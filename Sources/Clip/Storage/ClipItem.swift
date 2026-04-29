@@ -30,6 +30,8 @@ struct ClipItem: Identifiable, Equatable {
     }
 
     static func contentHash(of s: String) -> String {
-        fatalError("implemented in Task 6")
+        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        let digest = SHA256.hash(data: Data(trimmed.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
     }
 }

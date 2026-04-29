@@ -32,4 +32,24 @@ final class ClipItemTests: XCTestCase {
         XCTAssertEqual(out.utf8.count, 6)
         XCTAssertEqual(out, "你你")
     }
+
+    func testHashIsHex64Chars() {
+        let h = ClipItem.contentHash(of: "hi")
+        XCTAssertEqual(h.count, 64)
+        XCTAssertTrue(h.allSatisfy { $0.isHexDigit })
+    }
+
+    func testHashTrimsLeadingTrailingWhitespace() {
+        XCTAssertEqual(
+            ClipItem.contentHash(of: "  hi  \n"),
+            ClipItem.contentHash(of: "hi")
+        )
+    }
+
+    func testHashDifferentForDifferentContent() {
+        XCTAssertNotEqual(
+            ClipItem.contentHash(of: "hello"),
+            ClipItem.contentHash(of: "world")
+        )
+    }
 }

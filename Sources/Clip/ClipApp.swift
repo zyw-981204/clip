@@ -99,6 +99,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         panel.setRoot(PanelView(model: panelModel))
 
+        // Wire the panel's local-monitor key handlers into the model.
+        let model = panelModel!
+        let panelRef = panel!
+        panel.keyHandlers = PanelWindow.KeyHandlers(
+            onUp:    { model.moveSelection(by: -1) },
+            onDown:  { model.moveSelection(by: 1) },
+            onEnter: { model.paste() },
+            onEscape: { panelRef.close() },
+            onPin:    { Task { await model.togglePinSelected() } },
+            onDelete: { [weak self] in self?.deleteSelectedFromPanel() },
+            onIndex:  { n in model.selectIndex(n) },
+            // ⌘F is handled by a SwiftUI keyboardShortcut button inside
+            // PanelView (it needs @FocusState access). The window monitor
+            // never sees ⌘F because PanelWindow.handleKeyDown returns the
+            // event for ⌘F to flow into SwiftUI. (Currently we DO consume
+            // ⌘F in handleKeyDown — switch to no-op there if you want the
+            // SwiftUI button to take over.)
+            onFocusSearch: { /* no-op; SwiftUI button handles it */ }
+        )
+
         // 9. Status item
         statusItem = StatusItemController()
         statusItem.onOpenPanel = { [weak self] in self?.togglePanel() }
@@ -118,6 +138,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             panelModel.prepareForShow()
             panel.showAtCursor()
+        }
+    }
+
+    /// Wraps `PanelModel.deleteSelected` with the NSAlert pinned-confirmation
+    /// dialog. Called from `PanelWindow`'s key monitor when user hits ⌘D / ⌫.
+    private func deleteSelectedFromPanel() {
+        let model = panelModel!
+        let panelRef = panel!
+        Task { @MainActor in
+            await model.deleteSelected {
+                await PanelDeleteConfirm.confirm(
+                    window: panelRef,
+                    content: model.selectedItem()?.content ?? ""
+                )
+            }
         }
     }
 

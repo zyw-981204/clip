@@ -26,25 +26,21 @@ struct PanelView: View {
                 Divider()
                 footer
             }
-            KeyCatcher(
-                onUp:          { model.moveSelection(by: -1) },
-                onDown:        { model.moveSelection(by: 1) },
-                onEnter:       { model.paste() },
-                onEscape:      { model.close() },
-                onPin:         { Task { await model.togglePinSelected() } },
-                onDelete:      { Task { await deleteSelected() } },
-                onIndex:       { n in model.selectIndex(n) },
-                onFocusSearch: { searchFocused = true }
-            )
-            .allowsHitTesting(false)
-            .frame(width: 0, height: 0)
 
-            // SwiftUI cancel-action shortcut for ESC. Needed because the
-            // search TextField captures first-responder, so KeyCatcher's
-            // keyDown doesn't fire for ESC. cancelAction is intercepted by
-            // SwiftUI at scene level regardless of focus.
+            // ESC backstop. PanelWindow's local key monitor is the primary
+            // path; this catches the case where the monitor isn't installed
+            // yet (e.g. the very first keyDown before showAtCursor returns).
             Button("") { model.close() }
                 .keyboardShortcut(.cancelAction)
+                .frame(width: 0, height: 0)
+                .opacity(0)
+                .accessibilityHidden(true)
+
+            // ⌘F focuses the search field. Handled here (rather than in the
+            // window's monitor) because @FocusState can only be flipped from
+            // inside the SwiftUI view tree.
+            Button("") { searchFocused = true }
+                .keyboardShortcut("f", modifiers: .command)
                 .frame(width: 0, height: 0)
                 .opacity(0)
                 .accessibilityHidden(true)
@@ -53,7 +49,10 @@ struct PanelView: View {
         .background(.thinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .onAppear {
-            searchFocused = true
+            // Do NOT auto-focus the search field. Focusing the field would
+            // route ↑↓ / digit keypresses to the field editor first, making
+            // the panel feel unresponsive. The user can click the field (or
+            // press ⌘F) to enter filter mode.
             model.reload()
         }
     }

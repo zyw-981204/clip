@@ -10,6 +10,25 @@ import SwiftUI
 final class PanelWindow: NSPanel {
     static let size = CGSize(width: 480, height: 640)
 
+    /// Closures invoked by the local key-down monitor. Set once after the
+    /// panel + model are wired up in AppDelegate. The monitor runs on every
+    /// keyDown delivered to this window — irrespective of which subview
+    /// (search field, list, etc.) currently has first-responder — so this
+    /// is the reliable place to handle shortcuts.
+    struct KeyHandlers {
+        let onUp: () -> Void
+        let onDown: () -> Void
+        let onEnter: () -> Void
+        let onEscape: () -> Void
+        let onPin: () -> Void
+        let onDelete: () -> Void
+        let onIndex: (Int) -> Void
+        let onFocusSearch: () -> Void
+    }
+
+    var keyHandlers: KeyHandlers?
+    private var keyMonitor: Any?
+
     init() {
         super.init(
             contentRect: NSRect(origin: .zero, size: Self.size),
@@ -71,15 +90,74 @@ final class PanelWindow: NSPanel {
 
     override func close() {
         stopWatchingAppSwitches()
+        removeKeyMonitor()
         super.close()
     }
 
     /// Backstop for ESC: NSResponder forwards unhandled `cancelOperation:`
-    /// up the chain. Our SwiftUI hidden `.keyboardShortcut(.cancelAction)`
-    /// button usually catches ESC first, but if SwiftUI focus state ever
-    /// blocks it, this ensures the panel still closes.
+    /// up the chain. The local key monitor below is the primary path; this
+    /// is a safety net.
     override func cancelOperation(_ sender: Any?) {
         self.close()
+    }
+
+    // MARK: - Key event monitor
+
+    private func installKeyMonitor() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, event.window === self else { return event }
+            return self.handleKeyDown(event)
+        }
+    }
+
+    private func removeKeyMonitor() {
+        if let m = keyMonitor { NSEvent.removeMonitor(m) }
+        keyMonitor = nil
+    }
+
+    /// Returns nil to consume the event, the event itself to pass through.
+    private func handleKeyDown(_ event: NSEvent) -> NSEvent? {
+        guard let h = keyHandlers else { return event }
+        let cmd = event.modifierFlags.contains(.command)
+        let chars = event.charactersIgnoringModifiers ?? ""
+
+        // ⌘1 – ⌘9 → jump-paste Nth row.
+        if cmd, let digit = Int(chars), (1...9).contains(digit) {
+            h.onIndex(digit); return nil
+        }
+
+        if cmd {
+            switch chars.lowercased() {
+            case "p": h.onPin(); return nil
+            case "d": h.onDelete(); return nil
+            // ⌘F is handled by a SwiftUI keyboardShortcut button in PanelView
+            // (it needs @FocusState access to flip the search field's focus).
+            // Letting the event through allows SwiftUI's shortcut to catch it.
+            default: break
+            }
+        }
+
+        switch event.keyCode {
+        case 36, 76:                     // return / numpad-enter
+            h.onEnter(); return nil
+        case 53:                         // escape
+            h.onEscape(); return nil
+        case 126:                        // up arrow
+            h.onUp(); return nil
+        case 125:                        // down arrow
+            h.onDown(); return nil
+        case 51, 117:                    // backspace / forward-delete
+            // If the search field is focused with text in it, let backspace
+            // edit the query rather than deleting a clipboard item.
+            if let editor = self.firstResponder as? NSText, !editor.string.isEmpty {
+                return event
+            }
+            h.onDelete(); return nil
+        default:
+            // Letters / digits without ⌘ — forward to focused field (search).
+            return event
+        }
     }
 
     /// Show the panel anchored near the mouse cursor:
@@ -90,6 +168,7 @@ final class PanelWindow: NSPanel {
         positionNearCursor()
         self.makeKeyAndOrderFront(nil)
         startWatchingAppSwitches()
+        installKeyMonitor()
     }
 
     private func positionNearCursor() {

@@ -153,7 +153,7 @@ extension AppDelegate {
     }
 }
 
-// MARK: - Task 49: Pruner timer
+// MARK: - Pruner timer
 extension AppDelegate {
     func startPruner() {
         let t = DispatchSource.makeTimerSource(queue: .global(qos: .utility))

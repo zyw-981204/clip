@@ -13,4 +13,15 @@ final class PrivacyFilterTests: XCTestCase {
         )
         XCTAssertNil(reason)
     }
+
+    func testInternalPasteUTIIsSkipped() {
+        let f = PrivacyFilter()
+        let reason = f.reasonToSkip(
+            types: [.string, PrivacyFilter.internalUTI],
+            content: "anything",
+            sourceBundleID: "com.zyw.clip",
+            blacklist: []
+        )
+        XCTAssertEqual(reason, "internal-paste")
+    }
 }

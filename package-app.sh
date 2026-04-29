@@ -81,7 +81,7 @@ EOF
 #   Name: "Clip Dev"; Identity Type: Self Signed Root; Type: Code Signing
 #   Then `security find-identity -v -p codesigning` should list it.
 
-CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
+CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-Clip Dev}"
 codesign --force --deep --sign "$CODESIGN_IDENTITY" \
     --identifier com.zyw.clip \
     --options runtime \

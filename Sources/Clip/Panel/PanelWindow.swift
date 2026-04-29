@@ -40,6 +40,40 @@ final class PanelWindow: NSPanel {
         self.contentView = host.view
     }
 
+    private var activateObserver: NSObjectProtocol?
+
+    /// Begin observing app-switches so the panel closes if the user activates
+    /// any other application (Cmd-Tab, Dock click, Spotlight, etc.). We
+    /// install the observer in `showAtCursor` and remove it in `close` so we
+    /// don't fire while the panel is hidden.
+    private func startWatchingAppSwitches() {
+        guard activateObserver == nil else { return }
+        let mineBundleID = Bundle.main.bundleIdentifier
+        activateObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard
+                let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                app.bundleIdentifier != mineBundleID
+            else { return }
+            self?.close()
+        }
+    }
+
+    private func stopWatchingAppSwitches() {
+        if let obs = activateObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(obs)
+            activateObserver = nil
+        }
+    }
+
+    override func close() {
+        stopWatchingAppSwitches()
+        super.close()
+    }
+
     /// Show the panel anchored near the mouse cursor:
     /// the panel's top-left corner sits at (cursor.x + 12, cursor.y - 12),
     /// then we clamp to the cursor's current screen `visibleFrame` so the
@@ -47,6 +81,7 @@ final class PanelWindow: NSPanel {
     func showAtCursor() {
         positionNearCursor()
         self.makeKeyAndOrderFront(nil)
+        startWatchingAppSwitches()
     }
 
     private func positionNearCursor() {

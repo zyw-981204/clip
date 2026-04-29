@@ -159,11 +159,13 @@ extension AppDelegate {
 // MARK: - Pruner timer
 extension AppDelegate {
     func startPruner() {
-        // Capture the store directly (it's Sendable / thread-safe). Crossing
-        // into @MainActor `self` from this background queue would trip Swift 6
-        // runtime isolation checks.
+        // Run on the main queue. Pruning is a sub-millisecond SQLite DELETE on
+        // a 500-row table firing every 60s — no UI impact. Running on main
+        // avoids Swift 6's runtime actor-isolation check (the timer closure
+        // is implicitly @MainActor since startPruner() is, and dispatching to
+        // a background queue would trip dispatch_assert_queue_fail / SIGTRAP).
         let store = self.store!
-        let t = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        let t = DispatchSource.makeTimerSource(queue: .main)
         t.schedule(
             deadline: .now() + 60,
             repeating: 60,

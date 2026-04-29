@@ -1,7 +1,9 @@
 import Foundation
 import GRDB
 
-final class BlacklistService {
+/// Thread-safe (only state is the underlying `HistoryStore.pool` which is
+/// itself `Sendable`), safe to call from background queues.
+final class BlacklistService: @unchecked Sendable {
     private let store: HistoryStore
     init(store: HistoryStore) { self.store = store }
 

@@ -1,7 +1,10 @@
 import Foundation
 import GRDB
 
-final class HistoryStore {
+/// Thread-safety: the only stored state is `pool`, a GRDB `DatabasePool`
+/// which is documented as safe to share across threads. WAL journal mode
+/// (set in init) lets readers and writers proceed concurrently.
+final class HistoryStore: @unchecked Sendable {
     let pool: DatabasePool
 
     init(path: String) throws {

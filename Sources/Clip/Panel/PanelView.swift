@@ -80,7 +80,7 @@ struct PanelView: View {
                     get: { model.selectedID },
                     set: { model.selectedID = $0 }
                 )) {
-                    ForEach(Array(model.items.enumerated()), id: \.element.id) { idx, item in
+                    ForEach(Array(model.pageItems.enumerated()), id: \.element.id) { idx, item in
                         PanelRow(item: item, index: idx + 1)
                             .id(item.id)
                             .tag(item.id)
@@ -150,8 +150,14 @@ struct PanelView: View {
 
     private var footer: some View {
         VStack(spacing: 2) {
-            Text("↑↓ 选 · ↵ 粘贴 · ⌘1–9 直接粘 · ⌘F 搜索")
-            Text("⌘P 钉 · ⌘D 删 · esc 关闭")
+            Text("↑↓ 选 · ←→ 翻页 · ↵ 粘贴 · ⌘1–9 直接粘")
+            HStack(spacing: 6) {
+                Text("⌘F 搜 · ⌘P 钉 · ⌘D 删 · esc 关闭")
+                if !model.items.isEmpty {
+                    Text("·")
+                    Text("第 \(model.currentPage + 1) / \(model.pageCount) 页")
+                }
+            }
         }
         .font(.caption2)
         .foregroundStyle(.secondary)

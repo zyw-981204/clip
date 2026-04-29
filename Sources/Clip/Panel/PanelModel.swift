@@ -10,12 +10,33 @@ import SwiftUI
 /// calls cancel the previous task so a fast typer never sees stale results.
 @MainActor
 final class PanelModel: ObservableObject {
+    /// Items shown per page. Matches the ⌘1–9 jump-paste shortcut so the
+    /// digit on each visible row is always its actual hotkey.
+    static let pageSize: Int = 9
+
     @Published var query: String = ""
     @Published private(set) var items: [ClipItem] = []
     @Published var selectedID: Int64?
+    /// 0-based current page index. Reset to 0 on every reload.
+    @Published var currentPage: Int = 0
     /// Set to `true` by `close()`; `PanelView` (or its host) observes and
     /// closes the panel window. Reset to `false` each time the panel is shown.
     @Published var shouldClose: Bool = false
+
+    /// Number of pages required to display all loaded items. Always ≥ 1 so
+    /// the footer can render "第 1 / 1 页" even when empty.
+    var pageCount: Int {
+        max(1, (items.count + Self.pageSize - 1) / Self.pageSize)
+    }
+
+    /// The slice of `items` visible on the current page (≤ `pageSize` rows).
+    var pageItems: [ClipItem] {
+        guard !items.isEmpty else { return [] }
+        let start = currentPage * Self.pageSize
+        guard start < items.count else { return [] }
+        let end = min(start + Self.pageSize, items.count)
+        return Array(items[start..<end])
+    }
 
     private let store: HistoryStore
     private let onPasteCallback: (ClipItem) -> Void
@@ -27,6 +48,8 @@ final class PanelModel: ObservableObject {
     }
 
     /// Trigger a debounced search/listRecent load. Safe to call repeatedly.
+    /// Always resets `currentPage` to 0 — content has changed, so the freshest
+    /// rows on page 0 are the right place to start.
     func reload() {
         searchTask?.cancel()
         let q = query
@@ -44,27 +67,61 @@ final class PanelModel: ObservableObject {
             }
             if Task.isCancelled { return }
             self.items = result
-            // Preserve selection if still present, else select the first row.
+            self.currentPage = 0
+            // Preserve selection if still present, else select the first row
+            // of the current (= 0) page.
             if let s = self.selectedID, result.contains(where: { $0.id == s }) {
                 // keep
             } else {
-                self.selectedID = result.first?.id
+                self.selectedID = self.pageItems.first?.id
             }
         }
     }
 
+    /// Move the selection within the current page, auto-flipping pages at the
+    /// boundary so a steady stream of ↓ presses still reaches the bottom.
     func moveSelection(by delta: Int) {
-        guard !items.isEmpty else { return }
-        let currentIdx = items.firstIndex(where: { $0.id == selectedID }) ?? 0
-        let next = max(0, min(items.count - 1, currentIdx + delta))
-        selectedID = items[next].id
+        let visible = pageItems
+        guard !visible.isEmpty else { return }
+        let currentIdx = visible.firstIndex(where: { $0.id == selectedID }) ?? 0
+        let target = currentIdx + delta
+        if target < 0 {
+            if currentPage > 0 {
+                currentPage -= 1
+                selectedID = pageItems.last?.id
+            }
+            return
+        }
+        if target >= visible.count {
+            if currentPage + 1 < pageCount {
+                currentPage += 1
+                selectedID = pageItems.first?.id
+            }
+            return
+        }
+        selectedID = visible[target].id
     }
 
-    /// 1-based index for ⌘1 – ⌘9.
+    /// Page navigation (← / →). No-op at the first / last page.
+    func nextPage() {
+        guard currentPage + 1 < pageCount else { return }
+        currentPage += 1
+        selectedID = pageItems.first?.id
+    }
+
+    func prevPage() {
+        guard currentPage > 0 else { return }
+        currentPage -= 1
+        selectedID = pageItems.first?.id
+    }
+
+    /// 1-based index for ⌘1 – ⌘9. Indexes into the **current page**, so the
+    /// digit shown on each visible row is always its real shortcut.
     func selectIndex(_ n: Int) {
         let idx = n - 1
-        guard items.indices.contains(idx) else { return }
-        selectedID = items[idx].id
+        let visible = pageItems
+        guard visible.indices.contains(idx) else { return }
+        selectedID = visible[idx].id
         paste()
     }
 

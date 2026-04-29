@@ -116,7 +116,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // event for ⌘F to flow into SwiftUI. (Currently we DO consume
             // ⌘F in handleKeyDown — switch to no-op there if you want the
             // SwiftUI button to take over.)
-            onFocusSearch: { /* no-op; SwiftUI button handles it */ }
+            onFocusSearch: { /* no-op; SwiftUI button handles it */ },
+            onPrevPage: { model.prevPage() },
+            onNextPage: { model.nextPage() }
         )
 
         // 9. Status item

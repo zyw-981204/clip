@@ -24,6 +24,8 @@ final class PanelWindow: NSPanel {
         let onDelete: () -> Void
         let onIndex: (Int) -> Void
         let onFocusSearch: () -> Void
+        let onPrevPage: () -> Void
+        let onNextPage: () -> Void
     }
 
     var keyHandlers: KeyHandlers?
@@ -150,6 +152,14 @@ final class PanelWindow: NSPanel {
             h.onUp(); return nil
         case 125:                        // down arrow
             h.onDown(); return nil
+        case 123, 124:                   // left / right arrow → page flip
+            // If the search field is focused with text in it, let arrow keys
+            // move the caret instead of flipping pages.
+            if let editor = self.firstResponder as? NSText, !editor.string.isEmpty {
+                return event
+            }
+            if event.keyCode == 123 { h.onPrevPage() } else { h.onNextPage() }
+            return nil
         case 51, 117:                    // backspace / forward-delete
             // If the search field is focused with text in it, let backspace
             // edit the query rather than deleting a clipboard item.

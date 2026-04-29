@@ -9,6 +9,7 @@ struct OnboardingWindow: View {
     @State private var page: Int = 0
     @State private var trusted: Bool = AccessibilityCheck.isTrusted(prompt: false)
     @State private var loginError: String?
+    @State private var trustPollTask: Task<Void, Never>?
 
     /// When true, skip pages 2/3 and only show the Accessibility page.
     let accessibilityOnly: Bool
@@ -30,7 +31,44 @@ struct OnboardingWindow: View {
                 .padding(.vertical, 12)
         }
         .frame(width: 480, height: 360)
-        .onAppear { trusted = AccessibilityCheck.isTrusted(prompt: false) }
+        .onAppear {
+            // If Accessibility is already granted on entry, skip the prompt page entirely.
+            let nowTrusted = AccessibilityCheck.isTrusted(prompt: false)
+            trusted = nowTrusted
+            if nowTrusted && !accessibilityOnly && page == 0 {
+                page = 1
+            }
+            startTrustPolling()
+        }
+        .onDisappear { stopTrustPolling() }
+    }
+
+    /// Polls the Accessibility trust state every 0.8s while the window is open.
+    /// When the user grants permission in System Settings, auto-advance from
+    /// the Accessibility page to the next step (or close, in accessibility-only mode).
+    private func startTrustPolling() {
+        stopTrustPolling()
+        trustPollTask = Task { @MainActor in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(800))
+                if Task.isCancelled { return }
+                let nowTrusted = AccessibilityCheck.isTrusted(prompt: false)
+                guard nowTrusted != trusted || (nowTrusted && page == 0) else { continue }
+                trusted = nowTrusted
+                if nowTrusted && page == 0 {
+                    if accessibilityOnly {
+                        finish()
+                    } else {
+                        page = 1
+                    }
+                }
+            }
+        }
+    }
+
+    private func stopTrustPolling() {
+        trustPollTask?.cancel()
+        trustPollTask = nil
     }
 
     @ViewBuilder

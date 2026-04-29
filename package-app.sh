@@ -60,4 +60,32 @@ cat >"$CONTENTS_DIR/Info.plist" <<EOF
 </plist>
 EOF
 
+
+# Code signing.
+#
+# Stable signing matters for macOS TCC (Privacy & Security): without a stable
+# signing identity, every rebuild changes the binary's cdhash, which makes
+# TCC drop the previous Accessibility grant — you'd have to re-authorize on
+# every rebuild.
+#
+# Options:
+#   - Default: ad-hoc sign (--sign -) with explicit identifier. Better than
+#     unsigned (TCC at least sees a stable bundle id), but cdhash still
+#     changes per rebuild → re-authorize each time.
+#   - Set CODESIGN_IDENTITY="Clip Dev" (a self-signed code-signing cert in
+#     your login keychain) → TCC matches by certificate identity, so
+#     authorization persists across rebuilds.
+#
+# To create a self-signed cert once:
+#   open -a "Keychain Access" → Certificate Assistant → Create a Certificate
+#   Name: "Clip Dev"; Identity Type: Self Signed Root; Type: Code Signing
+#   Then `security find-identity -v -p codesigning` should list it.
+
+CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
+codesign --force --deep --sign "$CODESIGN_IDENTITY" \
+    --identifier com.zyw.clip \
+    --options runtime \
+    "$APP_DIR" 2>&1 | sed 's/^/codesign: /'
+
 printf '%s\n' "Packaged app: $APP_DIR"
+printf 'Signed with identity: %s\n' "$CODESIGN_IDENTITY"

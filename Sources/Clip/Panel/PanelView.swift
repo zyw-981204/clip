@@ -45,7 +45,7 @@ struct PanelView: View {
                 .opacity(0)
                 .accessibilityHidden(true)
         }
-        .frame(width: PanelWindow.size.width, height: PanelWindow.size.height)
+        .frame(width: PanelWindow.size.width, height: contentHeight)
         .background(.thinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay {
@@ -59,8 +59,44 @@ struct PanelView: View {
             // the panel feel unresponsive. The user can click the field (or
             // press ⌘F) to enter filter mode.
             model.reload()
+            resizePanel()
         }
+        .onChange(of: model.pageItems.count) { _ in resizePanel() }
+        .onChange(of: model.currentPage)     { _ in resizePanel() }
     }
+
+    /// Computed height of the rendered SwiftUI content. Drives both the
+    /// SwiftUI `.frame(height:)` and the NSPanel's `setFrame` so the two
+    /// stay in lockstep — no empty band below the last row when the
+    /// current page has fewer than `pageSize` items.
+    private var contentHeight: CGFloat {
+        let chrome: CGFloat = PanelView.searchBarHeight
+                            + 1                                  // top divider
+                            + 1                                  // bottom divider
+                            + PanelView.footerHeight
+        let rows = model.items.isEmpty
+            ? PanelView.emptyStateHeight
+            : CGFloat(model.pageItems.count) * PanelRow.height
+        return chrome + rows
+    }
+
+    /// Push the computed height into the NSPanel, anchoring its top edge so
+    /// the panel "grows / shrinks downward" rather than jumping vertically.
+    private func resizePanel() {
+        guard let panel = NSApp.windows.compactMap({ $0 as? PanelWindow }).first
+        else { return }
+        let target = contentHeight
+        var f = panel.frame
+        let dy = f.height - target
+        guard abs(dy) > 0.5 else { return }
+        f.size.height = target
+        f.origin.y += dy           // keep top edge in place
+        panel.setFrame(f, display: true, animate: false)
+    }
+
+    static let searchBarHeight: CGFloat = 40
+    static let footerHeight: CGFloat = 36
+    static let emptyStateHeight: CGFloat = 200
 
     private var searchBar: some View {
         HStack(spacing: 6) {
@@ -229,7 +265,14 @@ struct PanelView: View {
 /// Single list row. Pinned rows show a 📌 prefix; right-aligned source-app
 /// label. Text rows show a one-line preview (truncated to 120 chars). Image
 /// rows show a 32×32 inline thumbnail + size / mime metadata.
+///
+/// All rows are forced to a uniform 40pt — the 32×32 thumbnail in image rows
+/// is the floor, and matching text rows to the same height keeps mixed-type
+/// pages visually consistent (otherwise paging from images-heavy → text-only
+/// would cause a height mismatch).
 struct PanelRow: View {
+    static let height: CGFloat = 40
+
     let item: ClipItem
     let index: Int
     let model: PanelModel
@@ -265,8 +308,9 @@ struct PanelRow: View {
                 Text("(截断)").font(.caption2).foregroundStyle(.orange)
             }
         }
-        .padding(.vertical, 4)
         .padding(.horizontal, 8)
+        .frame(maxWidth: .infinity, minHeight: Self.height,
+               maxHeight: Self.height, alignment: .leading)
     }
 
     @ViewBuilder

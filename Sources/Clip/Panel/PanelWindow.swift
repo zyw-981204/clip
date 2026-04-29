@@ -8,10 +8,12 @@ import SwiftUI
 /// The window is borderless with a clear background; SwiftUI provides the
 /// rounded `.thinMaterial` chrome.
 final class PanelWindow: NSPanel {
-    /// Panel dimensions. Sized for the 10-row pageSize: 40 (search) +
-    /// 10 × ~32 (rows) + ~50 (2-line footer) + dividers ≈ 415pt, with a
-    /// little breathing room.
-    static let size = CGSize(width: 480, height: 440)
+    /// Initial panel dimensions. After SwiftUI renders, `PanelView`
+    /// re-computes height from actual `pageItems.count × PanelRow.height`
+    /// + chrome and resizes via `setFrame`, so this is just the "first
+    /// frame" target. 480 wide, 480 tall covers a full 10-row page (10 × 40
+    /// = 400 rows + 78 chrome ≈ 478pt) without an immediate resize jump.
+    static let size = CGSize(width: 480, height: 480)
 
     /// Closures invoked by the local key-down monitor. Set once after the
     /// panel + model are wired up in AppDelegate. The monitor runs on every

@@ -211,4 +211,48 @@ final class HistoryStoreTests: XCTestCase {
         try s.prune(now: now, maxCount: 500, maxAgeSeconds: 30 * 86_400)
         XCTAssertEqual(try s.listRecent().map(\.content), ["ancient"])
     }
+
+    func testCorruptedDBIsQuarantinedAndReplaced() throws {
+        let dir = NSTemporaryDirectory() + "clip-itest-\(UUID().uuidString)/"
+        try FileManager.default.createDirectory(
+            atPath: dir, withIntermediateDirectories: true)
+        let path = dir + "history.sqlite"
+
+        // Write a non-sqlite file at the path.
+        try Data("not a database".utf8).write(to: URL(fileURLWithPath: path))
+
+        // Open the store: corruption must be detected, file quarantined,
+        // and a fresh empty DB created in its place.
+        let s = try HistoryStore(path: path)
+        XCTAssertEqual(try s.listRecent().count, 0,
+                       "fresh DB should be empty after quarantine")
+
+        // The original file should be renamed with a `.corrupted-<ts>` suffix.
+        let siblings = try FileManager.default.contentsOfDirectory(atPath: dir)
+        XCTAssertTrue(
+            siblings.contains(where: { $0.hasPrefix("history.sqlite.corrupted-") }),
+            "expected a quarantined file in \(dir), got: \(siblings)"
+        )
+    }
+
+    func testHealthyDBOpensWithoutQuarantine() throws {
+        let dir = NSTemporaryDirectory() + "clip-itest-\(UUID().uuidString)/"
+        try FileManager.default.createDirectory(
+            atPath: dir, withIntermediateDirectories: true)
+        let path = dir + "history.sqlite"
+
+        // First open: creates valid DB.
+        do {
+            let s = try HistoryStore(path: path)
+            try s.insert(makeItem(content: "keep me", at: 100))
+        }
+        // Second open: must not quarantine; data must still be there.
+        let s2 = try HistoryStore(path: path)
+        XCTAssertEqual(try s2.listRecent().map(\.content), ["keep me"])
+        let siblings = try FileManager.default.contentsOfDirectory(atPath: dir)
+        XCTAssertFalse(
+            siblings.contains(where: { $0.contains(".corrupted-") }),
+            "healthy DB must not be quarantined; got: \(siblings)"
+        )
+    }
 }

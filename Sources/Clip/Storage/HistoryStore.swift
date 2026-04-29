@@ -5,6 +5,9 @@ final class HistoryStore {
     let pool: DatabasePool
 
     init(path: String) throws {
+        if FileManager.default.fileExists(atPath: path) {
+            try Self.checkOrQuarantine(path: path)
+        }
         var config = Configuration()
         config.prepareDatabase { db in
             try db.execute(sql: "PRAGMA journal_mode=WAL")
@@ -13,6 +16,31 @@ final class HistoryStore {
         var migrator = DatabaseMigrator()
         Migrations.register(&migrator)
         try migrator.migrate(pool)
+    }
+
+    private static func checkOrQuarantine(path: String) throws {
+        let ok: Bool
+        do {
+            let q = try DatabaseQueue(path: path)
+            let result = try q.read { db in
+                try String.fetchOne(db, sql: "PRAGMA integrity_check") ?? "fail"
+            }
+            ok = (result == "ok")
+        } catch {
+            ok = false
+        }
+        guard !ok else { return }
+
+        let ts = Int64(Date().timeIntervalSince1970)
+        let dest = path + ".corrupted-\(ts)"
+        let fm = FileManager.default
+        try? fm.moveItem(atPath: path, toPath: dest)
+        for suffix in ["-wal", "-shm"] {
+            let src = path + suffix
+            if fm.fileExists(atPath: src) {
+                try? fm.moveItem(atPath: src, toPath: dest + suffix)
+            }
+        }
     }
 
     /// Test helper: backs onto a fresh temp-file DB so DatabasePool's file-only

@@ -180,4 +180,35 @@ final class HistoryStoreTests: XCTestCase {
         XCTAssertEqual(pinned, ["p0", "p1", "p2", "p3", "p4"])
         XCTAssertEqual(nonpinned, ["n9", "n8"])
     }
+
+    func testPruneByAgeDropsOldNonPinned() throws {
+        let s = try HistoryStore.inMemory()
+        let now: Int64 = 30 * 86_400 + 1_000   // arbitrary "now"
+        let day: Int64 = 86_400
+
+        // Boundary cases relative to a 30-day window:
+        try s.insert(makeItem(content: "old-31d-non",     at: now - 31 * day, pinned: false))
+        try s.insert(makeItem(content: "exactly-30d-non", at: now - 30 * day, pinned: false))
+        try s.insert(makeItem(content: "fresh-non",       at: now - 1,        pinned: false))
+        try s.insert(makeItem(content: "old-31d-pinned",  at: now - 31 * day, pinned: true))
+
+        try s.prune(now: now, maxCount: 1_000_000, maxAgeSeconds: 30 * day)
+
+        let remaining = try s.listRecent(limit: 100).map(\.content)
+        // "old-31d-non" is strictly older than now-30d → dropped.
+        // "exactly-30d-non" is at the threshold (created_at == now - cutoff) → kept (uses `<`).
+        // pinned old row is exempt → kept.
+        XCTAssertEqual(
+            Set(remaining),
+            Set(["exactly-30d-non", "fresh-non", "old-31d-pinned"])
+        )
+    }
+
+    func testPruneByAgeWithLargeMaxCountStillExemptsPinned() throws {
+        let s = try HistoryStore.inMemory()
+        let now: Int64 = 1_000_000
+        try s.insert(makeItem(content: "ancient", at: 0, pinned: true))
+        try s.prune(now: now, maxCount: 500, maxAgeSeconds: 30 * 86_400)
+        XCTAssertEqual(try s.listRecent().map(\.content), ["ancient"])
+    }
 }

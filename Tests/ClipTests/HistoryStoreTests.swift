@@ -131,4 +131,22 @@ final class HistoryStoreTests: XCTestCase {
         XCTAssertNoThrow(try s.togglePin(id: 9999))
         XCTAssertEqual(try s.listRecent().first?.pinned, false)
     }
+
+    func testDeleteRemovesRow() throws {
+        let s = try HistoryStore.inMemory()
+        let id = try s.insert(makeItem(content: "delete-me", at: 100))
+        try s.insert(makeItem(content: "keep-me", at: 200))
+
+        try s.delete(id: id)
+
+        let remaining = try s.listRecent().map(\.content)
+        XCTAssertEqual(remaining, ["keep-me"])
+    }
+
+    func testDeleteUnknownIDIsNoOp() throws {
+        let s = try HistoryStore.inMemory()
+        try s.insert(makeItem(content: "a", at: 100))
+        XCTAssertNoThrow(try s.delete(id: 9999))
+        XCTAssertEqual(try s.listRecent().count, 1)
+    }
 }

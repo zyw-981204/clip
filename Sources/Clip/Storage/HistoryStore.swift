@@ -54,6 +54,15 @@ final class HistoryStore {
         }
     }
 
+    func delete(id: Int64) throws {
+        try pool.write { db in
+            try db.execute(
+                sql: "DELETE FROM items WHERE id = ?",
+                arguments: [id]
+            )
+        }
+    }
+
     func togglePin(id: Int64) throws {
         try pool.write { db in
             try db.execute(

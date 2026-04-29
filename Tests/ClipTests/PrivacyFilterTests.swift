@@ -45,4 +45,27 @@ final class PrivacyFilterTests: XCTestCase {
                                content: "gen", sourceBundleID: nil, blacklist: [])
         XCTAssertEqual(r, "auto-generated")
     }
+
+    func testEmptyContentReason() {
+        let f = PrivacyFilter()
+        let r = f.reasonToSkip(types: [.string], content: "   \n\t  ",
+                               sourceBundleID: "com.apple.Notes", blacklist: [])
+        XCTAssertEqual(r, "empty")
+    }
+
+    func testBlacklistedReason() {
+        let f = PrivacyFilter()
+        let r = f.reasonToSkip(types: [.string], content: "ok",
+                               sourceBundleID: "com.agilebits.onepassword7",
+                               blacklist: ["com.agilebits.onepassword7"])
+        XCTAssertEqual(r, "blacklisted")
+    }
+
+    func testBlacklistMissBundleIDIsAccepted() {
+        let f = PrivacyFilter()
+        let r = f.reasonToSkip(types: [.string], content: "ok",
+                               sourceBundleID: nil,
+                               blacklist: ["com.agilebits.onepassword7"])
+        XCTAssertNil(r)
+    }
 }

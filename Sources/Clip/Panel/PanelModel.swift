@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SwiftUI
 
@@ -84,6 +85,36 @@ final class PanelModel: ObservableObject {
         guard let id = selectedID else { return }
         do { try store.togglePin(id: id) } catch { return }
         reload()
+    }
+
+    /// Toggle pin on a specific row (used by the right-click context menu so
+    /// it acts on the row that was right-clicked, not the previously selected
+    /// row).
+    func togglePin(item: ClipItem) async {
+        guard let id = item.id else { return }
+        do { try store.togglePin(id: id) } catch { return }
+        reload()
+    }
+
+    /// Delete a specific row. Pinned rows still go through `confirmIfPinned`.
+    func delete(item: ClipItem, confirmIfPinned: () async -> Bool) async {
+        guard let id = item.id else { return }
+        if item.pinned {
+            let ok = await confirmIfPinned()
+            if !ok { return }
+        }
+        do { try store.delete(id: id) } catch { return }
+        reload()
+    }
+
+    /// Copy the item's content back onto the system pasteboard without
+    /// triggering a paste. The next observer tick will dedup against the
+    /// existing row and bump its `last_seen_at`, naturally promoting the
+    /// item to the top of the recents list.
+    func copyToPasteboard(_ item: ClipItem) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(item.content, forType: .string)
     }
 
     /// Delete the selected row. If the row is pinned, call `confirmIfPinned`

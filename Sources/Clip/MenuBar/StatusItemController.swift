@@ -1,9 +1,14 @@
 import AppKit
+import KeyboardShortcuts
 
 /// Owns the menu-bar `NSStatusItem`, builds its dropdown menu, and exposes
 /// closure hooks the AppDelegate wires to actual behaviour. The icon dims
 /// and switches to the "filled" SF Symbol while paused.
-final class StatusItemController {
+///
+/// Marked `@MainActor` because every NSStatusItem property (button.image /
+/// alphaValue / menu) must be touched on the main thread.
+@MainActor
+final class StatusItemController: NSObject, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
     var onOpenPanel: (() -> Void)?
@@ -15,18 +20,29 @@ final class StatusItemController {
     }
 
     private var pauseItem: NSMenuItem?
+    private var openPanelItem: NSMenuItem?
 
-    init() {
+    override init() {
+        super.init()
         build()
         updateIcon()
+        refreshHotkeyLabel()
+    }
+
+    /// NSMenuDelegate: re-read the hotkey from `KeyboardShortcuts` every time
+    /// the menu is about to open, so user customisations show up immediately.
+    func menuWillOpen(_ menu: NSMenu) {
+        refreshHotkeyLabel()
     }
 
     private func build() {
         let menu = NSMenu()
 
-        menu.addItem(BlockMenuItem(title: "打开剪贴板面板  ⌃⌥⌘V") { [weak self] in
+        let open = BlockMenuItem(title: "打开剪贴板面板") { [weak self] in
             self?.onOpenPanel?()
-        })
+        }
+        menu.addItem(open)
+        self.openPanelItem = open
 
         let pause = BlockMenuItem(title: "暂停采集") { [weak self] in
             self?.onTogglePause?()
@@ -36,18 +52,36 @@ final class StatusItemController {
 
         menu.addItem(.separator())
 
-        menu.addItem(BlockMenuItem(title: "偏好设置...  ⌘,") { [weak self] in
+        let prefs = BlockMenuItem(title: "偏好设置...") { [weak self] in
             self?.onOpenPreferences?()
-        })
+        }
+        prefs.keyEquivalent = ","
+        prefs.keyEquivalentModifierMask = .command
+        menu.addItem(prefs)
 
         menu.addItem(.separator())
 
-        let quit = NSMenuItem(title: "退出  ⌘Q",
+        let quit = NSMenuItem(title: "退出",
                               action: #selector(NSApplication.terminate(_:)),
-                              keyEquivalent: "")
+                              keyEquivalent: "q")
+        quit.keyEquivalentModifierMask = .command
         menu.addItem(quit)
 
+        menu.delegate = self
         statusItem.menu = menu
+    }
+
+    /// Re-read the current global shortcut from `KeyboardShortcuts` and update
+    /// the "open panel" menu-item title so it reflects user customisations.
+    /// Call this on launch and whenever the user finishes recording a new
+    /// shortcut in Preferences.
+    func refreshHotkeyLabel() {
+        guard let item = openPanelItem else { return }
+        if let s = KeyboardShortcuts.getShortcut(for: .togglePanel) {
+            item.title = "打开剪贴板面板  \(s)"
+        } else {
+            item.title = "打开剪贴板面板（未设置热键）"
+        }
     }
 
     private func updateIcon() {

@@ -70,47 +70,93 @@ struct PanelView: View {
         .frame(height: 40)
     }
 
+    @ViewBuilder
     private var list: some View {
-        ScrollViewReader { proxy in
-            List(selection: Binding(
-                get: { model.selectedID },
-                set: { model.selectedID = $0 }
-            )) {
-                ForEach(Array(model.items.enumerated()), id: \.element.id) { idx, item in
-                    PanelRow(item: item, index: idx + 1)
-                        .id(item.id)
-                        .tag(item.id)
-                        .listRowBackground(
-                            item.id == model.selectedID
-                                ? Color.accentColor.opacity(0.2)
-                                : Color.clear
-                        )
-                        .contentShape(Rectangle())
-                        .onTapGesture(count: 2) {
-                            model.selectedID = item.id
-                            model.paste()
-                        }
-                        .onTapGesture {
-                            model.selectedID = item.id
-                        }
+        if model.items.isEmpty {
+            emptyState
+        } else {
+            ScrollViewReader { proxy in
+                List(selection: Binding(
+                    get: { model.selectedID },
+                    set: { model.selectedID = $0 }
+                )) {
+                    ForEach(Array(model.items.enumerated()), id: \.element.id) { idx, item in
+                        PanelRow(item: item, index: idx + 1)
+                            .id(item.id)
+                            .tag(item.id)
+                            .listRowBackground(
+                                item.id == model.selectedID
+                                    ? Color.accentColor.opacity(0.2)
+                                    : Color.clear
+                            )
+                            .contentShape(Rectangle())
+                            .onTapGesture(count: 2) {
+                                model.selectedID = item.id
+                                model.paste()
+                            }
+                            .onTapGesture {
+                                model.selectedID = item.id
+                            }
+                            .contextMenu {
+                                Button(item.pinned ? "取消置顶" : "置顶") {
+                                    Task { await model.togglePin(item: item) }
+                                }
+                                Button("复制原文") {
+                                    model.copyToPasteboard(item)
+                                }
+                                Divider()
+                                Button("删除", role: .destructive) {
+                                    Task { @MainActor in
+                                        await model.delete(item: item) {
+                                            await PanelDeleteConfirm.confirm(
+                                                window: NSApp.keyWindow,
+                                                content: item.content
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                    }
                 }
-            }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
-            .onChange(of: model.selectedID) { new in
-                if let new {
-                    withAnimation(.none) { proxy.scrollTo(new, anchor: .center) }
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
+                .onChange(of: model.selectedID) { new in
+                    if let new {
+                        withAnimation(.none) { proxy.scrollTo(new, anchor: .center) }
+                    }
                 }
             }
         }
     }
 
+    private var emptyState: some View {
+        VStack(spacing: 8) {
+            Image(systemName: model.query.isEmpty
+                  ? "doc.on.clipboard"
+                  : "magnifyingglass")
+                .font(.system(size: 32))
+                .foregroundStyle(.tertiary)
+            Text(model.query.isEmpty ? "暂无剪贴板记录" : "无匹配结果")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            if model.query.isEmpty {
+                Text("复制任意文字即可开始记录")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
     private var footer: some View {
-        Text("↑↓ 选 · ↵ 粘贴 · ⌘P 钉 · ⌘D 删 · esc 关闭")
-            .font(.caption2)
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity, alignment: .center)
-            .frame(height: 24)
+        VStack(spacing: 2) {
+            Text("↑↓ 选 · ↵ 粘贴 · ⌘1–9 直接粘 · ⌘F 搜索")
+            Text("⌘P 钉 · ⌘D 删 · esc 关闭")
+        }
+        .font(.caption2)
+        .foregroundStyle(.secondary)
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.vertical, 4)
     }
 
     /// Dispatches delete with the pinned-confirmation hook wired to NSAlert.

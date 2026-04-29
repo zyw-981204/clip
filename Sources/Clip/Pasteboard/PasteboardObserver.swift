@@ -1,6 +1,13 @@
 import AppKit
 
-final class PasteboardObserver {
+/// Marked `@unchecked Sendable` because:
+/// - `lastChangeCount` / `lastChangeAt` / `paused` are only mutated from the
+///   serial timer queue, plus a few notification handlers (sleep/wake/lock/
+///   unlock) which set `paused` atomically. The worst-case race is one
+///   spurious tick on resume, which dedups via `insertOrPromote`.
+/// - `store`, `filter`, `blacklist`, `frontmost`, `source` are themselves
+///   thread-safe or pure functions.
+final class PasteboardObserver: @unchecked Sendable {
     static let maxBytes = 256 * 1024
     static let hardSkipBytes = 5 * 1024 * 1024
 

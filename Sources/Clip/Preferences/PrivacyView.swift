@@ -128,7 +128,7 @@ struct PrivacyView: View {
 /// `.shared.dbPath` / `.shared.store` on launch so the SwiftUI Settings views
 /// (which can't take constructor args) can reach the live services.
 final class PreferencesContainer: @unchecked Sendable {
-    nonisolated(unsafe) static let shared = PreferencesContainer()
+    static let shared = PreferencesContainer()
     var blacklist: BlacklistService?
     var store: HistoryStore?
     var dbPath: String?

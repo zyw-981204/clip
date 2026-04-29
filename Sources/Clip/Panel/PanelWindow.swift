@@ -77,7 +77,10 @@ final class PanelWindow: NSPanel {
                 let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
                 app.bundleIdentifier != mineBundleID
             else { return }
-            self?.close()
+            // Notification queue is `.main`, so we're already on the main
+            // thread; assumeIsolated lets us call the MainActor-isolated
+            // `close()` synchronously without a Task hop.
+            MainActor.assumeIsolated { self?.close() }
         }
     }
 

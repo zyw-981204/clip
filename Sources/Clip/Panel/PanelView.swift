@@ -4,15 +4,16 @@ import SwiftUI
 ///   ┌──────────────────────┐
 ///   │ search field         │ 40 pt
 ///   ├──────────────────────┤
-///   │ scrollable list      │ flex
+///   │ all / 文字 / 图片    │ 32 pt
 ///   ├──────────────────────┤
-///   │ keyboard-hint footer │ 24 pt
+///   │ row stack            │ pageItems × 40 pt
+///   ├──────────────────────┤
+///   │ keyboard-hint footer │ 36 pt
 ///   └──────────────────────┘
-/// The `KeyCatcher` overlays the whole stack so it captures keyboard events
-/// regardless of which subview the cursor is over. The search field handles
-/// its own typing; KeyCatcher only intercepts modifier shortcuts and the
-/// arrow / return / escape / backspace keys (which the text field doesn't
-/// need for caret movement when single-line and unselected).
+///
+/// Rows are rendered in a plain `VStack` (not `List`) so we can pin every row
+/// to exactly `PanelRow.height` and the panel's total height matches what
+/// the user sees with no scroll bar.
 struct PanelView: View {
     @ObservedObject var model: PanelModel
     @FocusState private var searchFocused: Bool
@@ -21,6 +22,8 @@ struct PanelView: View {
         ZStack {
             VStack(spacing: 0) {
                 searchBar
+                Divider()
+                filterTabs
                 Divider()
                 list
                 Divider()
@@ -48,11 +51,6 @@ struct PanelView: View {
         .frame(width: PanelWindow.size.width, height: contentHeight)
         .background(.thinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay {
-            if let item = model.previewItem {
-                previewOverlay(item: item)
-            }
-        }
         .onAppear {
             // Do NOT auto-focus the search field. Focusing the field would
             // route ↑↓ / digit keypresses to the field editor first, making
@@ -63,6 +61,7 @@ struct PanelView: View {
         }
         .onChange(of: model.pageItems.count) { _ in resizePanel() }
         .onChange(of: model.currentPage)     { _ in resizePanel() }
+        .onChange(of: model.contentFilter)   { _ in model.reload() }
     }
 
     /// Computed height of the rendered SwiftUI content. Drives both the
@@ -71,8 +70,10 @@ struct PanelView: View {
     /// current page has fewer than `pageSize` items.
     private var contentHeight: CGFloat {
         let chrome: CGFloat = PanelView.searchBarHeight
-                            + 1                                  // top divider
-                            + 1                                  // bottom divider
+                            + 1                                   // div after search
+                            + PanelView.tabsHeight
+                            + 1                                   // div after tabs
+                            + 1                                   // div after rows
                             + PanelView.footerHeight
         let rows = model.items.isEmpty
             ? PanelView.emptyStateHeight
@@ -95,7 +96,8 @@ struct PanelView: View {
     }
 
     static let searchBarHeight: CGFloat = 40
-    static let footerHeight: CGFloat = 36
+    static let tabsHeight: CGFloat = 32
+    static let footerHeight: CGFloat = 44
     static let emptyStateHeight: CGFloat = 200
 
     private var searchBar: some View {
@@ -108,7 +110,22 @@ struct PanelView: View {
                 .onSubmit { model.paste() }
         }
         .padding(.horizontal, 12)
-        .frame(height: 40)
+        .frame(height: PanelView.searchBarHeight)
+    }
+
+    /// 全部 / 文字 / 图片. Image tab + non-empty query yields no results
+    /// (search runs LIKE on `content` which is empty for image rows) — that's
+    /// expected; user should clear the query to browse images.
+    private var filterTabs: some View {
+        Picker("", selection: $model.contentFilter) {
+            ForEach(ContentFilter.allCases, id: \.self) { f in
+                Text(f.title).tag(f)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .padding(.horizontal, 12)
+        .frame(height: PanelView.tabsHeight)
     }
 
     @ViewBuilder
@@ -116,19 +133,12 @@ struct PanelView: View {
         if model.items.isEmpty {
             emptyState
         } else {
-            // No ScrollViewReader / scrollTo here: we paginate at 10 rows so
-            // every visible row already fits inside the panel — calling
-            // proxy.scrollTo on each selectedID change is pure overhead and
-            // makes ↑↓ navigation feel laggy.
-            List(selection: Binding(
-                get: { model.selectedID },
-                set: { model.selectedID = $0 }
-            )) {
+            // Plain VStack, not List, so every row is exactly `PanelRow.height`
+            // and the panel sized to chrome + n×40 has no scroll bar.
+            VStack(spacing: 0) {
                 ForEach(Array(model.pageItems.enumerated()), id: \.element.id) { idx, item in
                     PanelRow(item: item, index: idx + 1, model: model)
-                        .id(item.id)
-                        .tag(item.id)
-                        .listRowBackground(
+                        .background(
                             item.id == model.selectedID
                                 ? Color.accentColor.opacity(0.2)
                                 : Color.clear
@@ -162,8 +172,6 @@ struct PanelView: View {
                         }
                 }
             }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
         }
     }
 
@@ -183,7 +191,8 @@ struct PanelView: View {
                     .foregroundStyle(.tertiary)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: .infinity)
+        .frame(height: PanelView.emptyStateHeight)
     }
 
     private var footer: some View {
@@ -200,65 +209,7 @@ struct PanelView: View {
         .font(.caption2)
         .foregroundStyle(.secondary)
         .frame(maxWidth: .infinity, alignment: .center)
-        .padding(.vertical, 4)
-    }
-
-    /// Quick-Look-style preview overlay. Click anywhere or press ⎵ / esc to
-    /// dismiss (the keypress is wired through `PanelWindow.handleKeyDown`).
-    @ViewBuilder
-    private func previewOverlay(item: ClipItem) -> some View {
-        VStack(spacing: 0) {
-            switch item.kind {
-            case .text:
-                ScrollView {
-                    Text(item.content)
-                        .textSelection(.enabled)
-                        .font(.body)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(12)
-                }
-            case .image:
-                if let img = model.fullImage(for: item) {
-                    ScrollView([.horizontal, .vertical]) {
-                        Image(nsImage: img)
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                            .padding(8)
-                    }
-                } else {
-                    VStack {
-                        Image(systemName: "photo.badge.exclamationmark")
-                            .font(.system(size: 32))
-                            .foregroundStyle(.tertiary)
-                        Text("无法加载预览")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
-            }
-
-            Divider()
-            Text("⎵ / esc 关闭预览")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 4)
-        }
-        .background(.thickMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .contentShape(Rectangle())
-        .onTapGesture { model.previewItem = nil }
-    }
-
-    /// Dispatches delete with the pinned-confirmation hook wired to NSAlert.
-    private func deleteSelected() async {
-        await model.deleteSelected {
-            await PanelDeleteConfirm.confirm(
-                window: NSApp.keyWindow,
-                content: model.selectedItem()?.content ?? ""
-            )
-        }
+        .frame(height: PanelView.footerHeight)
     }
 }
 
@@ -268,8 +219,7 @@ struct PanelView: View {
 ///
 /// All rows are forced to a uniform 40pt — the 32×32 thumbnail in image rows
 /// is the floor, and matching text rows to the same height keeps mixed-type
-/// pages visually consistent (otherwise paging from images-heavy → text-only
-/// would cause a height mismatch).
+/// pages visually consistent.
 struct PanelRow: View {
     static let height: CGFloat = 40
 

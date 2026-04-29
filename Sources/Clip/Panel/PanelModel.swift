@@ -2,6 +2,23 @@ import AppKit
 import Foundation
 import SwiftUI
 
+/// Tab filter shown above the clipboard list. Image tab + non-empty query
+/// returns nothing (search runs LIKE on `content`, which images don't have);
+/// the caller should clear the search box to browse images.
+enum ContentFilter: String, CaseIterable, Equatable {
+    case all
+    case text
+    case image
+
+    var title: String {
+        switch self {
+        case .all:   "全部"
+        case .text:  "文字"
+        case .image: "图片"
+        }
+    }
+}
+
 /// Drives `PanelView`. Owns the search query, the current item list, and the
 /// selected row id. All published mutations happen on the main actor.
 ///
@@ -23,9 +40,12 @@ final class PanelModel: ObservableObject {
     /// Set to `true` by `close()`; `PanelView` (or its host) observes and
     /// closes the panel window. Reset to `false` each time the panel is shown.
     @Published var shouldClose: Bool = false
-    /// Non-nil → render the Quick-Look-style preview overlay for this item.
-    /// Toggled by ⎵ (space) on a selected row; dismissed by ⎵ or esc again.
+    /// Non-nil → AppDelegate's Combine sink shows the global PreviewWindow
+    /// for this item. Toggled by ⎵ (space) on a selected row.
     @Published var previewItem: ClipItem?
+    /// 全部 / 文字 / 图片 tab. Changes are observed by PanelView which calls
+    /// `reload()` so results re-filter immediately.
+    @Published var contentFilter: ContentFilter = .all
 
     /// Number of pages required to display all loaded items. Always ≥ 1 so
     /// the footer can render "第 1 / 1 页" even when empty.
@@ -82,20 +102,31 @@ final class PanelModel: ObservableObject {
     /// Trigger a debounced search/listRecent load. Safe to call repeatedly.
     /// Always resets `currentPage` to 0 — content has changed, so the freshest
     /// rows on page 0 are the right place to start.
+    ///
+    /// `contentFilter` is applied in-memory after the DB read because the
+    /// existing search() already excludes images, and listing all 500 rows
+    /// then filtering down is cheap.
     func reload() {
         searchTask?.cancel()
         let q = query
+        let filter = contentFilter
         searchTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(100))
             if Task.isCancelled { return }
             guard let self else { return }
-            let result: [ClipItem]
+            let raw: [ClipItem]
             do {
-                result = try q.trimmingCharacters(in: .whitespaces).isEmpty
+                raw = try q.trimmingCharacters(in: .whitespaces).isEmpty
                     ? self.store.listRecent(limit: 500)
                     : self.store.search(query: q, limit: 500)
             } catch {
-                result = []
+                raw = []
+            }
+            let result: [ClipItem]
+            switch filter {
+            case .all:   result = raw
+            case .text:  result = raw.filter { $0.kind == .text }
+            case .image: result = raw.filter { $0.kind == .image }
             }
             if Task.isCancelled { return }
             self.items = result

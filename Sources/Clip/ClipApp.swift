@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 
 @main
 struct ClipApp: App {
@@ -26,6 +27,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var onboardingWindow: NSWindow?
     private var preferencesWindow: NSWindow?
+    private var cancellables: Set<AnyCancellable> = []
 
     func applicationDidFinishLaunching(_ note: Notification) {
         // 1. Single-instance check
@@ -114,6 +116,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         panel.setRoot(PanelView(model: panelModel))
 
+        // Drive the global PreviewWindow off the model's previewItem. Sink
+        // outside the panel so the preview can render larger than the panel
+        // itself and float at modalPanel level above it.
+        panelModel.$previewItem
+            .receive(on: RunLoop.main)
+            .sink { [weak self] item in
+                guard let self else { return }
+                if let item {
+                    PreviewWindow.shared.show(item: item, model: self.panelModel) {
+                        // PreviewWindow's own ⎵ / esc dismissed it; clear the
+                        // model so the published state matches.
+                        self.panelModel.previewItem = nil
+                    }
+                } else {
+                    PreviewWindow.shared.hide()
+                }
+            }
+            .store(in: &cancellables)
+
         // Wire the panel's local-monitor key handlers into the model.
         let model = panelModel!
         let panelRef = panel!
@@ -121,15 +142,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onUp:    { model.moveSelection(by: -1) },
             onDown:  { model.moveSelection(by: 1) },
             onEnter: { model.paste() },
-            onEscape: {
-                // Escape closes the preview overlay first if it's open;
-                // otherwise it closes the whole panel.
-                if model.previewItem != nil {
-                    model.previewItem = nil
-                } else {
-                    panelRef.close()
-                }
-            },
+            onEscape: { panelRef.close() },
             onPin:    { Task { await model.togglePinSelected() } },
             onDelete: { [weak self] in self?.deleteSelectedFromPanel() },
             onIndex:  { n in model.selectIndex(n) },

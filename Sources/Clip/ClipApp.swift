@@ -211,19 +211,7 @@ extension AppDelegate {
         w.level = .floating
         onboardingWindow = w
 
-        NSApp.setActivationPolicy(.regular)  // Temporarily show in Dock so the window grabs focus.
         NSApp.activate(ignoringOtherApps: true)
         w.makeKeyAndOrderFront(nil)
-
-        // Restore .accessory once the onboarding window closes.
-        NotificationCenter.default.addObserver(
-            forName: NSWindow.willCloseNotification,
-            object: w,
-            queue: .main
-        ) { _ in
-            Task { @MainActor in
-                NSApp.setActivationPolicy(.accessory)
-            }
-        }
     }
 }

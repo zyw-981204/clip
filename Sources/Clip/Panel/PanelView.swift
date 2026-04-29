@@ -48,6 +48,11 @@ struct PanelView: View {
         .frame(width: PanelWindow.size.width, height: PanelWindow.size.height)
         .background(.thinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            if let item = model.previewItem {
+                previewOverlay(item: item)
+            }
+        }
         .onAppear {
             // Do NOT auto-focus the search field. Focusing the field would
             // route ↑↓ / digit keypresses to the field editor first, making
@@ -150,7 +155,7 @@ struct PanelView: View {
 
     private var footer: some View {
         VStack(spacing: 2) {
-            Text("↑↓ 选 · ←→ 翻页 · ↵ 粘贴 · ⌘1–9 直接粘")
+            Text("↑↓ 选 · ←→ 翻页 · ↵ 粘贴 · ⎵ 预览 · ⌘1–9 直接粘")
             HStack(spacing: 6) {
                 Text("⌘F 搜 · ⌘P 钉 · ⌘D 删 · esc 关闭")
                 if !model.items.isEmpty {
@@ -163,6 +168,54 @@ struct PanelView: View {
         .foregroundStyle(.secondary)
         .frame(maxWidth: .infinity, alignment: .center)
         .padding(.vertical, 4)
+    }
+
+    /// Quick-Look-style preview overlay. Click anywhere or press ⎵ / esc to
+    /// dismiss (the keypress is wired through `PanelWindow.handleKeyDown`).
+    @ViewBuilder
+    private func previewOverlay(item: ClipItem) -> some View {
+        VStack(spacing: 0) {
+            switch item.kind {
+            case .text:
+                ScrollView {
+                    Text(item.content)
+                        .textSelection(.enabled)
+                        .font(.body)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                }
+            case .image:
+                if let img = model.fullImage(for: item) {
+                    ScrollView([.horizontal, .vertical]) {
+                        Image(nsImage: img)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .padding(8)
+                    }
+                } else {
+                    VStack {
+                        Image(systemName: "photo.badge.exclamationmark")
+                            .font(.system(size: 32))
+                            .foregroundStyle(.tertiary)
+                        Text("无法加载预览")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+
+            Divider()
+            Text("⎵ / esc 关闭预览")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 4)
+        }
+        .background(.thickMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .contentShape(Rectangle())
+        .onTapGesture { model.previewItem = nil }
     }
 
     /// Dispatches delete with the pinned-confirmation hook wired to NSAlert.

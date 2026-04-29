@@ -10,11 +10,10 @@ import SwiftUI
 /// calls cancel the previous task so a fast typer never sees stale results.
 @MainActor
 final class PanelModel: ObservableObject {
-    /// Items shown per page. Sized to fill the panel (480 × 640) — search
-    /// bar + footer + dividers leave ~560pt for rows, ~32pt each. The first
-    /// 9 rows on each page get a ⌘1–⌘9 shortcut prefix; rows 10+ are pasted
-    /// via ↑↓ + ↵.
-    static let pageSize: Int = 17
+    /// Items shown per page. 10 fits in the compact 480×440 panel; ↑↓
+    /// stays cheap (one screen-worth of rows) and ⌘1–9 still maps every
+    /// row except the 10th, which is reachable with ↑↓ + ↵.
+    static let pageSize: Int = 10
 
     @Published var query: String = ""
     @Published private(set) var items: [ClipItem] = []
@@ -24,6 +23,9 @@ final class PanelModel: ObservableObject {
     /// Set to `true` by `close()`; `PanelView` (or its host) observes and
     /// closes the panel window. Reset to `false` each time the panel is shown.
     @Published var shouldClose: Bool = false
+    /// Non-nil → render the Quick-Look-style preview overlay for this item.
+    /// Toggled by ⎵ (space) on a selected row; dismissed by ⎵ or esc again.
+    @Published var previewItem: ClipItem?
 
     /// Number of pages required to display all loaded items. Always ≥ 1 so
     /// the footer can render "第 1 / 1 页" even when empty.
@@ -51,6 +53,26 @@ final class PanelModel: ObservableObject {
         guard item.kind == .image, let blobID = item.blobID else { return nil }
         return ThumbnailCache.shared.thumbnail(for: blobID, store: store)
     }
+
+    /// Full-size NSImage for the preview overlay. Decoded fresh each time
+    /// (preview is opened on demand and closed quickly), so we don't bother
+    /// caching the natural-size version — only thumbnails are hot.
+    func fullImage(for item: ClipItem) -> NSImage? {
+        guard item.kind == .image, let blobID = item.blobID,
+              let bytes = try? store.blob(id: blobID)
+        else { return nil }
+        return NSImage(data: bytes)
+    }
+
+    /// Toggle the Quick-Look-style preview for the currently selected row.
+    func togglePreview() {
+        if previewItem != nil {
+            previewItem = nil
+        } else {
+            previewItem = selectedItem()
+        }
+    }
+
 
     init(store: HistoryStore, onPaste: @escaping (ClipItem) -> Void) {
         self.store = store

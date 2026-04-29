@@ -8,7 +8,10 @@ import SwiftUI
 /// The window is borderless with a clear background; SwiftUI provides the
 /// rounded `.thinMaterial` chrome.
 final class PanelWindow: NSPanel {
-    static let size = CGSize(width: 480, height: 640)
+    /// Panel dimensions. Sized for the 10-row pageSize: 40 (search) +
+    /// 10 × ~32 (rows) + ~50 (2-line footer) + dividers ≈ 415pt, with a
+    /// little breathing room.
+    static let size = CGSize(width: 480, height: 440)
 
     /// Closures invoked by the local key-down monitor. Set once after the
     /// panel + model are wired up in AppDelegate. The monitor runs on every
@@ -26,6 +29,7 @@ final class PanelWindow: NSPanel {
         let onFocusSearch: () -> Void
         let onPrevPage: () -> Void
         let onNextPage: () -> Void
+        let onPreview: () -> Void
     }
 
     var keyHandlers: KeyHandlers?
@@ -167,6 +171,12 @@ final class PanelWindow: NSPanel {
                 return event
             }
             h.onDelete(); return nil
+        case 49:                         // space → Quick-Look-style preview
+            // If the search field has focus, let space type into it.
+            if self.firstResponder is NSText {
+                return event
+            }
+            h.onPreview(); return nil
         default:
             // Letters / digits without ⌘ — forward to focused field (search).
             return event

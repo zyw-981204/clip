@@ -121,7 +121,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onUp:    { model.moveSelection(by: -1) },
             onDown:  { model.moveSelection(by: 1) },
             onEnter: { model.paste() },
-            onEscape: { panelRef.close() },
+            onEscape: {
+                // Escape closes the preview overlay first if it's open;
+                // otherwise it closes the whole panel.
+                if model.previewItem != nil {
+                    model.previewItem = nil
+                } else {
+                    panelRef.close()
+                }
+            },
             onPin:    { Task { await model.togglePinSelected() } },
             onDelete: { [weak self] in self?.deleteSelectedFromPanel() },
             onIndex:  { n in model.selectIndex(n) },
@@ -133,7 +141,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // SwiftUI button to take over.)
             onFocusSearch: { /* no-op; SwiftUI button handles it */ },
             onPrevPage: { model.prevPage() },
-            onNextPage: { model.nextPage() }
+            onNextPage: { model.nextPage() },
+            onPreview:  { model.togglePreview() }
         )
 
         // 9. Status item

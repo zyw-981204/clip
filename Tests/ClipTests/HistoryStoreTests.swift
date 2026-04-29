@@ -157,7 +157,7 @@ final class HistoryStoreTests: XCTestCase {
             try s.insert(makeItem(content: "n\(i)", at: Int64(100 + i)))
         }
         // Keep newest 3, age cap effectively disabled (very large window).
-        try s.prune(now: 200, maxCount: 3, maxAgeSeconds: 1_000_000)
+        try s.prune(now: 200, maxText: 3, maxImage: 100, maxAgeSeconds: 1_000_000)
 
         let remaining = try s.listRecent().map(\.content)
         XCTAssertEqual(remaining, ["n9", "n8", "n7"])
@@ -172,7 +172,7 @@ final class HistoryStoreTests: XCTestCase {
         for i in 0..<10 {
             try s.insert(makeItem(content: "n\(i)", at: Int64(200 + i), pinned: false))
         }
-        try s.prune(now: 1000, maxCount: 2, maxAgeSeconds: 1_000_000)
+        try s.prune(now: 1000, maxText: 2, maxImage: 100, maxAgeSeconds: 1_000_000)
 
         let remaining = try s.listRecent(limit: 100)
         let pinned = remaining.filter(\.pinned).map(\.content).sorted()
@@ -192,7 +192,7 @@ final class HistoryStoreTests: XCTestCase {
         try s.insert(makeItem(content: "fresh-non",       at: now - 1,        pinned: false))
         try s.insert(makeItem(content: "old-31d-pinned",  at: now - 31 * day, pinned: true))
 
-        try s.prune(now: now, maxCount: 1_000_000, maxAgeSeconds: 30 * day)
+        try s.prune(now: now, maxText: 1_000_000, maxImage: 100, maxAgeSeconds: 30 * day)
 
         let remaining = try s.listRecent(limit: 100).map(\.content)
         // "old-31d-non" is strictly older than now-30d → dropped.
@@ -208,7 +208,7 @@ final class HistoryStoreTests: XCTestCase {
         let s = try HistoryStore.inMemory()
         let now: Int64 = 1_000_000
         try s.insert(makeItem(content: "ancient", at: 0, pinned: true))
-        try s.prune(now: now, maxCount: 500, maxAgeSeconds: 30 * 86_400)
+        try s.prune(now: now, maxText: 500, maxImage: 100, maxAgeSeconds: 30 * 86_400)
         XCTAssertEqual(try s.listRecent().map(\.content), ["ancient"])
     }
 
@@ -233,6 +233,116 @@ final class HistoryStoreTests: XCTestCase {
             siblings.contains(where: { $0.hasPrefix("history.sqlite.corrupted-") }),
             "expected a quarantined file in \(dir), got: \(siblings)"
         )
+    }
+
+    // MARK: - Image / blob support (v2)
+
+    func testInsertImageStoresBlobAndItem() throws {
+        let s = try HistoryStore.inMemory()
+        let bytes = Data((0..<128).map { UInt8($0 % 256) })
+        let id = try s.insertImage(
+            bytes: bytes, mimeType: "image/png",
+            sourceBundleID: "com.example.foo", sourceAppName: "Foo",
+            now: 1_000
+        )
+
+        let items = try s.listRecent()
+        XCTAssertEqual(items.count, 1)
+        XCTAssertEqual(items[0].id, id)
+        XCTAssertEqual(items[0].kind, .image)
+        XCTAssertEqual(items[0].mimeType, "image/png")
+        XCTAssertEqual(items[0].byteSize, bytes.count)
+        XCTAssertEqual(items[0].content, "")
+        XCTAssertNotNil(items[0].blobID)
+
+        let fetched = try s.blob(id: items[0].blobID!)
+        XCTAssertEqual(fetched, bytes)
+    }
+
+    func testInsertImageDedupsViaSHA256() throws {
+        let s = try HistoryStore.inMemory()
+        let bytes = Data(repeating: 0x42, count: 256)
+        let id1 = try s.insertImage(
+            bytes: bytes, mimeType: "image/png",
+            sourceBundleID: nil, sourceAppName: nil, now: 100
+        )
+        let id2 = try s.insertImage(
+            bytes: bytes, mimeType: "image/png",
+            sourceBundleID: nil, sourceAppName: nil, now: 200
+        )
+        XCTAssertEqual(id1, id2, "same bytes must collapse to a single items row")
+
+        let items = try s.listRecent()
+        XCTAssertEqual(items.count, 1)
+        XCTAssertEqual(items[0].createdAt, 200, "second insert must promote created_at")
+
+        // And only one blob row.
+        let blobCount = try s.pool.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM clip_blobs") ?? -1
+        }
+        XCTAssertEqual(blobCount, 1)
+    }
+
+    func testPruneRemovesOrphanBlobs() throws {
+        let s = try HistoryStore.inMemory()
+        let bytes = Data(repeating: 0xAB, count: 64)
+        let id = try s.insertImage(
+            bytes: bytes, mimeType: "image/png",
+            sourceBundleID: nil, sourceAppName: nil, now: 100
+        )
+
+        // Sanity: 1 item, 1 blob.
+        XCTAssertEqual(try s.listRecent().count, 1)
+
+        // Delete the item; blob is now orphaned.
+        try s.delete(id: id)
+        let blobsBefore = try s.pool.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM clip_blobs") ?? -1
+        }
+        XCTAssertEqual(blobsBefore, 1, "delete leaves blob in place — pruner sweeps it")
+
+        try s.prune(now: 200, maxText: 500, maxImage: 100, maxAgeSeconds: 1_000_000)
+
+        let blobsAfter = try s.pool.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM clip_blobs") ?? -1
+        }
+        XCTAssertEqual(blobsAfter, 0, "orphan blob must be swept by prune")
+    }
+
+    func testPruneSeparateCapsForTextAndImage() throws {
+        let s = try HistoryStore.inMemory()
+        for i in 0..<5 {
+            try s.insert(makeItem(content: "t\(i)", at: Int64(100 + i)))
+        }
+        for i in 0..<5 {
+            try s.insertImage(
+                bytes: Data([UInt8(i)]),  // distinct bytes per image
+                mimeType: "image/png",
+                sourceBundleID: nil, sourceAppName: nil,
+                now: Int64(200 + i)
+            )
+        }
+        // Cap text to 2, images to 3.
+        try s.prune(now: 1000, maxText: 2, maxImage: 3, maxAgeSeconds: 1_000_000)
+
+        let remaining = try s.listRecent(limit: 100)
+        let texts  = remaining.filter { $0.kind == .text }.map(\.content).sorted()
+        let imgs   = remaining.filter { $0.kind == .image }
+        XCTAssertEqual(texts, ["t3", "t4"])
+        XCTAssertEqual(imgs.count, 3)
+    }
+
+    func testSearchSkipsImageRows() throws {
+        let s = try HistoryStore.inMemory()
+        try s.insert(makeItem(content: "hello world", at: 100))
+        try s.insertImage(
+            bytes: Data([1, 2, 3]), mimeType: "image/png",
+            sourceBundleID: nil, sourceAppName: nil, now: 200
+        )
+
+        let hits = try s.search(query: "hello")
+        XCTAssertEqual(hits.count, 1)
+        XCTAssertEqual(hits[0].kind, .text)
     }
 
     func testHealthyDBOpensWithoutQuarantine() throws {

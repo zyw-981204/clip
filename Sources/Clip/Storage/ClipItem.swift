@@ -1,6 +1,17 @@
 import Foundation
 import CryptoKit
 
+/// What's stored in a single history row.
+/// - `text`:  `content` holds the captured string. `blobID` / `mimeType` nil.
+/// - `image`: `content` holds the empty string. `blobID` references the bytes
+///            in `clip_blobs`; `mimeType` records the original pasteboard type
+///            ("image/png", "image/tiff", "application/pdf") so paste-back
+///            can write the same UTI.
+enum ClipKind: String, Equatable {
+    case text
+    case image
+}
+
 struct ClipItem: Identifiable, Equatable {
     var id: Int64?
     var content: String
@@ -11,6 +22,9 @@ struct ClipItem: Identifiable, Equatable {
     var pinned: Bool
     var byteSize: Int
     var truncated: Bool
+    var kind: ClipKind = .text
+    var blobID: Int64? = nil
+    var mimeType: String? = nil
 
     static func byteSize(of s: String) -> Int {
         s.utf8.count
@@ -32,6 +46,12 @@ struct ClipItem: Identifiable, Equatable {
     static func contentHash(of s: String) -> String {
         let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
         let digest = SHA256.hash(data: Data(trimmed.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// SHA-256 over raw bytes — used for blob dedup.
+    static func contentHash(of data: Data) -> String {
+        let digest = SHA256.hash(data: data)
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 }

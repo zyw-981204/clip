@@ -40,9 +40,17 @@ final class PanelModel: ObservableObject {
         return Array(items[start..<end])
     }
 
-    private let store: HistoryStore
+    let store: HistoryStore
     private let onPasteCallback: (ClipItem) -> Void
     private var searchTask: Task<Void, Never>?
+
+    /// Convenience accessor used by `PanelRow` to render image rows. Goes
+    /// through `ThumbnailCache` so the decoded `NSImage` is reused across
+    /// re-renders.
+    func thumbnail(for item: ClipItem) -> NSImage? {
+        guard item.kind == .image, let blobID = item.blobID else { return nil }
+        return ThumbnailCache.shared.thumbnail(for: blobID, store: store)
+    }
 
     init(store: HistoryStore, onPaste: @escaping (ClipItem) -> Void) {
         self.store = store
@@ -173,7 +181,17 @@ final class PanelModel: ObservableObject {
     func copyToPasteboard(_ item: ClipItem) {
         let pb = NSPasteboard.general
         pb.clearContents()
-        pb.setString(item.content, forType: .string)
+        switch item.kind {
+        case .text:
+            pb.setString(item.content, forType: .string)
+        case .image:
+            guard let blobID = item.blobID,
+                  let bytes = try? store.blob(id: blobID)
+            else { return }
+            let type = PasteInjector.pasteboardType(forMime: item.mimeType ?? "image/png")
+            pb.declareTypes([type], owner: nil)
+            pb.setData(bytes, forType: type)
+        }
     }
 
     /// Delete the selected row. If the row is pinned, call `confirmIfPinned`

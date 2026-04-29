@@ -81,7 +81,7 @@ struct PanelView: View {
                     set: { model.selectedID = $0 }
                 )) {
                     ForEach(Array(model.pageItems.enumerated()), id: \.element.id) { idx, item in
-                        PanelRow(item: item, index: idx + 1)
+                        PanelRow(item: item, index: idx + 1, model: model)
                             .id(item.id)
                             .tag(item.id)
                             .listRowBackground(
@@ -177,13 +177,15 @@ struct PanelView: View {
 }
 
 /// Single list row. Pinned rows show a 📌 prefix; right-aligned source-app
-/// label; preview is truncated to 120 chars (single-line).
+/// label. Text rows show a one-line preview (truncated to 120 chars). Image
+/// rows show a 32×32 inline thumbnail + size / mime metadata.
 struct PanelRow: View {
     let item: ClipItem
     let index: Int
+    let model: PanelModel
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
+        HStack(alignment: .center, spacing: 8) {
             if index <= 9 {
                 Text("⌘\(index)")
                     .font(.caption2.monospaced())
@@ -193,9 +195,16 @@ struct PanelRow: View {
                 Text("").frame(width: 24)
             }
             if item.pinned { Text("📌") }
-            Text(preview(item.content))
-                .lineLimit(1)
-                .truncationMode(.tail)
+
+            switch item.kind {
+            case .text:
+                Text(preview(item.content))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            case .image:
+                imageBody
+            }
+
             Spacer(minLength: 12)
             if let app = item.sourceAppName, !app.isEmpty {
                 Text(app)
@@ -208,6 +217,33 @@ struct PanelRow: View {
         }
         .padding(.vertical, 4)
         .padding(.horizontal, 8)
+    }
+
+    @ViewBuilder
+    private var imageBody: some View {
+        HStack(spacing: 8) {
+            if let img = model.thumbnail(for: item) {
+                Image(nsImage: img)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 32, height: 32)
+                    .clipShape(RoundedRectangle(cornerRadius: 3))
+            } else {
+                Image(systemName: "photo")
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 32, height: 32)
+            }
+            Text(imageLabel)
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+    }
+
+    /// Short metadata label for image rows: "图片 · 230 KB · png".
+    private var imageLabel: String {
+        let kb = max(1, item.byteSize / 1024)
+        let suffix = (item.mimeType ?? "").split(separator: "/").last.map(String.init) ?? "image"
+        return "图片 · \(kb) KB · \(suffix)"
     }
 
     private func preview(_ s: String) -> String {

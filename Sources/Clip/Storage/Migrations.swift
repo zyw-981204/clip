@@ -27,5 +27,35 @@ enum Migrations {
                 );
             """)
         }
+
+        // v2: image support.
+        // - items.kind:      'text' | 'image'. Existing rows default to 'text'.
+        // - items.blob_id:   FK into clip_blobs (NULL for text rows).
+        // - items.mime_type: 'image/png' | 'image/tiff' | 'application/pdf'
+        //                    for images; NULL for text.
+        // - clip_blobs:      content-addressed binary store keyed by sha256
+        //                    so identical images dedup across copies.
+        migrator.registerMigration("v2") { db in
+            try db.execute(sql: """
+                ALTER TABLE items ADD COLUMN kind TEXT NOT NULL DEFAULT 'text';
+            """)
+            try db.execute(sql: """
+                ALTER TABLE items ADD COLUMN blob_id INTEGER;
+            """)
+            try db.execute(sql: """
+                ALTER TABLE items ADD COLUMN mime_type TEXT;
+            """)
+            try db.execute(sql: """
+                CREATE TABLE clip_blobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sha256 TEXT NOT NULL UNIQUE,
+                    bytes BLOB NOT NULL,
+                    byte_size INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+            """)
+            try db.execute(sql: "CREATE INDEX idx_blobs_sha256 ON clip_blobs(sha256);")
+            try db.execute(sql: "CREATE INDEX idx_items_kind ON items(kind, created_at DESC);")
+        }
     }
 }

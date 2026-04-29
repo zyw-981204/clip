@@ -217,4 +217,120 @@ final class PasteboardObserverTests: XCTestCase {
         XCTAssertEqual(items.count, 1)
         XCTAssertEqual(items[0].createdAt, 200)
     }
+
+    // MARK: - Image branch (v2)
+
+    /// PNG bytes on the pasteboard → image row + new clip_blobs entry.
+    func testPngImageInsertsImageRowAndBlob() throws {
+        let store = try HistoryStore.inMemory()
+        let fake = FakePasteboardSource()
+        let observer = PasteboardObserver(
+            source: fake, store: store,
+            filter: { PrivacyFilter() },
+            blacklist: { [] },
+            frontmost: { (bundleID: "com.app", name: "App") }
+        )
+        let bytes = Data((0..<512).map { UInt8($0 % 256) })
+        fake.pushImage(bytes: bytes, type: .png)
+
+        XCTAssertTrue(try observer.tick(now: 100))
+
+        let items = try store.listRecent()
+        XCTAssertEqual(items.count, 1)
+        XCTAssertEqual(items[0].kind, .image)
+        XCTAssertEqual(items[0].mimeType, "image/png")
+        XCTAssertEqual(items[0].byteSize, bytes.count)
+        XCTAssertEqual(items[0].sourceBundleID, "com.app")
+    }
+
+    /// Same image bytes copied twice → single blob, items row promoted.
+    func testRepeatedImageBumpsCreatedAtAndDedupsBlob() throws {
+        let store = try HistoryStore.inMemory()
+        let fake = FakePasteboardSource()
+        let observer = PasteboardObserver(
+            source: fake, store: store,
+            filter: { PrivacyFilter() },
+            blacklist: { [] },
+            frontmost: { (bundleID: nil, name: nil) }
+        )
+        let bytes = Data(repeating: 0xAB, count: 256)
+
+        fake.pushImage(bytes: bytes, type: .png)
+        XCTAssertTrue(try observer.tick(now: 100))
+        fake.pushImage(bytes: bytes, type: .png)
+        XCTAssertTrue(try observer.tick(now: 200))
+
+        let items = try store.listRecent()
+        XCTAssertEqual(items.count, 1)
+        XCTAssertEqual(items[0].createdAt, 200)
+        let blobCount = try store.pool.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM clip_blobs") ?? -1
+        }
+        XCTAssertEqual(blobCount, 1)
+    }
+
+    /// Image > 5MB is silently dropped (no items row, no blob).
+    func testImageLargerThanHardSkipIsDropped() throws {
+        let store = try HistoryStore.inMemory()
+        let fake = FakePasteboardSource()
+        let observer = PasteboardObserver(
+            source: fake, store: store,
+            filter: { PrivacyFilter() },
+            blacklist: { [] },
+            frontmost: { (bundleID: nil, name: nil) }
+        )
+        let bytes = Data(count: PasteboardObserver.hardSkipBytes + 1)
+        fake.pushImage(bytes: bytes, type: .png)
+
+        XCTAssertFalse(try observer.tick(now: 100))
+        XCTAssertEqual(try store.listRecent().count, 0)
+    }
+
+    /// When both text and image are on the pasteboard, text wins (most
+    /// "copy from web page" scenarios).
+    func testTextWinsWhenBothPresent() throws {
+        let store = try HistoryStore.inMemory()
+        let fake = FakePasteboardSource()
+        let observer = PasteboardObserver(
+            source: fake, store: store,
+            filter: { PrivacyFilter() },
+            blacklist: { [] },
+            frontmost: { (bundleID: nil, name: nil) }
+        )
+        // Manually wire a multi-type push.
+        fake.changeCount += 1
+        fake.typesByCount[fake.changeCount] = [.string, .png]
+        fake.stringByCount[fake.changeCount] = "hello"
+        fake.dataByCountType[fake.changeCount] = [
+            .string: Data("hello".utf8),
+            .png:    Data(repeating: 0xCC, count: 64),
+        ]
+
+        XCTAssertTrue(try observer.tick(now: 100))
+
+        let items = try store.listRecent()
+        XCTAssertEqual(items.count, 1)
+        XCTAssertEqual(items[0].kind, .text)
+        XCTAssertEqual(items[0].content, "hello")
+    }
+
+    /// concealed/transient/auto-gen markers must skip image clips just like
+    /// text clips.
+    func testConcealedMarkerSkipsImageToo() throws {
+        let store = try HistoryStore.inMemory()
+        let fake = FakePasteboardSource()
+        let observer = PasteboardObserver(
+            source: fake, store: store,
+            filter: { PrivacyFilter() },
+            blacklist: { [] },
+            frontmost: { (bundleID: nil, name: nil) }
+        )
+        let bytes = Data((0..<32).map { UInt8($0) })
+        fake.changeCount += 1
+        fake.typesByCount[fake.changeCount] = [.png, PrivacyFilter.concealedUTI]
+        fake.dataByCountType[fake.changeCount] = [.png: bytes]
+
+        XCTAssertFalse(try observer.tick(now: 100))
+        XCTAssertEqual(try store.listRecent().count, 0)
+    }
 }

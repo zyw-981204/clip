@@ -7,18 +7,42 @@ import CoreGraphics
 /// so the focus has time to settle.
 @MainActor
 final class PasteInjector {
-    /// Paste `content` into whatever app is frontmost after `close()` runs.
-    /// `close` is invoked synchronously so the panel is gone before ⌘V fires.
+    /// Paste a text item into whatever app is frontmost after `close()`
+    /// runs. `close` is invoked synchronously so the panel is gone before
+    /// ⌘V fires.
     func paste(content: String, then close: @escaping () -> Void) {
         let pb = NSPasteboard.general
         pb.declareTypes([.string, PrivacyFilter.internalUTI], owner: nil)
         pb.setString(content, forType: .string)
         pb.setString("1", forType: PrivacyFilter.internalUTI)
+        finalize(close: close)
+    }
 
+    /// Paste an image item. `mimeType` records the original UTI we captured
+    /// so the receiver gets back what it produced ("image/png" → .png, etc.).
+    /// Falls back to `.tiff` if the mime is unknown.
+    func pasteImage(bytes: Data, mimeType: String, then close: @escaping () -> Void) {
+        let pb = NSPasteboard.general
+        let type = Self.pasteboardType(forMime: mimeType)
+        pb.declareTypes([type, PrivacyFilter.internalUTI], owner: nil)
+        pb.setData(bytes, forType: type)
+        pb.setString("1", forType: PrivacyFilter.internalUTI)
+        finalize(close: close)
+    }
+
+    private func finalize(close: @escaping () -> Void) {
         close()
-
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) { [weak self] in
             self?.postCommandV()
+        }
+    }
+
+    static func pasteboardType(forMime mime: String) -> NSPasteboard.PasteboardType {
+        switch mime {
+        case "image/png":       return .png
+        case "image/tiff":      return .tiff
+        case "application/pdf": return NSPasteboard.PasteboardType("com.adobe.pdf")
+        default:                return .tiff
         }
     }
 

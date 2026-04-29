@@ -11,6 +11,15 @@ final class PasteboardObserver: @unchecked Sendable {
     static let maxBytes = 256 * 1024
     static let hardSkipBytes = 5 * 1024 * 1024
 
+    /// Pasteboard types we treat as images, in order of preference. PNG is
+    /// the most common modern format; TIFF is the legacy macOS default;
+    /// PDF covers vector copies (e.g., from Preview / Keynote).
+    static let imageTypes: [(NSPasteboard.PasteboardType, String)] = [
+        (.png,                                        "image/png"),
+        (.tiff,                                       "image/tiff"),
+        (NSPasteboard.PasteboardType("com.adobe.pdf"), "application/pdf"),
+    ]
+
     private let source: PasteboardSource
     private let store: HistoryStore
     private let filter: () -> PrivacyFilter
@@ -55,33 +64,63 @@ final class PasteboardObserver: @unchecked Sendable {
         lastChangeCount = cc
 
         let types = Set(source.types())
-
-        // Hard size guard: check raw data size BEFORE materializing as Swift String.
-        if let size = source.data(forType: .string)?.count, size > Self.hardSkipBytes {
-            return false
-        }
-
-        guard let raw = source.string(forType: .string) else { return false }
         let app = frontmost()
-        if filter().reasonToSkip(types: types, content: raw,
+
+        // Privacy filter: bundle-id blacklist + concealed/transient/auto-gen
+        // markers + internal-paste guard. Applied first because it's cheap
+        // and short-circuits both text and image paths. We pass a non-empty
+        // placeholder so the filter's "empty-after-trim" rule (which is a
+        // text-only concern) doesn't fire here; each branch below verifies
+        // its own content non-emptiness.
+        if filter().reasonToSkip(types: types, content: "x",
                                  sourceBundleID: app.bundleID,
                                  blacklist: blacklist()) != nil {
             return false
         }
 
-        let (content, truncated) = ClipItem.truncateIfNeeded(raw, limit: Self.maxBytes)
-        let item = ClipItem(
-            content: content,
-            contentHash: ClipItem.contentHash(of: content),
-            sourceBundleID: app.bundleID,
-            sourceAppName: app.name,
-            createdAt: now,
-            pinned: false,
-            byteSize: ClipItem.byteSize(of: content),
-            truncated: truncated
-        )
-        try store.insertOrPromote(item, now: now)
-        return true
+        // Text branch — preferred when text is present, since most "copy from
+        // a webpage" cases pull both an image render and the underlying text
+        // and the user almost always means the text.
+        if types.contains(.string) {
+            if let size = source.data(forType: .string)?.count, size > Self.hardSkipBytes {
+                return false
+            }
+            if let raw = source.string(forType: .string),
+               !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                let (content, truncated) = ClipItem.truncateIfNeeded(raw, limit: Self.maxBytes)
+                let item = ClipItem(
+                    content: content,
+                    contentHash: ClipItem.contentHash(of: content),
+                    sourceBundleID: app.bundleID,
+                    sourceAppName: app.name,
+                    createdAt: now,
+                    pinned: false,
+                    byteSize: ClipItem.byteSize(of: content),
+                    truncated: truncated
+                )
+                try store.insertOrPromote(item, now: now)
+                return true
+            }
+        }
+
+        // Image branch — only if no usable text was on the pasteboard.
+        for (uti, mime) in Self.imageTypes {
+            guard types.contains(uti) else { continue }
+            guard let bytes = source.data(forType: uti) else { continue }
+            // 5 MB cap on raw bytes (matches text hardSkipBytes).
+            guard bytes.count <= Self.hardSkipBytes else { return false }
+            try store.insertImage(
+                bytes: bytes,
+                mimeType: mime,
+                sourceBundleID: app.bundleID,
+                sourceAppName: app.name,
+                now: now
+            )
+            return true
+        }
+
+        return false
     }
 
     func resetBaseline() { lastChangeCount = source.changeCount }

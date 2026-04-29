@@ -93,8 +93,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel = PanelWindow()
         panelModel = PanelModel(store: store) { [weak self] item in
             guard let self else { return }
-            self.injector.paste(content: item.content) { [weak self] in
-                self?.panel.close()
+            switch item.kind {
+            case .text:
+                self.injector.paste(content: item.content) { [weak self] in
+                    self?.panel.close()
+                }
+            case .image:
+                guard let blobID = item.blobID,
+                      let bytes = try? self.store.blob(id: blobID)
+                else {
+                    // Blob missing somehow — close without pasting.
+                    self.panel.close()
+                    return
+                }
+                self.injector.pasteImage(
+                    bytes: bytes,
+                    mimeType: item.mimeType ?? "image/png"
+                ) { [weak self] in self?.panel.close() }
             }
         }
         panel.setRoot(PanelView(model: panelModel))
@@ -236,7 +251,8 @@ extension AppDelegate {
             let now = Int64(Date().timeIntervalSince1970)
             try? store.prune(
                 now: now,
-                maxCount: cfg.maxItems,
+                maxText: cfg.maxItems,
+                maxImage: cfg.maxImageItems,
                 maxAgeSeconds: Int64(cfg.maxDays) * 86_400
             )
         }

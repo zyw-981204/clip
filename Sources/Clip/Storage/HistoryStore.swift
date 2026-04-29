@@ -54,6 +54,15 @@ final class HistoryStore {
         }
     }
 
+    func togglePin(id: Int64) throws {
+        try pool.write { db in
+            try db.execute(
+                sql: "UPDATE items SET pinned = 1 - pinned WHERE id = ?",
+                arguments: [id]
+            )
+        }
+    }
+
     func search(query: String, limit: Int = 50) throws -> [ClipItem] {
         let q = query.trimmingCharacters(in: .whitespaces)
         if q.isEmpty {

@@ -113,4 +113,22 @@ final class HistoryStoreTests: XCTestCase {
         let hits = try s.search(query: "hello").map(\.content)
         XCTAssertEqual(hits, ["hello b", "hello c", "hello a"])
     }
+
+    func testTogglePinFlipsBothDirections() throws {
+        let s = try HistoryStore.inMemory()
+        let id = try s.insert(makeItem(content: "x", at: 100, pinned: false))
+
+        try s.togglePin(id: id)
+        XCTAssertEqual(try s.listRecent().first?.pinned, true)
+
+        try s.togglePin(id: id)
+        XCTAssertEqual(try s.listRecent().first?.pinned, false)
+    }
+
+    func testTogglePinUnknownIDIsNoOp() throws {
+        let s = try HistoryStore.inMemory()
+        try s.insert(makeItem(content: "x", at: 100))
+        XCTAssertNoThrow(try s.togglePin(id: 9999))
+        XCTAssertEqual(try s.listRecent().first?.pinned, false)
+    }
 }

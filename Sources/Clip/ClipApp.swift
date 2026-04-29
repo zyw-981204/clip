@@ -136,7 +136,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-// MARK: - Task 48: Single-instance guard
+// MARK: - Single-instance guard
 extension AppDelegate {
     /// Returns `true` if another instance is already running and the current
     /// process has been told to terminate. Caller should `return` immediately.

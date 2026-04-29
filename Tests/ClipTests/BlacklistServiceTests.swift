@@ -30,4 +30,21 @@ final class BlacklistServiceTests: XCTestCase {
         try svc.add(bundleID: "com.x.app", displayName: "X-renamed")
         XCTAssertEqual(try svc.list().count, 1)
     }
+
+    func testRemoveDeletesEntry() throws {
+        let store = try HistoryStore.inMemory()
+        let svc = BlacklistService(store: store)
+        try svc.add(bundleID: "com.a", displayName: "A")
+        try svc.add(bundleID: "com.b", displayName: "B")
+        try svc.remove(bundleID: "com.a")
+        XCTAssertEqual(try svc.currentSet(), ["com.b"])
+    }
+
+    func testRemoveMissingBundleIDIsNoOp() throws {
+        let store = try HistoryStore.inMemory()
+        let svc = BlacklistService(store: store)
+        try svc.add(bundleID: "com.a", displayName: "A")
+        XCTAssertNoThrow(try svc.remove(bundleID: "com.never-added"))
+        XCTAssertEqual(try svc.currentSet(), ["com.a"])
+    }
 }

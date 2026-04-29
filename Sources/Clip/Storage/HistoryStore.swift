@@ -54,6 +54,23 @@ final class HistoryStore {
         }
     }
 
+    func search(query: String, limit: Int = 50) throws -> [ClipItem] {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        if q.isEmpty {
+            return try listRecent(limit: limit)
+        }
+        let escaped = LikeEscape.escape(q.lowercased())
+        let pattern = "%\(escaped)%"
+        return try pool.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT * FROM items
+                WHERE LOWER(content) LIKE ? ESCAPE '\\'
+                ORDER BY pinned DESC, created_at DESC, id DESC
+                LIMIT ?
+            """, arguments: [pattern, limit]).map(Self.itemFromRow)
+        }
+    }
+
     @discardableResult
     func insertOrPromote(_ item: ClipItem, now: Int64) throws -> Int64 {
         try pool.write { db in

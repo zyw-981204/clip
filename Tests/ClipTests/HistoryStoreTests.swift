@@ -70,4 +70,47 @@ final class HistoryStoreTests: XCTestCase {
         _ = try s.insertOrPromote(makeItem(content: "b", at: 200), now: 200)
         XCTAssertEqual(try s.listRecent().count, 2)
     }
+
+    func testSearchSubstringCaseInsensitive() throws {
+        let s = try HistoryStore.inMemory()
+        try s.insert(makeItem(content: "Hello World", at: 100))
+        try s.insert(makeItem(content: "GoodBye",     at: 200))
+        try s.insert(makeItem(content: "hello there", at: 300))
+
+        let hits = try s.search(query: "HELLO").map(\.content)
+        XCTAssertEqual(Set(hits), Set(["Hello World", "hello there"]))
+    }
+
+    func testSearchEmptyQueryReturnsRecent() throws {
+        let s = try HistoryStore.inMemory()
+        try s.insert(makeItem(content: "a", at: 100))
+        try s.insert(makeItem(content: "b", at: 200))
+        XCTAssertEqual(try s.search(query: "").map(\.content), ["b", "a"])
+    }
+
+    func testSearchEscapesPercentLiteral() throws {
+        // "50%" must match the row containing literal "50%", not "50something".
+        let s = try HistoryStore.inMemory()
+        try s.insert(makeItem(content: "buy 50% off",      at: 100))
+        try s.insert(makeItem(content: "version 50.1.0",   at: 200))
+        let hits = try s.search(query: "50%").map(\.content)
+        XCTAssertEqual(hits, ["buy 50% off"])
+    }
+
+    func testSearchEscapesUnderscoreLiteral() throws {
+        let s = try HistoryStore.inMemory()
+        try s.insert(makeItem(content: "snake_case_id",    at: 100))
+        try s.insert(makeItem(content: "snakeXcaseXid",    at: 200))
+        let hits = try s.search(query: "snake_case").map(\.content)
+        XCTAssertEqual(hits, ["snake_case_id"])
+    }
+
+    func testSearchPinnedFirstWithinResults() throws {
+        let s = try HistoryStore.inMemory()
+        try s.insert(makeItem(content: "hello a", at: 100, pinned: false))
+        try s.insert(makeItem(content: "hello b", at: 200, pinned: true))
+        try s.insert(makeItem(content: "hello c", at: 300, pinned: false))
+        let hits = try s.search(query: "hello").map(\.content)
+        XCTAssertEqual(hits, ["hello b", "hello c", "hello a"])
+    }
 }

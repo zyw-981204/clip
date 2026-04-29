@@ -10,9 +10,11 @@ import SwiftUI
 /// calls cancel the previous task so a fast typer never sees stale results.
 @MainActor
 final class PanelModel: ObservableObject {
-    /// Items shown per page. Matches the ⌘1–9 jump-paste shortcut so the
-    /// digit on each visible row is always its actual hotkey.
-    static let pageSize: Int = 9
+    /// Items shown per page. Sized to fill the panel (480 × 640) — search
+    /// bar + footer + dividers leave ~560pt for rows, ~32pt each. The first
+    /// 9 rows on each page get a ⌘1–⌘9 shortcut prefix; rows 10+ are pasted
+    /// via ↑↓ + ↵.
+    static let pageSize: Int = 17
 
     @Published var query: String = ""
     @Published private(set) var items: [ClipItem] = []
@@ -60,8 +62,8 @@ final class PanelModel: ObservableObject {
             let result: [ClipItem]
             do {
                 result = try q.trimmingCharacters(in: .whitespaces).isEmpty
-                    ? self.store.listRecent(limit: 50)
-                    : self.store.search(query: q, limit: 50)
+                    ? self.store.listRecent(limit: 500)
+                    : self.store.search(query: q, limit: 500)
             } catch {
                 result = []
             }

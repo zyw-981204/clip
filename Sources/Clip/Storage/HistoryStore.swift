@@ -54,6 +54,28 @@ final class HistoryStore {
         }
     }
 
+    /// Remove non-pinned items beyond `maxCount` newest, and any non-pinned items
+    /// older than `now - maxAgeSeconds`. Pinned rows are exempt from both cuts.
+    func prune(now: Int64, maxCount: Int, maxAgeSeconds: Int64) throws {
+        try pool.write { db in
+            try db.execute(sql: """
+                DELETE FROM items
+                WHERE pinned = 0
+                  AND id NOT IN (
+                      SELECT id FROM items
+                      WHERE pinned = 0
+                      ORDER BY created_at DESC, id DESC
+                      LIMIT ?
+                  )
+            """, arguments: [maxCount])
+
+            try db.execute(
+                sql: "DELETE FROM items WHERE pinned = 0 AND created_at < ?",
+                arguments: [now - maxAgeSeconds]
+            )
+        }
+    }
+
     func delete(id: Int64) throws {
         try pool.write { db in
             try db.execute(

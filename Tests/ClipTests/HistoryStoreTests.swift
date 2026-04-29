@@ -149,4 +149,35 @@ final class HistoryStoreTests: XCTestCase {
         XCTAssertNoThrow(try s.delete(id: 9999))
         XCTAssertEqual(try s.listRecent().count, 1)
     }
+
+    func testPruneByCountKeepsNewestNonPinned() throws {
+        let s = try HistoryStore.inMemory()
+        // Insert 10 non-pinned items at increasing timestamps.
+        for i in 0..<10 {
+            try s.insert(makeItem(content: "n\(i)", at: Int64(100 + i)))
+        }
+        // Keep newest 3, age cap effectively disabled (very large window).
+        try s.prune(now: 200, maxCount: 3, maxAgeSeconds: 1_000_000)
+
+        let remaining = try s.listRecent().map(\.content)
+        XCTAssertEqual(remaining, ["n9", "n8", "n7"])
+    }
+
+    func testPruneByCountExemptsPinned() throws {
+        let s = try HistoryStore.inMemory()
+        // 5 pinned + 10 non-pinned. Cap non-pinned to 2.
+        for i in 0..<5 {
+            try s.insert(makeItem(content: "p\(i)", at: Int64(100 + i), pinned: true))
+        }
+        for i in 0..<10 {
+            try s.insert(makeItem(content: "n\(i)", at: Int64(200 + i), pinned: false))
+        }
+        try s.prune(now: 1000, maxCount: 2, maxAgeSeconds: 1_000_000)
+
+        let remaining = try s.listRecent(limit: 100)
+        let pinned = remaining.filter(\.pinned).map(\.content).sorted()
+        let nonpinned = remaining.filter { !$0.pinned }.map(\.content)
+        XCTAssertEqual(pinned, ["p0", "p1", "p2", "p3", "p4"])
+        XCTAssertEqual(nonpinned, ["n9", "n8"])
+    }
 }

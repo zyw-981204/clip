@@ -181,7 +181,7 @@ extension AppDelegate {
     }
 }
 
-// MARK: - Task 50: Onboarding-on-first-run wiring
+// MARK: - Onboarding-on-first-run wiring
 extension AppDelegate {
     func showOnboardingIfNeeded() {
         let onboarded = UserDefaults.standard.bool(forKey: "clip.onboarded")

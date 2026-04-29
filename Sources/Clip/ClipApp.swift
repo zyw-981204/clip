@@ -6,7 +6,9 @@ struct ClipApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     var body: some Scene {
-        Settings { PreferencesWindow() }
+        // SwiftUI requires at least one scene. The actual preferences window is
+        // managed by AppDelegate.openPreferences() (NSWindow + NSHostingController).
+        Settings { EmptyView() }
     }
 }
 
@@ -23,6 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var pruner: DispatchSourceTimer!
 
     private var onboardingWindow: NSWindow?
+    private var preferencesWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ note: Notification) {
         // 1. Single-instance check
@@ -100,9 +103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = StatusItemController()
         statusItem.onOpenPanel = { [weak self] in self?.togglePanel() }
         statusItem.onTogglePause = { [weak self] in self?.togglePause() }
-        statusItem.onOpenPreferences = {
-            NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-        }
+        statusItem.onOpenPreferences = { [weak self] in self?.openPreferences() }
 
         // 10. Pruner timer
         startPruner()
@@ -127,6 +128,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             observer.resume()
         }
+    }
+
+    /// Lazily create and present the preferences window. We don't use SwiftUI's
+    /// `Settings { ... }` scene because in LSUIElement (accessory) apps the
+    /// `showSettingsWindow:` selector has no responder — there's no app menu bar
+    /// for SwiftUI to wire it into — so the menu item silently does nothing.
+    /// Manage an NSWindow ourselves and host the SwiftUI view.
+    private func openPreferences() {
+        if let w = preferencesWindow {
+            NSApp.activate(ignoringOtherApps: true)
+            w.makeKeyAndOrderFront(nil)
+            return
+        }
+        let host = NSHostingController(rootView: PreferencesWindow())
+        let w = NSWindow(contentViewController: host)
+        w.title = "Clip 偏好设置"
+        w.styleMask = [.titled, .closable, .miniaturizable]
+        w.isReleasedWhenClosed = false
+        w.center()
+        preferencesWindow = w
+        NSApp.activate(ignoringOtherApps: true)
+        w.makeKeyAndOrderFront(nil)
     }
 
     static func databasePath() -> String {

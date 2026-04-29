@@ -17,7 +17,16 @@ struct ClipItem: Identifiable, Equatable {
     }
 
     static func truncateIfNeeded(_ s: String, limit: Int) -> (String, Bool) {
-        fatalError("implemented in Task 5")
+        let bytes = Array(s.utf8)
+        guard bytes.count > limit else { return (s, false) }
+        var cut = limit
+        // UTF-8 continuation bytes are 10xxxxxx (0x80..0xBF). Back up until cut
+        // points at a leading byte so we never split a codepoint.
+        while cut > 0 && (bytes[cut] & 0xC0) == 0x80 {
+            cut -= 1
+        }
+        let out = String(decoding: bytes.prefix(cut), as: UTF8.self)
+        return (out, true)
     }
 
     static func contentHash(of s: String) -> String {

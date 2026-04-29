@@ -9,4 +9,27 @@ final class ClipItemTests: XCTestCase {
         XCTAssertEqual(ClipItem.byteSize(of: "😀"), 4)       // 1 emoji × 4 bytes
         XCTAssertEqual(ClipItem.byteSize(of: "a你😀"), 1 + 3 + 4)
     }
+
+    func testTruncateNoOpUnderLimit() {
+        let (out, t) = ClipItem.truncateIfNeeded("hello", limit: 256 * 1024)
+        XCTAssertEqual(out, "hello")
+        XCTAssertFalse(t)
+    }
+
+    func testTruncateAt256KBOnASCII() {
+        let s = String(repeating: "a", count: 300_000)
+        let (out, t) = ClipItem.truncateIfNeeded(s, limit: 256 * 1024)
+        XCTAssertTrue(t)
+        XCTAssertEqual(out.utf8.count, 256 * 1024)
+    }
+
+    func testTruncateRespectsUTF8Boundary() {
+        // "你" is 3 bytes; cut limit mid-codepoint must back up to a boundary.
+        let s = String(repeating: "你", count: 10) // 30 bytes
+        let (out, t) = ClipItem.truncateIfNeeded(s, limit: 8) // mid-codepoint
+        XCTAssertTrue(t)
+        // Should back up to 6 bytes (2 full CJK chars), never split a codepoint.
+        XCTAssertEqual(out.utf8.count, 6)
+        XCTAssertEqual(out, "你你")
+    }
 }

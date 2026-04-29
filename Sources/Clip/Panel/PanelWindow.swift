@@ -74,6 +74,14 @@ final class PanelWindow: NSPanel {
         super.close()
     }
 
+    /// Backstop for ESC: NSResponder forwards unhandled `cancelOperation:`
+    /// up the chain. Our SwiftUI hidden `.keyboardShortcut(.cancelAction)`
+    /// button usually catches ESC first, but if SwiftUI focus state ever
+    /// blocks it, this ensures the panel still closes.
+    override func cancelOperation(_ sender: Any?) {
+        self.close()
+    }
+
     /// Show the panel anchored near the mouse cursor:
     /// the panel's top-left corner sits at (cursor.x + 12, cursor.y - 12),
     /// then we clamp to the cursor's current screen `visibleFrame` so the

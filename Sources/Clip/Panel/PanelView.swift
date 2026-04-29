@@ -38,6 +38,16 @@ struct PanelView: View {
             )
             .allowsHitTesting(false)
             .frame(width: 0, height: 0)
+
+            // SwiftUI cancel-action shortcut for ESC. Needed because the
+            // search TextField captures first-responder, so KeyCatcher's
+            // keyDown doesn't fire for ESC. cancelAction is intercepted by
+            // SwiftUI at scene level regardless of focus.
+            Button("") { model.close() }
+                .keyboardShortcut(.cancelAction)
+                .frame(width: 0, height: 0)
+                .opacity(0)
+                .accessibilityHidden(true)
         }
         .frame(width: PanelWindow.size.width, height: PanelWindow.size.height)
         .background(.thinMaterial)

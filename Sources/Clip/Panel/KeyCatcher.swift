@@ -1,12 +1,15 @@
 import AppKit
 import SwiftUI
 
-/// SwiftUI bridge to a first-responder `NSView` that intercepts `keyDown`
-/// events for the panel. SwiftUI's `List` keyboard-nav doesn't work
-/// reliably inside a `.nonactivatingPanel`, and `.onKeyPress` (macOS 14+)
-/// only fires when its host view has focus — which the search field steals.
-/// This view sits behind the UI, becomes first responder when the panel
-/// opens, and dispatches recognised shortcuts to the supplied closures.
+/// SwiftUI bridge that installs an `NSEvent.addLocalMonitorForEvents` on
+/// the host window. The previous first-responder approach was unreliable
+/// because the SwiftUI search field grabs focus and the responder chain
+/// never reaches us. A local key-down monitor is invoked BEFORE the
+/// responder chain, so it works regardless of which subview has focus.
+///
+/// The monitor returns `nil` to consume an event or returns the event to
+/// pass through (e.g. arrows still drive SwiftUI List nav, typing keys
+/// still reach the search field).
 struct KeyCatcher: NSViewRepresentable {
     var onUp: () -> Void
     var onDown: () -> Void
@@ -20,7 +23,6 @@ struct KeyCatcher: NSViewRepresentable {
     func makeNSView(context: Context) -> KeyCatcherView {
         let v = KeyCatcherView()
         v.handlers = handlers()
-        DispatchQueue.main.async { v.window?.makeFirstResponder(v) }
         return v
     }
 
@@ -48,47 +50,68 @@ final class KeyCatcherView: NSView {
     }
 
     var handlers: Handlers?
-
-    override var acceptsFirstResponder: Bool { true }
+    private var monitor: Any?
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        // Defer so the window has finished installing; otherwise
-        // makeFirstResponder fails silently.
-        DispatchQueue.main.async { [weak self] in
-            guard let self, let w = self.window else { return }
-            w.makeFirstResponder(self)
+        if window != nil {
+            installMonitor()
+        } else {
+            removeMonitor()
         }
     }
 
-    override func keyDown(with event: NSEvent) {
-        guard let h = handlers else { return super.keyDown(with: event) }
+    deinit { removeMonitor() }
 
+    private func installMonitor() {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, let w = self.window, event.window === w else { return event }
+            return self.handle(event)
+        }
+    }
+
+    private func removeMonitor() {
+        if let m = monitor { NSEvent.removeMonitor(m) }
+        monitor = nil
+    }
+
+    /// Returns nil to consume the event, or the event itself to pass through.
+    private func handle(_ event: NSEvent) -> NSEvent? {
+        guard let h = handlers else { return event }
         let cmd = event.modifierFlags.contains(.command)
         let chars = event.charactersIgnoringModifiers ?? ""
 
         // ⌘1 – ⌘9 take precedence over plain digits.
         if cmd, let digit = Int(chars), (1...9).contains(digit) {
-            h.onIndex(digit); return
+            h.onIndex(digit); return nil
         }
 
         if cmd {
             switch chars.lowercased() {
-            case "p": h.onPin(); return
-            case "d": h.onDelete(); return
-            case "f": h.onFocusSearch(); return
+            case "p": h.onPin(); return nil
+            case "d": h.onDelete(); return nil
+            case "f": h.onFocusSearch(); return nil
             default: break
             }
         }
 
         switch event.keyCode {
-        case 126: h.onUp()      // up arrow
-        case 125: h.onDown()    // down arrow
-        case 36, 76: h.onEnter()        // return / numpad-enter
-        case 53: h.onEscape()           // escape
-        case 51, 117: h.onDelete()      // backspace / forward-delete
+        case 36, 76:                      // return / numpad-enter
+            h.onEnter(); return nil
+        case 53:                          // escape
+            h.onEscape(); return nil
+        case 51, 117:                     // backspace / forward-delete
+            // Only treat as "delete history item" when search field is NOT
+            // the first responder; otherwise let the user backspace search text.
+            if let editor = window?.firstResponder as? NSText, editor.string.isEmpty == false {
+                return event
+            }
+            if window?.firstResponder is NSTextView { return event }
+            h.onDelete(); return nil
         default:
-            super.keyDown(with: event)
+            // Arrow keys, alphanumerics for the search field, etc.
+            return event
         }
     }
 }

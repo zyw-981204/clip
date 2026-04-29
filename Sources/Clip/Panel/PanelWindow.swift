@@ -190,6 +190,12 @@ final class PanelWindow: NSPanel {
     func showAtCursor() {
         positionNearCursor()
         self.makeKeyAndOrderFront(nil)
+        // AppKit's default initial-first-responder logic auto-focuses the
+        // first text field on key, which steers ⎵ / arrow keys into the
+        // search field's editor instead of our local key monitor. Clear it
+        // so the panel's window-level monitor sees keypresses unmodified.
+        // ⌘F still re-focuses the field on demand.
+        self.makeFirstResponder(nil)
         startWatchingAppSwitches()
         installKeyMonitor()
     }

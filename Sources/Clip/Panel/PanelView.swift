@@ -80,57 +80,54 @@ struct PanelView: View {
         if model.items.isEmpty {
             emptyState
         } else {
-            ScrollViewReader { proxy in
-                List(selection: Binding(
-                    get: { model.selectedID },
-                    set: { model.selectedID = $0 }
-                )) {
-                    ForEach(Array(model.pageItems.enumerated()), id: \.element.id) { idx, item in
-                        PanelRow(item: item, index: idx + 1, model: model)
-                            .id(item.id)
-                            .tag(item.id)
-                            .listRowBackground(
-                                item.id == model.selectedID
-                                    ? Color.accentColor.opacity(0.2)
-                                    : Color.clear
-                            )
-                            .contentShape(Rectangle())
-                            .onTapGesture(count: 2) {
-                                model.selectedID = item.id
-                                model.paste()
+            // No ScrollViewReader / scrollTo here: we paginate at 10 rows so
+            // every visible row already fits inside the panel — calling
+            // proxy.scrollTo on each selectedID change is pure overhead and
+            // makes ↑↓ navigation feel laggy.
+            List(selection: Binding(
+                get: { model.selectedID },
+                set: { model.selectedID = $0 }
+            )) {
+                ForEach(Array(model.pageItems.enumerated()), id: \.element.id) { idx, item in
+                    PanelRow(item: item, index: idx + 1, model: model)
+                        .id(item.id)
+                        .tag(item.id)
+                        .listRowBackground(
+                            item.id == model.selectedID
+                                ? Color.accentColor.opacity(0.2)
+                                : Color.clear
+                        )
+                        .contentShape(Rectangle())
+                        .onTapGesture(count: 2) {
+                            model.selectedID = item.id
+                            model.paste()
+                        }
+                        .onTapGesture {
+                            model.selectedID = item.id
+                        }
+                        .contextMenu {
+                            Button(item.pinned ? "取消置顶" : "置顶") {
+                                Task { await model.togglePin(item: item) }
                             }
-                            .onTapGesture {
-                                model.selectedID = item.id
+                            Button("复制原文") {
+                                model.copyToPasteboard(item)
                             }
-                            .contextMenu {
-                                Button(item.pinned ? "取消置顶" : "置顶") {
-                                    Task { await model.togglePin(item: item) }
-                                }
-                                Button("复制原文") {
-                                    model.copyToPasteboard(item)
-                                }
-                                Divider()
-                                Button("删除", role: .destructive) {
-                                    Task { @MainActor in
-                                        await model.delete(item: item) {
-                                            await PanelDeleteConfirm.confirm(
-                                                window: NSApp.keyWindow,
-                                                content: item.content
-                                            )
-                                        }
+                            Divider()
+                            Button("删除", role: .destructive) {
+                                Task { @MainActor in
+                                    await model.delete(item: item) {
+                                        await PanelDeleteConfirm.confirm(
+                                            window: NSApp.keyWindow,
+                                            content: item.content
+                                        )
                                     }
                                 }
                             }
-                    }
-                }
-                .listStyle(.plain)
-                .scrollContentBackground(.hidden)
-                .onChange(of: model.selectedID) { new in
-                    if let new {
-                        withAnimation(.none) { proxy.scrollTo(new, anchor: .center) }
-                    }
+                        }
                 }
             }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
         }
     }
 

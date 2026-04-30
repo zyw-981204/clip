@@ -83,6 +83,10 @@ struct PanelView: View {
 
     /// Push the computed height into the NSPanel, anchoring its top edge so
     /// the panel "grows / shrinks downward" rather than jumping vertically.
+    /// After the top-anchor, clamp the frame to the current screen's
+    /// `visibleFrame` so the panel never extends behind the Dock or above
+    /// the menu bar — the user reported the last row being clipped when
+    /// the panel grew downward near the bottom of the screen.
     private func resizePanel() {
         guard let panel = NSApp.windows.compactMap({ $0 as? PanelWindow }).first
         else { return }
@@ -91,7 +95,19 @@ struct PanelView: View {
         let dy = f.height - target
         guard abs(dy) > 0.5 else { return }
         f.size.height = target
-        f.origin.y += dy           // keep top edge in place
+        f.origin.y += dy
+
+        let mid = NSPoint(x: f.midX, y: f.midY)
+        let screen = NSScreen.screens.first(where: { NSMouseInRect(mid, $0.frame, false) })
+            ?? NSScreen.main
+        if let visible = screen?.visibleFrame {
+            if f.origin.y + f.height > visible.maxY {
+                f.origin.y = visible.maxY - f.height
+            }
+            if f.origin.y < visible.minY {
+                f.origin.y = visible.minY
+            }
+        }
         panel.setFrame(f, display: true, animate: false)
     }
 

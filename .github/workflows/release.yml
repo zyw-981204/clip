@@ -1,0 +1,85 @@
+name: release
+
+# Triggered only when you push a tag matching `v*` (e.g. `v0.1.0`).
+# Push to a normal branch goes through `ci.yml` (compile + test) and does
+# NOT cut a release. To cut one:
+#   git tag v0.1.0
+#   git push origin v0.1.0
+on:
+  push:
+    tags:
+      - 'v*'
+
+# `gh release create` writes to the repo via GITHUB_TOKEN.
+permissions:
+  contents: write
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tag `v0.1.0` → version `0.1.0` (CFBundleShortVersionString hates the `v`).
+      - name: derive version
+        id: ver
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          echo "tag=$tag"            >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}"    >> "$GITHUB_OUTPUT"
+
+      # Belt-and-suspenders: don't ship a tag whose tests are red.
+      - name: swift test
+        run: swift test
+
+      # Reuse the local packaging script so dev + CI produce identical
+      # bundles. CODESIGN_IDENTITY=- forces ad-hoc; flip to a real
+      # Developer ID identity once you have one (and stash the cert as
+      # an Actions secret).
+      - name: package
+        env:
+          CODESIGN_IDENTITY: '-'
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: ./package-app.sh
+
+      # `ditto -c -k --keepParent` is the macOS-canonical way to zip an
+      # .app bundle: preserves resource forks, xattrs, and symlinks. A
+      # plain `zip` can corrupt the bundle.
+      - name: zip
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          cd dist
+          ditto -c -k --keepParent Clip.app "Clip-$TAG.zip"
+          shasum -a 256 "Clip-$TAG.zip"
+
+      # Compose release notes = static install/usage prefix + auto-generated
+      # changelog from commits since the previous tag.
+      - name: compose release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          auto_body=$(gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="$TAG" --jq '.body' 2>/dev/null || echo "")
+
+          {
+            cat .github/RELEASE_NOTES_PREFIX.md
+            echo
+            echo "---"
+            echo
+            echo "$auto_body"
+          } > /tmp/release_notes.md
+
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            "dist/Clip-$TAG.zip" \
+            --title "$TAG" \
+            --notes-file /tmp/release_notes.md

@@ -1,17 +1,35 @@
-name: test
+name: ci
 
 on:
   push:
     branches: [main]
   pull_request:
 
+# Pin to a runner image that ships Xcode 16+ (Swift 6.0 + PreviewsMacros
+# plugin). Setting DEVELOPER_DIR here makes every step's `swift` resolve
+# through the full Xcode toolchain, not Command Line Tools — the
+# KeyboardShortcuts dependency uses `#Preview` macros that fail to load
+# under CLT.
+env:
+  DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+
 jobs:
-  test:
-    runs-on: macos-latest
+  ci:
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: "6.0"
+
+      - name: toolchain
+        run: |
+          swift --version
+          xcrun -f swift
+
       - name: swift test
         run: swift test --enable-code-coverage
+
+      # Verify a release-mode build still compiles. `swift test` already
+      # exercises the library in debug; this step catches release-only
+      # issues (optimizer, conditional compilation, link-time visibility)
+      # before they surface during `./package-app.sh`.
+      - name: release build
+        run: swift build -c release --product Clip

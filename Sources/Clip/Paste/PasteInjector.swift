@@ -32,7 +32,11 @@ final class PasteInjector {
 
     private func finalize(close: @escaping () -> Void) {
         close()
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) { [weak self] in
+        // 100ms (was 50) gives focus a bit more time to return to the
+        // previously-frontmost app — some apps (Electron, terminals) need
+        // the longer breathing room or the synthetic ⌘V hits a stale
+        // first-responder.
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self] in
             self?.postCommandV()
         }
     }
@@ -46,19 +50,49 @@ final class PasteInjector {
         }
     }
 
-    /// Posts a ⌘V keyDown + keyUp pair through the session event tap.
-    /// Virtual key 0x09 = "V" on US layout (Apple HIToolbox kVK_ANSI_V).
-    /// No-op when the app is not Accessibility-trusted; the content is still
+    /// Synthesise ⌘V for the previously-frontmost app.
+    ///
+    /// We post FOUR events — Cmd down, V down, V up, Cmd up — instead of
+    /// just two V events with `.maskCommand` set. Reason: some apps
+    /// (terminals like Ghostty, Electron-based apps, anything that checks
+    /// system-level modifier state via NSEvent.modifierFlags rather than
+    /// the per-event flags field) won't recognize the synthetic ⌘V if the
+    /// Cmd key was never "pressed". The user reported pasting an image
+    /// into a terminal yielded a literal "v" — that's exactly this failure
+    /// mode: terminal saw the V keypress without acknowledging Cmd, fell
+    /// through to plain text input.
+    ///
+    /// Virtual keycodes: kVK_ANSI_V = 0x09, kVK_Command (left) = 0x37.
+    /// No-op if the app isn't Accessibility-trusted; the content is still
     /// on the pasteboard so the user can ⌘V manually.
     private func postCommandV() {
         guard AccessibilityCheck.isTrusted() else { return }
         let src = CGEventSource(stateID: .combinedSessionState)
         let vKey: CGKeyCode = 0x09
-        let down = CGEvent(keyboardEventSource: src, virtualKey: vKey, keyDown: true)
-        let up   = CGEvent(keyboardEventSource: src, virtualKey: vKey, keyDown: false)
-        down?.flags = .maskCommand
-        up?.flags   = .maskCommand
-        down?.post(tap: .cgSessionEventTap)
-        up?.post(tap: .cgSessionEventTap)
+        let cmdKey: CGKeyCode = 0x37
+
+        let tap: CGEventTapLocation = .cgSessionEventTap
+
+        // Press Cmd (modifier-key keyDown synthesizes the flagsChanged
+        // event the system uses to track modifier state).
+        if let e = CGEvent(keyboardEventSource: src, virtualKey: cmdKey, keyDown: true) {
+            e.flags = .maskCommand
+            e.post(tap: tap)
+        }
+        // Press V (with Cmd held).
+        if let e = CGEvent(keyboardEventSource: src, virtualKey: vKey, keyDown: true) {
+            e.flags = .maskCommand
+            e.post(tap: tap)
+        }
+        // Release V.
+        if let e = CGEvent(keyboardEventSource: src, virtualKey: vKey, keyDown: false) {
+            e.flags = .maskCommand
+            e.post(tap: tap)
+        }
+        // Release Cmd.
+        if let e = CGEvent(keyboardEventSource: src, virtualKey: cmdKey, keyDown: false) {
+            e.flags = []
+            e.post(tap: tap)
+        }
     }
 }

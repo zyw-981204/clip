@@ -213,7 +213,7 @@ struct PanelView: View {
 
     private var footer: some View {
         VStack(spacing: 2) {
-            Text("↑↓ 选 · ←→ 翻页 · ↵ 粘贴 · ⎵ 预览 · ⌘1–9 直接粘")
+            Text("↑↓ 选 · ←→ 翻页 · ↵ 粘贴 · ⎵ 预览 · ⌘1–9 直接粘 · ⌥1–3 切类型")
             HStack(spacing: 6) {
                 Text("⌘F 搜 · ⌘P 钉 · ⌘D 删 · esc 关闭")
                 if !model.items.isEmpty {

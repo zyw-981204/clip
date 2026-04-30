@@ -32,6 +32,8 @@ final class PanelWindow: NSPanel {
         let onPrevPage: () -> Void
         let onNextPage: () -> Void
         let onPreview: () -> Void
+        /// ⌥1 / ⌥2 / ⌥3 → 全部 / 文字 / 图片. 1-based.
+        let onSwitchTab: (Int) -> Void
     }
 
     var keyHandlers: KeyHandlers?
@@ -136,6 +138,14 @@ final class PanelWindow: NSPanel {
         // ⌘1 – ⌘9 → jump-paste Nth row.
         if cmd, let digit = Int(chars), (1...9).contains(digit) {
             h.onIndex(digit); return nil
+        }
+
+        // ⌥1 / ⌥2 / ⌥3 → switch content filter tab (全部 / 文字 / 图片).
+        // `charactersIgnoringModifiers` returns the bare digit even with
+        // Option held (e.g. ⌥1 → "1", not "¡").
+        let opt = event.modifierFlags.contains(.option)
+        if opt && !cmd, let digit = Int(chars), (1...3).contains(digit) {
+            h.onSwitchTab(digit); return nil
         }
 
         if cmd {

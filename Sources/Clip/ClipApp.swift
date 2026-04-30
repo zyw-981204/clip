@@ -155,7 +155,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onFocusSearch: { /* no-op; SwiftUI button handles it */ },
             onPrevPage: { model.prevPage() },
             onNextPage: { model.nextPage() },
-            onPreview:  { model.togglePreview() }
+            onPreview:  { model.togglePreview() },
+            onSwitchTab: { n in
+                let tabs: [ContentFilter] = [.all, .text, .image]
+                guard tabs.indices.contains(n - 1) else { return }
+                model.contentFilter = tabs[n - 1]
+            }
         )
 
         // 9. Status item

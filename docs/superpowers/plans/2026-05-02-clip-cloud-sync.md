@@ -2488,37 +2488,32 @@ actor SyncEngine {
 
     private func pushItem(itemID: Int64) async throws {
         guard let item = try store.itemByID(itemID) else { return }
+
+        // Resolve blob_hmac for image items so the lazy-fetch pull can locate
+        // blobs/<name>.bin. Text items leave blobHmac = nil.
+        var blobHmac: String? = nil
+        var blobSize: Int? = nil
+        if item.kind == .image, let blobID = item.blobID,
+           let info = try store.blobInfo(id: blobID) {
+            // store.blobInfo(id:) is the existing v2 API: returns (size, sha)
+            blobHmac = crypto.name(forContentHash: info.sha)
+            blobSize = info.size
+        }
+
         let payload = ItemPayload(
             v: 1, kind: item.kind.rawValue, contentHash: item.contentHash,
             content: item.kind == .text ? item.content : nil,
             mimeType: item.mimeType,
-            blobHmac: item.blobID.map { _ in
-                // Resolve blob_hmac from clip_blobs.sha256, hashed via crypto.name
-                // For now placeholder; pushBlob will set it. v3 keeps simple:
-                // we encode null and let pull side derive from the blob name lookup.
-                ""  // overridden below
-            },
-            blobSize: nil, thumbB64: nil,
+            blobHmac: blobHmac,
+            blobSize: blobSize,
+            thumbB64: nil,
             byteSize: item.byteSize, truncated: item.truncated,
             sourceBundleId: item.sourceBundleID,
             sourceAppName: item.sourceAppName,
             createdAt: item.createdAt, pinned: item.pinned,
             deviceId: item.deviceID ?? deviceID)
 
-        // For text-only items the blob_hmac reference is unused on the
-        // pull side. For image items we want the actual blob_hmac so that
-        // lazy fetch can locate the blobs/<name> object. Compute it from
-        // the blob's sha256.
-        var finalPayload = payload
-        if item.kind == .image, let blobID = item.blobID,
-           let info = try store.blobInfo(id: blobID) {
-            finalPayload.blobHmac = crypto.name(forContentHash: info.sha)
-            finalPayload.blobSize = info.size
-        } else if item.kind == .text {
-            finalPayload.blobHmac = nil
-        }
-
-        let json = try JSONEncoder().encode(finalPayload)
+        let json = try JSONEncoder().encode(payload)
         let sealed = try crypto.seal(json)
         let name = crypto.name(forContentHash: item.contentHash)
         let key = CloudKey.itemKey(name: name)
@@ -2549,7 +2544,9 @@ actor SyncEngine {
     }
 
     private func pushDevice() async throws {
-        // Implementation in task 18.
+        // Out of scope for v3 — see "Out of Scope" section. devices/<id>.bin
+        // payload is defined in SyncSchema (DevicePayload) so a v3.1 task can
+        // wire this without protocol changes.
     }
 }
 ```
@@ -2674,7 +2671,12 @@ Append inside the `actor SyncEngine` body, after the push methods:
     }
 
     private func pullPrefix(_ prefix: String) async throws {
-        var cursor: String? = nil
+        // Persisted per-prefix cursor (spec §5.2 / §7.3): JSON map in sync_state.
+        var cursors = (try state.get("last_pull_cursor"))
+            .flatMap { $0.data(using: .utf8) }
+            .flatMap { try? JSONDecoder().decode([String: String].self, from: $0) }
+            ?? [:]
+        var cursor: String? = cursors[prefix]
         repeat {
             let page = try await backend.list(prefix: prefix, after: cursor)
             for obj in page.objects {
@@ -2699,6 +2701,12 @@ Append inside the `actor SyncEngine` body, after the push methods:
             }
             cursor = page.nextCursor
         } while cursor != nil
+        // Persist updated cursor for this prefix.
+        cursors[prefix] = cursor
+        if let data = try? JSONEncoder().encode(cursors),
+           let s = String(data: data, encoding: .utf8) {
+            try state.set("last_pull_cursor", s)
+        }
     }
 
     /// Spec §7.3 — incremental pull: skip GET if list ETag already matches what we
@@ -4045,6 +4053,26 @@ And add this method at the bottom of `AppDelegate`:
     }
 ```
 
+**Lazy blob fetch wire-up** — replace the `case .image:` branch in the existing `panelModel = PanelModel(store: store) { [weak self] item in ... }` setup so that an image row whose `bytes` are empty (the lazy placeholder from a pull) triggers `engine.fetchBlob` before paste:
+
+```swift
+            case .image:
+                guard let blobID = item.blobID else { self.panel.close(); return }
+                Task {
+                    var bytes = (try? self.store.blob(id: blobID)) ?? Data()
+                    if bytes.isEmpty, let engine = self.syncEngine {
+                        bytes = (try? await engine.fetchBlob(blobID: blobID)) ?? Data()
+                    }
+                    guard !bytes.isEmpty else { await MainActor.run { self.panel.close() }; return }
+                    await MainActor.run {
+                        self.injector.pasteImage(bytes: bytes,
+                            mimeType: item.mimeType ?? "image/png") { self.panel.close() }
+                    }
+                }
+```
+
+Same pattern in `PreviewWindow.shared.show(...)` callsite when the preview wants to render a lazy image — fetch first via Task, then call back into `PreviewWindow.refresh(image:)`.
+
 **Bootstrap notification wiring** — also subscribe to the notification CloudSyncView posts after enableSync returns, so the engine spins up immediately (without requiring an app restart) and the first device's backfill kicks off:
 
 ```swift
@@ -4270,6 +4298,9 @@ These items appear in the spec (some only as UI affordances) but are **deliberat
 | §8.4 | First-launch modal sheet ("first Mac vs join existing" branching with progress bar) | The bootstrap logic IS in T17A; UI shows it as a Preferences form rather than a separate onboarding sheet | Functional — user bootstraps via Preferences instead of modal |
 | §10.2 | Password change flow (5-step blocking re-encrypt) | Heavy feature; reset-cloud-and-re-enable accomplishes the same with minor data loss | Per workaround in §8.1 |
 | §10.4 | In-app quota-exceeded remediation flow | Spec already says "user handles via dashboard" | Dashboard link in CloudSyncView status text (manual step) |
+| §10.1 | Special-case R2 401/403: pause push loop + surface auth-error banner | Generic backoff loop will retry forever and the queue will pile up; observable via `查看错误` (also deferred). For v3 the sync_queue.last_error column captures the message | Manual: rotate token in dashboard + paste new secret in CloudSyncView; engine restarts the queue on next push tick |
+| §12 acceptance #4 | Activity-Monitor 24h CPU < 0.5% | Manual measurement; no automated long-running benchmark in v3 | Run app + observe Activity Monitor manually after v3 lands |
+| §12 acceptance #6 | Backfill 1000 entries < 100ms UI block | UI block is bounded by single-actor pushTask + main-thread isolation; not measured | Manual smoke during backfill of a populated DB |
 
 For each item above, the engine architecture is forward-compatible: a follow-up plan can add tasks without touching the core push/pull/crypto/queue modules.
 

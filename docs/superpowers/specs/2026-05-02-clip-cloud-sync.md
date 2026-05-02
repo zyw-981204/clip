@@ -1,676 +1,742 @@
-# clip — 云端剪贴板同步设计文档
+# clip — 云端剪贴板同步设计文档 (v2 架构)
 
-**状态**：spec / pending review
-**日期**：2026-05-02
-**工作名**：cloud-sync（增量到 v3）
-**前序文档**：`docs/superpowers/specs/2026-04-29-clip-design.md`
+**状态**：spec / pending review (architecture pivot)
+**日期**：2026-05-02 (v2 重写)
+**工作名**：cloud-sync (Migration v3)
+**前序文档**：
+- 原 v1 spec (R2-only): `docs/superpowers/specs/2026-05-02-clip-cloud-sync.v1.md.bak`
+- 原 MVP spec: `docs/superpowers/specs/2026-04-29-clip-design.md`
 
-## 0. 与原 spec 的关系（必读）
+## 0. 修订记录
 
-原 spec §2.2 明确把 "iCloud / 跨机同步" 列为**永远不做**。本文档**推翻**这条决策。
+### 0.1 与 v1 的关系（必读）
 
-**为什么改**：用户使用一段时间后明确提出"我想要剪贴板信息同步到云端，跨设备可用"。原 spec 当时的"永远不做"是对 v1 范围的克制，不是对功能本身的否定。本文档作为 v3 的设计延伸，原 spec 其余部分（数据模型 v1/v2、隐私过滤、面板交互、性能预算）继续有效，本文档**只**描述云同步增量。
+v1 把整个云端建模为 **R2 对象存储**：每条剪贴板 = 一个 `items/<hmac>.bin` 加密对象，删除 = `tomb/<hmac>.bin`，设备 = `devices/<id>.bin`。pull 阶段用 `backend.list("items/")` 全量列出再增量 GET。
 
-**revision 记录**：原 spec line 31 `iCloud / 跨机同步（永远不做）` → 本 spec 取代。
+v1 在 plan-review 流程结束后，user 提出尖锐的反例：**每 30s 全量 list 整个桶是浪费**——idle 时也要传几十 KB metadata，实际"什么都没变"。
 
-### 0.1 关于实现拆分
+更深的问题：**对象存储被硬当成数据库用**。每加一个 mutable 字段（pin / exclude / display_name）都要绕：要么重写整条 hmac 文件（pin 改一次 = 整个 item 重 PUT），要么开新 prefix（manifests / devices）。没有一阶的 `WHERE updated_at > ?` 概念。
 
-本 spec 涵盖 KDF + crypto、S3 v4 签名、queue/backoff、lazy-blob fetch、Preferences 重设计、modal onboarding、migration v3、tombstone 语义、密码轮换、R2 集成测试、panel icon、新热键。reviewer 可能认为这跨越多个独立子系统、应该拆成 3-4 份 spec/plan。
+### 0.2 v2 架构
 
-**保持单 spec / 单 plan 的理由**：上述模块之间高度耦合——所有路径都共用 `CryptoBox`、`CloudSyncBackend`、`SyncEngine` 三个核心抽象，拆开后边界处反而要重复定义同样的契约（PayloadVersion、ETag 表示、错误类型）。**拆分应该发生在 plan 内的 task 划分**（pp 1: foundations / 2: backend / 3: engine / 4: UI），而不是 spec 维度。`superpowers:writing-plans` 流程天然把这种规模分解成 bite-sized tasks。
+把云端拆成两层：
+
+- **Cloudflare D1（SQLite at edge）** — 存"轻数据"：每条剪贴板的 metadata + 内容**密文**。提供 SQL `WHERE updated_at > ?` 增量 query，是 pull 的真源。
+- **Cloudflare R2** — 只存"重数据"：图片 / 文件原字节的**密文**。R2 不再被 list / 不再承担"哪条存在"的语义，纯字节 key-value 仓库。
+
+加密规格不变（ChaCha20-Poly1305 + PBKDF2 + HKDF + HMAC 命名），E2E 担保不变（云端任何一层都拿不到明文）。改的是**云端数据的组织**和**pull 算法**。
+
+### 0.3 与原 MVP spec 的关系
+
+原 MVP spec line 31 `iCloud / 跨机同步（永远不做）` 已被 v1 推翻；v2 继续保留同步功能。MVP spec 其余部分（数据模型 v1/v2、隐私过滤、面板交互、性能预算）继续有效，本文档只描述云同步增量到 v3。
 
 ## 1. 概述
 
-为 clip 增加**端到端加密**的跨 Mac 剪贴板历史同步。后端选 **Cloudflare R2**（S3 兼容对象存储），客户端用 ChaCha20-Poly1305 加密后再上传，云端永远拿不到明文。剪贴板条目是 immutable history events，用 content-addressed 命名 → 同条目跨设备天然去重，无合并冲突。
+为 clip 增加**端到端加密的跨 Mac 剪贴板历史同步**。后端用 **Cloudflare D1 + R2**，本地 SQLite 仍是首要源；同步引擎把本地变更串行化推到云端 D1（图片字节走 R2），并轮询 D1 的 `updated_at` 增量游标拉对端变更。剪贴板内容**永远以密文形式离开本机**——D1 的 `ciphertext` 列、R2 的 `blobs/<hmac>.bin` 对象都是 ChaCha20-Poly1305 sealed box，cloud-side 服务（Cloudflare 自己 / 任何拿到 token 的攻击者）只能看到 metadata 索引列（id / hmac / 时间戳），无法解出内容。
 
-**典型用法**：用户在 Mac A 复制一段代码 → 几秒后在 Mac B 唤起面板 → 看到该条目 → Enter 粘贴。
+**典型用法**：用户在 Mac A 复制一段代码 → 几秒内在 Mac B 唤起面板看到该条目 → Enter 粘贴。
 
 ## 2. 目标 / 非目标
 
 ### 2.1 目标
 
 - 跨 2-3 台 Mac 同步剪贴板**全部历史**（文字 + 图片）
-- **强制 E2E 加密**：用户设同步密码，云端只存密文；密码丢 = 数据不可恢复（明示）
+- **强制 E2E 加密**：用户设同步密码，云端 D1 行的内容字段、R2 blob 都是密文；密码丢 = 数据不可恢复（明示）
 - 图片 ≤ 2MB 上传；> 2MB 本地存但跳过云
-- 启用时**全量 backfill** 一次本地既有数据
-- **选择性同步**：每条可标记"不上云"，已上传的会发 tombstone 删除
+- 启用同步时**全量 backfill** 一次本地既有数据
+- **选择性同步**：每条可标记"不上云"，已上传的会更新成 `deleted=1`
+- D1 schema 在首次启用同步时由客户端自动创建（idempotent CREATE TABLE IF NOT EXISTS）
 - 把 capture 之外的 sync / crypto / storage 抽到 `Sources/Clip/Sync/` 单目录，**为后续 iOS 客户端复用准备**（不在本期交付 iOS app）
-- 沿用现有 LSUIElement / .accessory 架构、SQLite + GRDB、Migrations 链，不重写既有模块
+- 沿用现有 LSUIElement / .accessory 架构、SQLite + GRDB、Migrations 链
 
 ### 2.2 非目标 / 留给以后
 
 - iOS / iPadOS 客户端 app（架构准备好，本期不交付）
-- CloudKit / Backblaze / 自建 S3 等其它 backend（架构 pluggable，本期只实现 R2）
-- 实时推送（无 APNS entitlement 跨 app；用 30s 轮询 + 唤醒/激活时 immediate pull）
-- 选择性同步的 app-id 维度规则（先用每条手动；现有 Blacklist 已经在 capture 层挡）
+- 自建 PostgreSQL / Supabase / 其它 DB backend（架构 pluggable，本期只实现 D1）
+- 实时推送（无 APNS entitlement；用 30s 轮询 + 唤醒 / 激活时 immediate pull）
+- 选择性同步的 app-id 维度规则（先用每条手动；现有 Blacklist 在 capture 层挡）
 - "仅 WiFi" / 流量控制 / 带宽限速
 - 同步 Preferences / 黑名单 / 热键设置
-- 多账号 / 多 cloud profile（每台 Mac 一份配置）
-- 端到端**密码恢复**机制（KDF + Keychain，丢密码就是丢数据；UI 上做强提醒）
-- 密码轮换的**在线 / 增量 / 后台优化**（v3.1 再做。v3 已含基础密码修改流程，但是阻塞式重传——见 §10.2）
+- 多 cloud profile（每台 Mac 一份配置）
+- E2E **密码恢复** 机制
+- 密码轮换的**在线 / 增量 / 后台优化**（v3 含基础阻塞式重传，§10.2）
+- R2 blob 的 lifecycle GC（被 tombstone 的 row 对应的 blob 不会自动删，留 v3.1）
 
 ## 3. 设计决策汇总
 
 | # | 决策点 | 选择 | 理由 |
 |---|---|---|---|
-| 1 | Backend | Cloudflare R2（S3 API） | 免费 10GB / 出口免费 / 跨平台 / 控制力强；vs iCloud Drive 同步延迟不可控、跨端体验差 |
-| 2 | Backend 抽象 | `CloudSyncBackend` protocol，5 个方法（put/get/delete/list/headObject） | 不绑定 R2；以后加 CloudKit / Backblaze / 自建 = 写一个 adapter |
-| 3 | 加密算法 | **ChaCha20-Poly1305**（Apple `CryptoKit.ChaChaPoly`，AEAD） | 原生、性能好、AEAD 一步完成 confidentiality + integrity；vs AES-GCM 在 iOS 老设备性能差 |
-| 4 | 密钥派生 | **PBKDF2-HMAC-SHA256**, 200k rounds, 32B 输出（CommonCrypto `CCKeyDerivationPBKDF`） | 抗暴力够用；CryptoKit 没原生 PBKDF2，scrypt/argon2 需引第三方依赖 |
-| 5 | 密钥分层 | 主密钥 → HKDF 派生 `kEncrypt`（加密）+ `kName`（HMAC 命名） | 单个泄漏不污染另一个用途；标准 NIST SP 800-108 模式 |
-| 6 | 文件命名 | `HMAC-SHA256(content_hash, kName)` 取 hex → 文件名 | 云端看不到 content_hash 也看不到内容；同 hash 跨设备命名一致 → 天然去重 |
-| 7 | 内容寻址 | 是 | 同一段文字在两台 Mac 复制 → 同 hmac → 第二台 PUT 覆盖第一台，幂等无冲突 |
-| 8 | 冲突解决 | **R2 LastModified 比较**（不是 payload 内的 created_at）。同 hmac 多次 PUT，list 拿到的 LastModified 较新者 wins。pin/exclude 是少数 mutable 字段；payload 内 created_at 用作 tombstone vs item 的复活判定（见 §10.3） | 区分两种比较语义：跨设备并发改 pin → 服务端时间为准；删除复活 → payload 时间为准 |
-| 9 | 图片存储 | 元数据 + 缩略图（≤ 5KB）随 item JSON 一起；原图单独 `blobs/<hmac>` 对象；backfill 与正常 push 共用串行 pushTask（不并行） | 拉取端按需下载原图，避免一同步就占满本地磁盘；串行 push 简化错误恢复 |
-| 10 | 大图阈值 | > 2MB 不上云（本地仍存） | 平衡带宽和实用性；同步 panel 显示 "📤 跳过云"  |
-| 11 | Tombstone | 删除 = 删 `items/<h>` + 写 `tomb/<h>`；本地 `tombstones` 表防"复活"。复活判定语义见 §10.3 | 单写 `items/` 删的方案在 list-page 边界会复活：A 删后 B 在 list `items/` 拿到陈旧页面（没看到删除），又把它当作"新增"重新 INSERT，所以必须有显式 tomb 标记 |
-| 12 | Pin / Exclude | inline 在 item JSON 里；toggle 即重传同 key | 简单；pin 改一次约几百字节 PUT |
-| 13 | Backfill | 启用时把所有 items + clip_blobs 推入 sync_queue | 用户期望"过去的也能同步" |
-| 14 | 拉取频率 | 30s 轮询 + app launch / wake / hotkey 唤起时 immediate pull | 没 APNS，轮询是唯一选项；30s 在能感知和省电之间 |
-| 15 | Device 标识 | 每台 Mac 启用同步时生成 UUID，存 `sync_state.device_id` | 用于 item 元数据里"来源设备"展示 + 调试 |
-| 16 | 密码丢失 | 不可恢复，UI 强提示；提供 "reset cloud" 清空 R2 + 重设密码 | E2E 的本质代价；自动备份密码到云就破坏 E2E |
-| 17 | 模块组织 | `Sources/Clip/Sync/` 子目录，纯 Swift Foundation，无 AppKit 依赖 | 为后续抽 `ClipKit` 共享 lib 给 iOS 用做准备；本期不实际拆 package |
-| 18 | iOS 客户端 | 不交付 | 设计上预留；交付清单里只是"代码能搬"，UI / Pasteboard 适配是独立工程 |
+| 1 | 云端"哪条存在"的真源 | **Cloudflare D1**（SQLite at edge，REST API 访问） | 原生支持 `WHERE updated_at > ?` 增量游标；pull 在没变化时 0 流量；schema 演进直接 ALTER TABLE。**vs R2 全 list**：节流量 100×+ |
+| 2 | 云端 blob 字节存放 | **Cloudflare R2** | 只为图片用；2MB 单对象远低于 R2 5GB PUT 上限；同账号同 token 即可；DB 行通过 `blob_key` 引用 |
+| 3 | DB 客户端 | 直接调 D1 REST API（**不**部署 Workers 中间层） | 个人工具不值得部署 Workers；REST `POST /accounts/{id}/d1/database/{db}/query` + Bearer token 一句话；后续要中间层（速率限制 / IP allowlist）再加 |
+| 4 | 后端抽象 | **`CloudSyncDataSource`** (D1) + **`CloudSyncBlobStore`** (R2) 两个独立 protocol | 干净分层：行操作 vs 对象操作；测试时各自 mock；以后 D1 换 Supabase / R2 换 S3 各自独立替换 |
+| 5 | 加密算法 | **ChaCha20-Poly1305**（CryptoKit `ChaChaPoly`，AEAD） | 同 v1 |
+| 6 | 密钥派生 | **PBKDF2-HMAC-SHA256**, 200k rounds, 32B 输出 (CommonCrypto) | 同 v1 |
+| 7 | 密钥分层 | 主密钥 → HKDF 派生 `kEncrypt`（加密 row）+ `kName`（HMAC 命名 R2 blob + 跨设备 dedup hash） | 同 v1 |
+| 8 | DB row id | **客户端生成 UUID**，主键 | D1 服务端不能依赖 autoincrement（多设备并发 INSERT 会碰撞）；UUIDv4 全球唯一 |
+| 9 | 跨设备去重 | 每行带 `hmac` 列（`HMAC(content_hash, kName)`，明文），有索引；客户端 push 前查"本地或云 hmac 已存在?" | 不能用 D1 UNIQUE 约束（hmac 是密文派生的，但明文 hmac 暴露存在等价性这个轻量 metadata；接受这种泄漏，因为它不暴露内容） |
+| 10 | 删除语义 | D1 行 `deleted=1` flag + `updated_at` bump（**软删除**）；本地 `tombstones` 表保留防 capture 时复活 | 软删除在 SQL 模型里更自然，pull 看到 deleted=1 就本地删；hard-delete 会让 cursor 错过 |
+| 11 | 冲突解决 | LWW by D1 server-side **`updated_at`**（D1 在 UPDATE 时由我们主动写入 `unixepoch()`，类似 trigger） | 同 row 在 A / B 上 pin 不一致 → 后写者赢；payload `created_at` 不参与 LWW（只用于 tomb-vs-fresh-item 复活判定） |
+| 12 | Pin / Exclude | 内嵌在 row 的密文 payload；toggle = D1 UPDATE；`updated_at` 自动 bump | DB 模型天然支持 partial update |
+| 13 | 图片存储 | 元数据 + 缩略图（≤ 5KB，base64）随 row ciphertext；原图字节 = R2 单独对象，DB row 持 `blob_key`；拉取端 lazy fetch | 拉端默认不拉原图；点开预览/粘贴时按 `blob_key` 去 R2 GET + 解密 |
+| 14 | 大图阈值 | > 2MB 不上传（本地仍存）；DB 行不写入；UI 显示 📤 | 同 v1 |
+| 15 | Tombstone vs item 同 hash | tomb 时间 ≥ item.created_at → tomb wins（防止陈旧 INSERT 复活已删条目）；item 较新 → item wins（用户在 tomb 后又复制了相同内容） | 同 v1 §10.3 |
+| 16 | 拉取频率 | 30s 轮询 + app launch / wake / hotkey 触发的 immediate pull（5s 内合并） | 同 v1，但每次 pull = 一条 SQL `SELECT WHERE updated_at > cursor LIMIT 100`，idle 时返回 0 行 |
+| 17 | 设备 metadata | D1 单独 `devices` 表（每设备一行；UPDATE on launch / display_name 改） | DB 模型下 trivial |
+| 18 | KDF 配置存放 | D1 `config` 表（明文 KV），首次启用时 INSERT salt + iters | 替代 v1 的 `config.json` R2 对象；同样 idempotent；任意设备首次启用都能拿到 |
+| 19 | iOS 客户端 | 不交付，架构允许 | D1 REST API 任何 platform 都可调；R2 同；`ClipKit` extraction 跟 v1 计划一致 |
+| 20 | 密码丢失 | 不可恢复，UI 强提示；提供"清空云端 + 重设"流程 | 同 v1 |
 
 ## 4. 架构
 
-### 4.1 模块分工
+### 4.1 进程 + 模块分工
 
-| 模块 | 职责 | 路径 |
-|---|---|---|
-| `CloudSyncBackend`（protocol） | 抽象的对象存储读写接口 | `Sources/Clip/Sync/CloudSyncBackend.swift` |
-| `R2Backend` | S3 v4 签名 + URLSession 实现 backend | `Sources/Clip/Sync/R2Backend.swift` |
-| `LocalDirBackend` | 写本地目录的 backend，单测和无网测试用 | `Sources/Clip/Sync/LocalDirBackend.swift` |
-| `CryptoBox` | ChaCha20 seal/open + HMAC 命名 | `Sources/Clip/Sync/CryptoBox.swift` |
-| `KeyDerivation` | PBKDF2 包装；从密码 + salt → 主密钥 | `Sources/Clip/Sync/KeyDerivation.swift` |
-| `SyncEngine` | 拉取轮询 + 推送队列调度 + tombstone 处理 | `Sources/Clip/Sync/SyncEngine.swift` |
-| `SyncQueue` | 持久化重试队列（DB 表），带 backoff | `Sources/Clip/Sync/SyncQueue.swift` |
-| `SyncSchema` | 云对象 payload 结构 + Codable | `Sources/Clip/Sync/SyncSchema.swift` |
-| `SyncSettings` | 启用状态、密码、桶配置；密码不落盘 | `Sources/Clip/Sync/SyncSettings.swift` |
-| `KeychainStore` | 主密钥 / R2 token 落 Keychain | `Sources/Clip/Sync/KeychainStore.swift` |
-| `CloudSyncView`（SwiftUI） | Preferences 新 tab "云同步" | `Sources/Clip/Preferences/CloudSyncView.swift` |
-| `Migrations.v3` | DB 迁移加 sync 相关字段和表 | `Sources/Clip/Storage/Migrations.swift` |
-
-`HistoryStore` 现有 API 不破坏，加少量 hooks（`onInsert`、`onDelete`、`onPinToggle` 回调），由 `AppDelegate` 在初始化时把 `SyncEngine.enqueue*` 接进去。
-
-### 4.2 进程模型
-
-仍是单进程 LSUIElement，新增一个**串行 actor** `SyncEngine`：
+仍是单进程 LSUIElement，新增 **`SyncEngine` actor** 串行化所有云端动作。
 
 ```
 AppDelegate
-  ├─ HistoryStore (existing)
-  ├─ PasteboardObserver (existing) → store.insert → store hook → engine.enqueuePush
+  ├─ HistoryStore (existing) ← onChange hook → engine.enqueuePush
+  ├─ PasteboardObserver (existing)
   └─ SyncEngine (new actor)
-        ├─ pushTask: 串行 drain SyncQueue → backend.put
-        └─ pullTask: 30s timer → backend.list → 比对 cloud_index → backend.get → store.upsert
+        ├─ pushTask (Task): drain SyncQueue → D1Backend.upsertRow / R2BlobBackend.put
+        └─ pullTask (Task): 30s timer → D1Backend.queryChangesSince(cursor) → upsert local + lazy blob refs
 ```
 
-`SyncEngine` 是 Swift `actor`，所有可变状态串行化。后台用 `Task` 跑两条不阻塞主线程的循环。
+| 模块 | 职责 | 路径 |
+|---|---|---|
+| `CloudSyncDataSource`（protocol） | D1 行抽象：upsert / queryChanges / setDeleted | `Sources/Clip/Sync/CloudSyncDataSource.swift` |
+| `D1Backend` | D1 REST API 实现 (Cloudflare API token) | `Sources/Clip/Sync/D1Backend.swift` |
+| `LocalSqliteDataSource` | 内存 SQLite 模拟 D1，仅给单测用 | `Sources/Clip/Sync/LocalSqliteDataSource.swift` |
+| `CloudSyncBlobStore`（protocol） | R2 blob 抽象：put / get | `Sources/Clip/Sync/CloudSyncBlobStore.swift` |
+| `R2BlobBackend` | URLSession + S3v4 实现，**只 put/get/delete blobs/<key>**（不 list） | `Sources/Clip/Sync/R2BlobBackend.swift` |
+| `LocalDirBlobStore` | 文件系统模拟 R2，单测用 | `Sources/Clip/Sync/LocalDirBlobStore.swift` |
+| `S3SignerV4` | AWS Sig V4 签名实现 | `Sources/Clip/Sync/S3SignerV4.swift` |
+| `CryptoBox` | ChaChaPoly seal/open + HMAC 命名 | `Sources/Clip/Sync/CryptoBox.swift` |
+| `KeyDerivation` | PBKDF2 wrapper | `Sources/Clip/Sync/KeyDerivation.swift` |
+| `KeychainStore` | 主密钥 / token 落 Keychain | `Sources/Clip/Sync/KeychainStore.swift` |
+| `SyncEngine` | 推送 + 拉取协调 | `Sources/Clip/Sync/SyncEngine.swift` |
+| `SyncQueue` | DB-backed retry buffer | `Sources/Clip/Sync/SyncQueue.swift` |
+| `SyncSchema` | 行 ciphertext payload Codable + D1 schema 字符串 | `Sources/Clip/Sync/SyncSchema.swift` |
+| `SyncSettings` | UserDefaults wrapper：endpoints / token IDs | `Sources/Clip/Sync/SyncSettings.swift` |
+| `SyncStateStore` | 本地 sync_state 表 KV wrapper | `Sources/Clip/Sync/SyncStateStore.swift` |
+| `CloudSyncView`（SwiftUI） | Preferences 新 tab "云同步" | `Sources/Clip/Preferences/CloudSyncView.swift` |
+| `Migrations.v3` | 本地 schema 迁移 | `Sources/Clip/Storage/Migrations.swift` |
 
-### 4.3 `CloudSyncBackend` 协议契约
+### 4.2 `CloudSyncDataSource` 协议契约
 
 ```swift
-struct CloudObjectMeta {
-    var key: String          // e.g. "items/abc...bin"
-    var etag: String         // PUT/list 返回的 ETag (去引号)
-    var lastModified: Int64  // unix 秒
-    var size: Int            // 字节数
+struct CloudRow: Sendable, Equatable {
+    var id: String              // UUID, plaintext primary key
+    var hmac: String            // HMAC(content_hash, kName), plaintext, indexed
+    var ciphertext: Data        // ChaChaPoly sealed JSON of {content, metadata}
+    var kind: String            // "text" | "image"
+    var blobKey: String?        // R2 object key for image; nil for text
+    var byteSize: Int           // plaintext size, plaintext for UI hint / debug
+    var deviceID: String        // last writer
+    var createdAt: Int64
+    var updatedAt: Int64        // server-side bumped on UPDATE/INSERT
+    var deleted: Bool
 }
 
-struct ListPage {
-    var objects: [CloudObjectMeta]
-    var nextCursor: String?  // nil = 最后一页
+struct DeviceRow: Sendable, Equatable {
+    var deviceID: String
+    var ciphertext: Data        // sealed JSON of {display_name, model}
+    var lastSeenAt: Int64
 }
 
-protocol CloudSyncBackend: Sendable {
-    /// PUT；返回的 etag/lastModified 必须从响应 header 读取
-    func put(key: String, body: Data, contentType: String?) async throws -> (etag: String, lastModified: Int64)
+struct ConfigEntry: Sendable {
+    var key: String
+    var value: String
+}
 
-    /// GET；返回 nil = 404；其它错误抛
-    func get(key: String) async throws -> Data?
+protocol CloudSyncDataSource: Sendable {
+    /// Idempotent schema bootstrap (CREATE TABLE IF NOT EXISTS). Called once
+    /// per cold start of an enabled SyncEngine.
+    func ensureSchema() async throws
 
-    /// HEAD（用于"测试连接"和按需校验）
-    func head(key: String) async throws -> CloudObjectMeta?
+    // Clips
+    func upsertClip(_ row: CloudRow) async throws -> Int64    // returns server updated_at
+    func queryClipsChangedSince(cursor: Int64, limit: Int) async throws -> [CloudRow]
+    func setClipDeleted(id: String, at: Int64) async throws -> Int64
 
-    /// DELETE；404 不抛（idempotent）
-    func delete(key: String) async throws
+    // Devices
+    func upsertDevice(_ row: DeviceRow) async throws
+    func listDevices() async throws -> [DeviceRow]
 
-    /// LIST；prefix 必须以 "/" 结尾；cursor=nil 即从头；max 1000 / page
-    func list(prefix: String, after cursor: String?) async throws -> ListPage
+    // Config (KDF salt etc.)
+    func getConfig(key: String) async throws -> String?
+    func setConfig(key: String, value: String) async throws
+}
+
+protocol CloudSyncBlobStore: Sendable {
+    func putBlob(key: String, body: Data) async throws
+    func getBlob(key: String) async throws -> Data?    // nil = 404
+    func deleteBlob(key: String) async throws           // idempotent
 }
 ```
 
-**list 分页约定**：返回每页最多 1000 个对象（R2 默认上限）；当 `nextCursor != nil` 时调用方继续传回；分页过程中如果有对象被 PUT/DELETE，**只保证最终一致**——可能错过本轮但下轮 30s 必能见。
+**没有 `list` / `head`**：DataSource 不需要枚举（query 是增量 cursor）；BlobStore 也不枚举（拉取由 row 的 `blob_key` 直接定位）。
 
-**Pull 阶段并发**：v3 内 GET 串行（一次一个）。性能预算 §9 已按串行算账。如果 backfill 拉量巨大要并行优化，留 v3.x。
+### 4.3 D1 REST API 调用约定
 
-## 5. 数据模型 — Migration v3
+D1 SQL 查询走 `POST https://api.cloudflare.com/client/v4/accounts/{account_id}/d1/database/{database_id}/query`，body 形如：
 
-### 5.1 字段增量
+```json
+{ "sql": "SELECT * FROM clips WHERE updated_at > ?1 ORDER BY updated_at LIMIT ?2",
+  "params": [12345, 100] }
+```
+
+`Authorization: Bearer <api_token>`。Response：
+
+```json
+{ "result": [{
+    "results": [{ "id": "...", "hmac": "...", "ciphertext": "<base64>",
+                  "kind": "text", ... }],
+    "success": true, "meta": { "duration": 0.5, "rows_read": 1, "rows_written": 0 }
+}] }
+```
+
+`ciphertext` 是 BLOB → D1 REST 把它编码成 base64 字符串。客户端解码后再 ChaChaPoly.open。
+
+D1 token 权限：**Account → D1 → Edit**（用同一个 R2 token 加这条权限即可，不需要新 token）。
+
+### 4.4 R2 用法（只剩 blob）
+
+R2 用法窄化到三个方法：`putBlob` / `getBlob` / `deleteBlob`，全部 `blobs/<hmac>.bin` 前缀。
+
+- `<hmac>` = `HMAC(blob_sha256, kName)`，跨设备同图片一致
+- BlobStore **不 list**，BlobStore **不存 metadata**
+- 上传时不写 ETag 头（D1 row 是真源；R2 ETag 不参与判定）
+
+`R2BlobBackend` 复用 `S3SignerV4`（v1 写好的同一份代码），但 backend 类只用其中 PUT/GET/DELETE 三个方法（不需要 list / XML 解析）。
+
+## 5. 数据模型
+
+### 5.1 本地 SQLite — Migration v3
 
 ```sql
--- items 加 5 列
+-- items: 加 6 列
+ALTER TABLE items ADD COLUMN cloud_id TEXT;                        -- D1 row UUID; NULL = 未同步
+ALTER TABLE items ADD COLUMN cloud_updated_at INTEGER;             -- D1 server-side updated_at; LWW + skip 用
+ALTER TABLE items ADD COLUMN cloud_synced_at INTEGER;              -- 本机最近一次成功同步该行的时间
+ALTER TABLE items ADD COLUMN cloud_blob_key TEXT;                  -- R2 object key (image kind only)
 ALTER TABLE items ADD COLUMN sync_excluded INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE items ADD COLUMN cloud_synced_at INTEGER;          -- NULL = 未上传
-ALTER TABLE items ADD COLUMN cloud_etag TEXT;                  -- last seen / set ETag
-ALTER TABLE items ADD COLUMN cloud_lastmodified INTEGER;       -- R2 LastModified (unix 秒); LWW 比较用
-ALTER TABLE items ADD COLUMN device_id TEXT;                   -- 最近写者 (UPDATE 时覆盖)
+ALTER TABLE items ADD COLUMN device_id TEXT;                       -- 最近写者 device UUID
 
--- clip_blobs 加 2 列
-ALTER TABLE clip_blobs ADD COLUMN cloud_synced_at INTEGER;
-ALTER TABLE clip_blobs ADD COLUMN cloud_etag TEXT;
-```
+CREATE UNIQUE INDEX idx_items_cloud_id ON items(cloud_id) WHERE cloud_id IS NOT NULL;
 
-### 5.2 新表
-
-```sql
--- 云端 tombstones：被删除的条目，防 "pull 又把它捡回来"
+-- 本地 tombstones：防止 capture 把已删除条目重新入库 + 重新推送
 CREATE TABLE tombstones (
-  hmac               TEXT PRIMARY KEY,      -- HMAC 后的云端文件名
-  content_hash       TEXT NOT NULL,         -- 本地用，确认对应哪条
+  content_hash       TEXT PRIMARY KEY,
+  cloud_id           TEXT NOT NULL,
   tombstoned_at      INTEGER NOT NULL,
-  cloud_synced_at    INTEGER,               -- NULL = 本地 only；NN = 已上传 tomb/<h>
-  cloud_etag         TEXT,                  -- last seen ETag of tomb/<h>; 用于 pull 增量判定
-  cloud_lastmodified INTEGER                -- R2 LastModified (unix 秒); LWW 比较用
+  cloud_updated_at   INTEGER NOT NULL
 );
-CREATE INDEX idx_tombstones_synced ON tombstones(cloud_synced_at);
 
--- 推送队列：persistent retry buffer
+-- sync_queue: 本地 retry 缓冲
 CREATE TABLE sync_queue (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  op          TEXT NOT NULL,                -- 'put_item'|'put_blob'|'put_tomb'
-  target_key  TEXT NOT NULL,                -- 见下方 target_key 编码约定
+  op          TEXT NOT NULL,                  -- 'put_clip' | 'put_blob' | 'put_tomb' | 'put_device'
+  target_key  TEXT NOT NULL,                  -- items.id / clip_blobs.id / tombstones.content_hash / device_id
   attempts    INTEGER NOT NULL DEFAULT 0,
-  next_try_at INTEGER NOT NULL,             -- unix秒；backoff 后下次最早执行时间
+  next_try_at INTEGER NOT NULL,
   last_error  TEXT,
   enqueued_at INTEGER NOT NULL
 );
 CREATE INDEX idx_sync_queue_next ON sync_queue(next_try_at);
 
--- 同步状态：device_id / 上次拉取时间 / KDF 参数等
+-- sync_state: KV
 CREATE TABLE sync_state (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+-- known keys:
+--   device_id              UUID
+--   cloud_pull_cursor      最大已见 D1 updated_at (unix sec)
+--   cloud_pull_device_cursor 同上 for devices 表
+--   kdf_salt_b64           base64(salt) - 16 bytes
+--   kdf_iters              integer (200000)
+--   kdf_version            integer (1)
+```
+
+clip_blobs 不需要新列（lazy 标记复用现有 sha256 列的 `lazy:` 前缀约定，同 v1）。
+
+**与 v1 的 schema 差异**：v1 的 `cloud_etag` / `cloud_lastmodified` / `cloud_name` 全部移除，由 `cloud_id` + `cloud_updated_at` 替代（DB 模型不需要 ETag）。
+
+### 5.2 云端 D1 — schema (clip_v3 db)
+
+```sql
+CREATE TABLE IF NOT EXISTS clips (
+  id           TEXT PRIMARY KEY,           -- UUID v4，客户端生成
+  hmac         TEXT NOT NULL,              -- HMAC(content_hash, kName), 用于跨设备 dedup 查询
+  ciphertext   BLOB NOT NULL,              -- ChaChaPoly sealed JSON (RowPayload)
+  kind         TEXT NOT NULL,              -- 'text' | 'image'
+  blob_key     TEXT,                       -- 'blobs/<hmac>.bin' or NULL
+  byte_size    INTEGER NOT NULL,           -- plaintext content size (UI hint)
+  device_id    TEXT NOT NULL,
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL,           -- 必须 monotonic; pull cursor
+  deleted      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_clips_updated_at ON clips(updated_at);
+CREATE INDEX IF NOT EXISTS idx_clips_hmac ON clips(hmac);
+
+CREATE TABLE IF NOT EXISTS devices (
+  device_id     TEXT PRIMARY KEY,
+  ciphertext    BLOB NOT NULL,             -- sealed JSON {display_name, model, first_seen_at}
+  last_seen_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_devices_last_seen ON devices(last_seen_at);
+
+CREATE TABLE IF NOT EXISTS config (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
--- 已知 keys:
---   device_id           UUID
---   last_pull_at        unix 秒
---   last_pull_cursor    JSON: {"items/": "<token>"|null, "tomb/": ..., "devices/": ...}
---                       —— 每个 prefix 一个独立 cursor；新 prefix 默认 null（从头开始）
---   kdf_salt_b64        base64(salt) - 16 bytes
---   kdf_iters           integer (200000)
---   kdf_version         integer (1)
 ```
 
-**`sync_queue.target_key` 编码约定**：
+`ensureSchema()` 在 SyncEngine 每次启动时跑一遍。`CREATE TABLE IF NOT EXISTS` 是幂等的；旧 D1 数据库不会被破坏。
 
-| op | target_key 内容 | 说明 |
-|---|---|---|
-| `put_item` | `items.id` 的十进制字符串 | pusher 取行 → seal → PUT `items/<hmac>.bin` |
-| `put_blob` | `clip_blobs.id` 的十进制字符串 | pusher 取 blob → seal → PUT `blobs/<hmac>.bin`（hmac 由 blob.sha256 派生）|
-| `put_tomb` | `tombstones.hmac` 直接（不查表）| pusher 直接 PUT `tomb/<hmac>.bin` |
-| `put_device` | `device_id` UUID 字符串 | pusher seal `DevicePayload` PUT `devices/<device_id>.bin`（首启 + 改名时） |
+### 5.3 RowPayload (D1 ciphertext 解密后)
 
-**选择性同步取消推送的语义**（替代 §5.2 早期版本里"标记 skip"的设想）：toggle `sync_excluded = 1` 时，**直接 `DELETE FROM sync_queue WHERE op IN ('put_item','put_blob') AND target_key 对应到此 item`**。无需在 sync_queue 加 skip 列。pusher 永远只看到"该跑就跑"的行。
-
-### 5.3 关键约定
-
-- **去重**：同 `content_hash` → 同 `hmac`（因为 `kName` 跨设备一致）→ 同 R2 文件名。云端永远只有一份。
-- **device_id**：随机生成的 UUID，存 `sync_state`，在 item JSON 里也带一份让 panel 能显示"来自 Mac B"。
-- **kdf 参数**：写在 `sync_state` 里也写在云端 `config.json` 里，新设备先拉 config 才能正确派生密钥。
-
-## 6. 加密 / 命名 详细规范
-
-### 6.1 KDF
-
-```
-salt          := 16 random bytes (per cloud profile, 一次性生成)
-master_key    := PBKDF2-HMAC-SHA256(password, salt, iters=200_000, dkLen=32)
-k_encrypt     := HKDF-SHA256(master_key, info="clip.encrypt.v1", L=32)
-k_name        := HKDF-SHA256(master_key, info="clip.name.v1",    L=32)
-```
-
-`master_key` 派生后存 macOS Keychain（`kSecClassGenericPassword`，service `com.zyw.clip.cloud-master-v1`，account = device_id）；密码本身从不落盘。
-
-### 6.2 文件命名
-
-```
-hmac          := HMAC-SHA256(k_name, content_hash_utf8)
-filename      := items/<hex(hmac)>.bin     // 或 blobs/ tomb/
-```
-
-### 6.3 加密 payload
-
-```
-nonce         := 12 random bytes
-sealed        := ChaChaPoly.seal(plaintext, key=k_encrypt, nonce=nonce)
-                  → ciphertext + 16-byte tag
-on_disk       := nonce(12) || ciphertext || tag(16)
-```
-
-解密对称：分割 12 / N / 16 → `ChaChaPoly.open`。失败（密码错或被篡改）抛 `CryptoBox.Error.decryptionFailed`，**不删本地数据**，UI 提示"密码不对或对象损坏"。
-
-### 6.4 云端对象布局
-
-```
-config.json                                    # 明文，只含 KDF 参数 (没敏感信息)
-items/<hex(hmac)>.bin                          # 加密 ItemPayload
-blobs/<hex(hmac_of_blob_sha)>.bin              # 加密 BlobPayload (only for image kind, ≤2MB)
-tomb/<hex(hmac)>.bin                           # 加密 TombstonePayload
-devices/<device_id>.bin                        # 加密 DevicePayload (首启 + display name 改时上传)
-```
-
-**`cloud_etag` / `cloud_lastmodified` 来源**：
-- S3 PUT 响应的 `ETag` header → `cloud_etag`（R2 实现：MD5-hex 字符串，带双引号包裹，去引号即用）。**v3 不使用 multipart upload**（最大对象 = 2MB image，远低于 R2 单 PUT 5GB 上限），所以 ETag 永远是简单 MD5-hex，不需要处理 `<md5>-<part_count>` 形式
-- S3 PUT 响应的 `Last-Modified` header → 解析为 unix 秒 → `cloud_lastmodified`
-- list 返回的每个 object item 同样带 `etag` 和 `lastModified`，pull 阶段拿来做 LWW 比较
-
-`backend.put` 返回 `(etag, lastModified)` tuple；`SyncEngine` 把两个值都写入对应表行。
-
-**ItemPayload (encrypted JSON)**:
 ```json
 {
   "v": 1,
-  "kind": "text" | "image",
-  "content_hash": "<hex sha256>",
-  "content": "...",                            // text 才有
-  "mime_type": "image/png",                    // image 才有
-  "blob_hmac": "<hex>",                        // image 才有，指向 blobs/ 对象
-  "blob_size": 12345,                          // image 才有
-  "thumb_b64": "<base64 PNG ≤5KB>",            // image 才有；optional，本地能渲染就嵌
-  "byte_size": 0, "truncated": false,
-  "source_bundle_id": "...", "source_app_name": "...",
-  "created_at": 1735689600,
+  "content": "...",                        // text 才有；image 为空
+  "thumb_b64": "<base64 PNG ≤5KB>",        // image 才有 (optional)
+  "mime_type": "image/png",                // image 才有
+  "blob_size": 12345,                      // image 才有；R2 blob 字节数
+  "truncated": false,
+  "source_bundle_id": "com.apple.Safari",
+  "source_app_name": "Safari",
   "pinned": false,
-  "device_id": "<UUID>"
+  "content_hash": "<hex sha256>"           // 重复明文 hmac 的源；解密后用于本地 dedup
 }
 ```
 
-**TombstonePayload (encrypted JSON)**:
-```json
-{ "v": 1, "content_hash": "<hex>", "tombstoned_at": 1735689600, "device_id": "<UUID>" }
-```
-
-**DevicePayload (encrypted JSON)** — 用于 §8.1 "已知设备" UI 汇总：
-```json
-{ "v": 1, "device_id": "<UUID>", "display_name": "Mac-Mini-7",
-  "model": "Mac15,12", "first_seen_at": 1735689600, "last_seen_at": 1735776000 }
-```
-设备首启 + 用户改 display name + 每次 app 启动（更新 last_seen_at）时 PUT。CloudSyncView 的 "已知设备" 列表 = 把 `devices/` 全部 GET + 解密 + 按 last_seen_at DESC 排序。
-
-`config.json` 不加密（无敏感数据），但 PUT 时附 metadata `x-amz-meta-version` 防 backend 误读：
+### 5.4 DevicePayload (devices.ciphertext 解密后)
 
 ```json
-{ "v": 1, "kdf": "pbkdf2-hmac-sha256", "kdf_iters": 200000,
-  "kdf_salt_b64": "<base64>", "format": "chacha20-poly1305-ietf-12-16" }
+{ "v": 1, "display_name": "Mac-Mini-7", "model": "Mac15,12", "first_seen_at": 1735000000 }
 ```
 
-### 6.5 S3v4 签名（R2Backend 实现细节）
+## 6. 加密 / 命名规范
 
-R2 接受标准 AWS Signature Version 4。**v3 用法约束**：
+加密层与 v1 完全一致；**变化点只是"加密的范围"**：v1 加密一个完整 item（含所有字段），v2 加密一个**RowPayload**（不含主键 / hmac / 时间戳等需要服务端索引的字段）。
 
-- **Path-style**：URL 形如 `https://{account}.r2.cloudflarestorage.com/{bucket}/{key}`（virtual-hosted-style 在 R2 自定义 endpoint 不支持）
-- **Region**：固定字符串 `"auto"`（R2 不分 region；boto3 / 标准 SDK 也都用这个）
-- **Service**：`"s3"`
-- **Payload signing**：用 `UNSIGNED-PAYLOAD` 模式（在签名时 body hash 用字面字符串 `"UNSIGNED-PAYLOAD"`）。理由：item payload 已经是密文 + AEAD tag，再做 SHA256 浪费；R2 接受 unsigned payload；URLSession 上传时不需要先把 body 全读进内存做哈希
-- **签名头**：`Authorization: AWS4-HMAC-SHA256 Credential=..., SignedHeaders=..., Signature=...` + `x-amz-date` + `x-amz-content-sha256: UNSIGNED-PAYLOAD`
-- **字符转义**：key 走标准 RFC 3986 encode，但 `/` 不 encode（path 分隔符）
+### 6.1 KDF（同 v1）
 
-`R2Backend` 实现是一个纯 Swift class，依赖只有 `Foundation` + `CryptoKit` (HMAC-SHA256)。无第三方 S3 SDK——避免引入除了 GRDB / KeyboardShortcuts 之外的依赖。
+```
+salt        := 16 random bytes (per cloud profile)
+master_key  := PBKDF2-HMAC-SHA256(password, salt, iters=200_000, dkLen=32)
+k_encrypt   := HKDF-SHA256(master_key, info="clip.encrypt.v1", L=32)
+k_name      := HKDF-SHA256(master_key, info="clip.name.v1",    L=32)
+```
 
-### 6.6 杂项约定
+`master_key` 派生后存 macOS Keychain (`kSecAttrSynchronizable=false`)，密码不落盘。
 
-- **content_hash 定义**：沿用现有 `ClipItem.contentHash(of:)`，即 `SHA256(content.trimmingCharacters(in:.whitespacesAndNewlines).utf8)`，对图片 blob 是 `SHA256(rawBytes)`。云端跨设备依赖这个定义一致——Mac A / B 上同一段文字必须哈希出相同结果。这是已有契约，不变
-- **DevicePayload.display_name**：默认值 `Host.current().localizedName ?? "Mac"`；用户可在 Preferences > 云同步 > 设备 编辑。每次启动 / 改名 → PUT `devices/<device_id>.bin`
-- **Reachability**：用 `Network.framework` 的 `NWPathMonitor`（macOS 13+ 原生 API）。`SyncEngine` 持有 monitor，path 从 unsatisfied → satisfied 时发 wakeup signal 唤醒 pushTask
-- **Keychain 同步**：master_key 在 Keychain 里 **`kSecAttrSynchronizable = false`**（不走 iCloud Keychain）。理由：iCloud Keychain 同步密码 = 把 E2E 密钥放进 Apple 控制范围，违背"云端永远拿不到明文"的承诺。每台 Mac 单独输一次密码
+### 6.2 行级加密（v2 新）
+
+```
+plaintext      := JSON.encode(RowPayload)
+sealed         := ChaChaPoly.seal(plaintext, key=k_encrypt)
+                  → nonce(12) || ciphertext || tag(16)
+clips.ciphertext := sealed
+```
+
+D1 BLOB 列接受任意字节；REST API 在请求 / 响应 JSON 里 base64 encode 这个 BLOB。
+
+### 6.3 跨设备命名 / 去重
+
+```
+content_hash  := SHA256(text trim) 或 SHA256(image bytes)（沿用 ClipItem.contentHash）
+hmac          := HMAC-SHA256(k_name, content_hash) → 64 hex chars
+clips.hmac    := hmac                  // 明文，indexed
+blob_key      := "blobs/" + hmac + ".bin"
+```
+
+push 前 SyncEngine 查 D1 `SELECT id FROM clips WHERE hmac = ?`；命中 → 改成 UPDATE 而非 INSERT（避免重复 row）。**这是去重的唯一关口**。
+
+### 6.4 图片 blob
+
+R2 对象 = 同样的 sealed box (nonce || ciphertext || tag)。`getBlob(key)` 回来的 bytes 直接 `ChaChaPoly.open(...)`。
+
+### 6.5 安全 / 威胁模型
+
+| 攻击者 | 能看到 | 不能看到 |
+|---|---|---|
+| Cloudflare 自己 / 拿到 D1 token 的人 | id (UUID), hmac (HMAC，不可反向到原文), kind, blob_key, byte_size, device_id, created_at, updated_at, deleted | 内容、缩略图、source app、pinned 状态 |
+| 拿到 R2 token 的人 | 哪些 hmac 有 blob、blob 字节数 | blob 解密后的图片 |
+| 同时拿到 D1 + R2 token | 两表合起来 | 同上，仍无法解密 |
+| 拿到本机 master_key（攻破 Keychain）| 一切 | — |
+
+`hmac` 列的暴露含义：攻击者能看出"两条 row 内容是否相同"（同 hmac 等价于同 content_hash）。这是接受的轻量泄漏，换来跨设备 dedup。如果不能接受，需要在 v3.1 把 hmac 列也改成 per-row 随机 nonce + 客户端 dedup（牺牲服务端去重查询效率）。
 
 ## 7. 数据流
 
 ### 7.1 启用同步（首次配置）
 
 ```
-用户在 Preferences > 云同步 → 输入 R2 endpoint / access key / secret / bucket
-  ↓ 验证：backend.list("config.json") + backend.headObject("config.json")
-  ↓ 不存在  → 这是首台 Mac，进入 "新 cloud profile" 分支
-            生成 16B salt + UUID device_id
-            提示用户输密码 (≥12 字符) + 确认 + 警告 "丢密码 = 丢数据"
-            派生 master_key → Keychain
-            构造 config.json → backend.put
-            写 sync_state (device_id / kdf_*)
-            把所有现有 items + clip_blobs 入 sync_queue (backfill)
-  ↓ 已存在 → 这是新设备加入
-            backend.get("config.json") → 解析 KDF 参数
-            提示用户输已有密码 + 派生 master_key
-            尝试 backend.get(任意一个 items/ 的 key) + 解密 → 失败说密码错
-            通过 → 写 sync_state，启动 pull 全量同步
+用户在 Preferences > 云同步 → 输入 R2 endpoint / bucket / access key / secret +
+                              D1 account ID / database ID / API token
+  ↓ 按 "测试连接"
+  ↓ ensureSchema() 在 D1 上跑（CREATE TABLE IF NOT EXISTS …）
+  ↓ getConfig("kdf_salt_b64") + getConfig("kdf_iters")
+     ├─ 缺  → 新 cloud profile：生成 16B salt + setConfig + 提示输密码 + 派生 master_key
+     └─ 有  → 加入现有 profile：拉 KDF 参数 + 提示输密码 + 派生
+  ↓ master_key → Keychain
+  ↓ 是 firstDevice → backfill 本地全部 items 入 sync_queue
+  ↓ 启动 pushTask + pullTask
 ```
 
 ### 7.2 推送（本地→云）
 
 ```
-事件触发: store.insert → onInsert hook → engine.enqueuePush(.putItem(item.id))
-         store.delete → onDelete hook → engine.enqueueTombstone(content_hash)
-         store.togglePin → onPin → engine.enqueuePush(.putItem(id))  // 重传 metadata
-         配置选择性排除 → engine.enqueueTombstone + 标记 sync_excluded=1
+触发：HistoryStore.onChange (.inserted / .deleted / .pinToggled)
+  ↓ engine.enqueueClipPush(itemID, at: now)
+  ↓ SyncQueue.append(op='put_clip', target_key=itemID)
   ↓
-SyncQueue.append(op, target, next_try_at = now)
-  ↓
-pushTask 循环 (Task in actor):
+pushTask 循环（actor 内串行）:
   loop {
-    await engine.maybePump()  // 取 next_try_at <= now 的最早一条
-    if none → await Task.sleep until next or wakeup signal
-    item = next
-    do {
-      payload = build(item)            // SyncSchema serialize
-      sealed = cryptoBox.seal(payload)
-      etag = await backend.put(key, sealed, contentType: "application/octet-stream")
-      store.markSynced(item.id, at: now, etag: etag)
-      delete from sync_queue where id = item.id
-    } catch {
-      attempts += 1
-      next_try_at = now + min(900, 2^attempts)   // 指数 backoff，封顶 15 分钟
-      last_error = describe(error)
-      update sync_queue
-      // attempts > 10 → log + 不再自动重试，等手动"重试"按钮
-    }
+    row = queue.dequeueDueAt(now)
+    if none → sleep until next_try_at OR wakeup
+    item = store.itemByID(row.target_key)
+
+    // 1. 查 D1 有没有同 hmac 的现有 row（去重）
+    hmac = crypto.name(forContentHash: item.contentHash)
+    existing = await dataSource.queryClipByHmac(hmac)
+
+    // 2. 准备 ciphertext + 决定 cloud_id
+    rowPayload = build(item)
+    sealed = crypto.seal(JSON.encode(rowPayload))
+    cloudID = item.cloudID ?? existing?.id ?? UUID()
+
+    // 3. (image 才走) 先上 blob
+    if item.kind == .image && item.cloudBlobKey == nil:
+      blobBytes = store.blob(id: item.blobID!)
+      sealedBlob = crypto.seal(blobBytes)
+      blobKey = "blobs/" + crypto.name(forContentHash: blobInfo.sha) + ".bin"
+      try await blobStore.putBlob(key: blobKey, body: sealedBlob)
+      store.markBlobSynced(id: blobID, at: now)
+      item.cloudBlobKey = blobKey
+
+    // 4. UPSERT row
+    serverUpdatedAt = try await dataSource.upsertClip(CloudRow(
+        id: cloudID, hmac: hmac, ciphertext: sealed,
+        kind: item.kind.rawValue, blobKey: item.cloudBlobKey,
+        byteSize: item.byteSize, deviceID: deviceID,
+        createdAt: item.createdAt, updatedAt: 0,    // server overrides
+        deleted: false))
+    store.markClipSynced(id: item.id, cloudID: cloudID,
+                         updatedAt: serverUpdatedAt, at: now)
+    queue.delete(id: row.id)
+  } catch {
+    queue.recordFailure(id: row.id, attempts: row.attempts+1, at: now)
   }
 ```
 
+D1 INSERT/UPDATE SQL 模板（`upsertClip` 实现细节）：
+
+```sql
+INSERT INTO clips (id, hmac, ciphertext, kind, blob_key, byte_size,
+                   device_id, created_at, updated_at, deleted)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch(), 0)
+ON CONFLICT(id) DO UPDATE SET
+  hmac = excluded.hmac, ciphertext = excluded.ciphertext,
+  kind = excluded.kind, blob_key = excluded.blob_key,
+  byte_size = excluded.byte_size, device_id = excluded.device_id,
+  updated_at = unixepoch(), deleted = 0
+RETURNING updated_at;
+```
+
+`unixepoch()` 是 SQLite 内置函数，由 D1 服务端在执行时求值——这是 LWW 单调时钟的源。
+
 ### 7.3 拉取（云→本地）
 
-**触发**：30s 定时器；app launch；NSWorkspace.didWake；hotkey 唤起 panel。后三种触发会被 **rate-limited**：同 prefix 在 5s 内的多次唤起合并为一次 pull（避免 panel 反复弹出导致 burst）。
-
-**没有独立 cloud_index 表**：每个 object 类型已有"本地映像 + cloud_etag" 的列：
-- `items/<h>` ↔ `items.content_hash` 行的 `cloud_etag`
-- `tomb/<h>` ↔ `tombstones.hmac` 行的 `cloud_etag`
-- `devices/<id>` ↔ in-memory cache（不持久化，每次启动重 GET）
-
 ```
-触发后 pullTask:
-  cursors = JSON.parse(sync_state.last_pull_cursor) ?? {}
-  for prefix in ["tomb/", "items/", "devices/"]:    # tomb 先于 items 防复活
-    cursor = cursors[prefix]
-    while True:
-      page = await backend.list(prefix, after: cursor)
-      for object in page.objects:
-        local_etag = lookupLocalEtag(prefix, object.key)
-        if local_etag == object.etag: continue           # 已知不变
-        sealed = await backend.get(object.key)
-        plain  = cryptoBox.open(sealed)
-        switch prefix:
-          case "items/":   handleItemPayload(decode(plain), etag: object.etag)
-          case "tomb/":    handleTombstone(decode(plain), etag: object.etag)
-          case "devices/": cacheDevice(decode(plain))
-      if !page.hasMore: break
-      cursor = page.nextCursor
-    cursors[prefix] = cursor
-  sync_state.last_pull_at = now
-  sync_state.last_pull_cursor = JSON.stringify(cursors)
+触发：30s 定时器；app launch；NSWorkspace.didWake；hotkey 唤起 panel
+       后三种合并到 5s 内不重复触发
+
+pullTask:
+  cursor = sync_state.get("cloud_pull_cursor") ?? 0
+  loop {
+    rows = try await dataSource.queryClipsChangedSince(cursor: cursor, limit: 100)
+    if rows.isEmpty: break
+    for row in rows:
+      // 0. ETag-equivalent skip
+      if local = store.itemByCloudID(row.id), local.cloudUpdatedAt >= row.updatedAt:
+        continue
+
+      // 1. 解密
+      plain = try crypto.open(row.ciphertext)
+      payload = try JSON.decode(RowPayload, plain)
+
+      // 2. 处理 deleted
+      if row.deleted:
+        store.upsertTombstone(contentHash: payload.contentHash, cloudID: row.id,
+                              tombstonedAt: row.updatedAt, cloudUpdatedAt: row.updatedAt)
+        store.deleteItemsByContentHashOlderThan(payload.contentHash, row.updatedAt)
+        continue
+
+      // 3. 资源化复活判定 (v1 §10.3 同)
+      if tomb = store.tombstoneAt(contentHash: payload.contentHash),
+         tomb >= row.createdAt:
+        continue   // tomb 较新；丢弃这条
+
+      // 4. UPSERT 本地
+      store.upsertFromCloud(row, payload)
+        // image kind: 本地 clip_blobs 插占位行 (lazy)，bytes=NULL
+        //             items.cloud_blob_key = row.blob_key
+    cursor = max(rows.map { $0.updatedAt })
+  }
+  sync_state.set("cloud_pull_cursor", String(cursor))
+
+  // devices 同样模式（独立 cursor）
+  deviceCursor = sync_state.get("cloud_pull_device_cursor") ?? 0
+  devices = try await dataSource.listDevices()
+    .filter { $0.lastSeenAt > deviceCursor }
+  for d in devices: cacheDevice(decrypt(d.ciphertext))
+  sync_state.set("cloud_pull_device_cursor", String(devices.map { $0.lastSeenAt }.max() ?? deviceCursor))
 ```
 
-`handleItemPayload(payload, etag, lastModified)`：
-- 查 `tombstones` 表，hmac 命中且 `tombstoned_at >= payload.created_at` → **skip**（等号情况：tomb wins，与 §10.3 一致；保护"删后又出现陈旧复活"场景）
-- 查本地 `items` 表 by `content_hash`：
-  - 命中：把 list 返回的 `lastModified` 与本地 `cloud_etag_lastmodified`（伴随 cloud_etag 一起存的 server-side mtime）比较；**only if `lastModified > local_lastmodified`** 才 UPDATE 可变字段 `pinned`、`device_id`、`cloud_etag = etag`、`cloud_etag_lastmodified = lastModified`。这才真正实现了 §3 row 8 的 R2 LastModified LWW。`device_id` 字段语义：覆盖为最新写者的 device（而非 first-writer-wins），便于 UI 展示"这条最近一次被 pin 的设备"
-  - 未命中：INSERT，cloud_etag = etag。image kind 时 `clip_blobs` 插占位行（bytes NULL，blob_hmac/byte_size 来自 payload），thumbnail 落 ThumbnailCache
-- 解密失败：log warning + 跳过；不删本地
+**带宽**：idle (无变化) → 单次 pull = 一次 SQL roundtrip + JSON `{"results":[]}`，几百字节。500 条历史 / 30s tick / 全 idle ≈ 60KB/小时。**vs v1 的 ~9MB/小时（150× 节流）**。
 
-> **Schema 增量补充**：上面引入的 `cloud_etag_lastmodified` 字段需要在 §5.1 Migration v3 里给 `items` / `tombstones` 各加一列 `cloud_lastmodified INTEGER`（unix 秒；R2 LastModified header 解析后的值）。
+### 7.4 Lazy blob fetch
 
-`handleTombstone(payload, etag)`：
-- UPSERT into `tombstones` (hmac, content_hash, tombstoned_at, cloud_etag = etag, cloud_synced_at = now)
-- `DELETE FROM items WHERE content_hash = payload.content_hash AND created_at <= payload.tombstoned_at`（== 时也删；tomb wins）
-- `DELETE FROM clip_blobs WHERE id NOT IN (SELECT blob_id FROM items WHERE blob_id IS NOT NULL)` 的常规清理在 prune 路径里走，不在这里同步做
+同 v1：本地 `clip_blobs` 行 sha256 = `lazy:<hmac>` + bytes empty。`HistoryStore.blob(id)` 仍是 sync 接口；调用者（PreviewWindow / PasteInjector）的 async 上下文里，发现 bytes 空时 await `engine.fetchBlob(blobID)`：
 
-### 7.4 Lazy blob fetch（图片按需下载）
-
-```
-PreviewWindow 或 PasteInjector.pasteImage 调 store.blob(id) → bytes
-  ↓
-HistoryStore.blob(id):
-  row = SELECT bytes, blob_hmac, cloud_etag FROM clip_blobs WHERE id = ?
-  if row.bytes IS NOT NULL: return row.bytes
-  if row.blob_hmac IS NULL: return nil   // 真没有
-  // 远端拉
-  sealed = await syncEngine.fetchBlob(blob_hmac)
-  bytes  = cryptoBox.open(sealed)
-  store.fillBlob(id, bytes: bytes)
+```swift
+func fetchBlob(blobID: Int64) async throws -> Data {
+  guard let info = try store.lazyBlobHmac(id: blobID) else { ... }
+  let key = "blobs/" + info.hmac + ".bin"
+  guard let sealed = try await blobStore.getBlob(key: key) else { ... }
+  let bytes = try crypto.open(sealed)
+  try store.fillBlob(id: blobID, bytes: bytes, sha256: ClipItem.contentHash(of: bytes), at: now)
   return bytes
+}
 ```
-
-UI 在 lazy fetch 期间显示 spinner（PreviewWindow）或灰显 + tooltip（panel 行）。
 
 ### 7.5 选择性同步
 
-UI 在 panel 行有快捷键 `⌘N` toggle "不上云"（确认 ⌘N 在现有 panel 键映射中未被占用：现有 ⌘P/⌘D/⌘F/⌘1-9/⌘,/Esc/⌘B/⌘E 都不冲突）：
-- 已 synced 的项 → INSERT tombstone + enqueue tomb push + UPDATE items SET sync_excluded = 1 + **DELETE FROM sync_queue WHERE op IN ('put_item','put_blob') AND target_key 对应到本 item**
-- 未 synced 的项 → UPDATE sync_excluded = 1 + DELETE 相同 sync_queue 行（无 tomb 必要，反正未上传过）
+UI 在 panel 行 `⌘N` toggle "不上云"：
+- 已 synced → store.setSyncExcluded(true) + dataSource.setClipDeleted(cloud_id) + queue.deleteAllForItem
+- 未 synced → store.setSyncExcluded(true) + queue.deleteAllForItem（无云端动作）
 
-再次 `⌘N` 取消排除：UPDATE sync_excluded = 0 + 重新 enqueue put_item（如果 cloud_synced_at 仍然 NULL）。已上传过的 tomb 不会自动收回——重新出现的 hash 走正常 INSERT，云端会有一份新的 items/<h>，但旧 tomb 文件还在直到 lifecycle 清理。**B 端解释**：B pull 时同时看到 tomb（老）和 items/（新），按 §10.3 比较 `tombstoned_at` vs `payload.created_at`：新 PUT 的 item.created_at 一定 > 老 tomb 的 tombstoned_at（因为 toggle 是更晚的动作）→ item wins，B 删 tombstones 行 + INSERT。这是设计期望行为。v3 不自动 GC tomb（lifecycle 清理留 v3.x）。
-
-Panel 行尾若 `sync_excluded = 1` 显示 🚫；否则若 `cloud_synced_at IS NULL AND sync queue has it` 显示 ⏳；否则若 `cloud_synced_at NOT NULL` 显示 ☁️；否则不显示。
+再次 `⌘N` 取消：UPDATE sync_excluded=0 + 重新 enqueue put_clip。云端走正常 INSERT 路径，会 `ON CONFLICT(id) DO UPDATE`：但因为 cloud_id 已存在且 deleted=1 → UPDATE 把它复活（`deleted = 0`）。**这是设计意图**：选择性同步是可逆的。
 
 ### 7.6 Backfill
 
-启用时**独立事务**（不在 migrator 内）：
-
 ```sql
--- 文字 + ≤ 2MB 图片的 items
-INSERT INTO sync_queue (op, target_key, next_try_at, enqueued_at)
-SELECT 'put_item', CAST(items.id AS TEXT), strftime('%s','now'), strftime('%s','now')
+-- 启用同步独立事务，新设备首次 enable 时跑：
+INSERT INTO sync_queue (op, target_key, attempts, next_try_at, enqueued_at)
+SELECT 'put_clip', CAST(items.id AS TEXT), 0, strftime('%s','now'), strftime('%s','now')
 FROM items
 LEFT JOIN clip_blobs ON items.blob_id = clip_blobs.id
 WHERE items.sync_excluded = 0
-  AND (items.kind = 'text' OR clip_blobs.byte_size <= 2*1024*1024)
-ORDER BY items.created_at DESC;          -- 新的先推
-
--- 对应 ≤ 2MB 的 blobs
-INSERT INTO sync_queue (op, target_key, next_try_at, enqueued_at)
-SELECT 'put_blob', CAST(clip_blobs.id AS TEXT), strftime('%s','now'), strftime('%s','now')
-FROM clip_blobs
-JOIN items ON items.blob_id = clip_blobs.id
-WHERE items.sync_excluded = 0 AND clip_blobs.byte_size <= 2*1024*1024
+  AND items.cloud_id IS NULL                    -- 没同步过的
+  AND (items.kind = 'text' OR clip_blobs.byte_size <= 2097152)
 ORDER BY items.created_at DESC;
 ```
 
-`ORDER BY created_at DESC` 是有意：用户启用同步后第一时间想在 B 端看到的是**最近**复制的内容，所以**新的先推**。
+新加入设备 (joinedExisting) 不需要 backfill **本地**——它的本地是空的，pull 会把 D1 全部数据拉下来。
 
-UI 显示 "Backfill: M / N" 进度条，由 sync_queue 长度差驱动。
+### 7.7 大图（> 2MB）
+
+A 端 enqueue 时检查 `blob_size > 2MB` → 不入 queue（既不 put_clip 也不 put_blob）→ row 在 D1 永远不存在 → B 端永远看不到这条。同 v1。
 
 ## 8. UI / UX
 
-### 8.1 Preferences 新 tab "云同步"
+### 8.1 Preferences "云同步" tab
 
 ```
-[ ] 启用云同步                          (开关；off 时下面灰显)
+[ ] 启用云同步                                    (开关)
 
+— R2（图片字节）—
 R2 endpoint:    https://<account>.r2.cloudflarestorage.com
-                  (验证：必须 https://; host 须以 .r2.cloudflarestorage.com 结尾或为
-                   用户自定义 endpoint; account ID 32 hex chars)
-Bucket name:    clip-sync           (验证：DNS-safe，3-63 chars，[a-z0-9-])
-Access Key ID:  <…>                    (focus 时显示完整，blur 时遮蔽)
-Secret:         ●●●●●●●●               (写入触发；存 Keychain，读不出)
-                [测试连接]              (动作：HEAD config.json 期望 200 或 404；
-                                        其它 HTTP 状态展示 `测试失败: <code> <body截断>`)
+Bucket:         clip-sync
+Access Key ID:  <…>
+Secret:         ●●●●●●●●
 
-同步密码:        ●●●●●●●●●●●●          (≥12 chars)
-                [设置 / 修改]
-                ⚠️ 密码丢失 = 云端数据全部不可恢复。请使用密码管理器保存。
+— D1（条目元数据）—
+Account ID:     <已从 endpoint 解析；只读>
+Database ID:    <UUID>                            (也可点 [查询] 自动列出可用 DB)
+API Token:      ●●●●●●●●                          (Account → D1:Edit + R2:Edit)
+                [测试连接]                        (动作: D1.queryConfig + R2.head)
 
-设备:
-  • 本机: Mac-Mini-7 (device_id 前 8 位)
-  • 已知: Mac-Studio-A, Mac-Air-B    (从云端 device 元数据汇总)
+— 同步密码 —
+●●●●●●●●●●●●                                       (≥12 chars)
+[初始化 / 加入云端]                                ⚠️ 密码丢失 = 数据丢失
 
-状态:
-  云端: 1284 条 / 392 MB
-  本地未同步: 3 条 (重试中)         [立刻同步] [查看错误]
-                                  ↑ 立刻同步 = (1) 把所有 sync_queue 行
-                                    next_try_at 重置为 now，(2) 唤醒 pushTask，
-                                    (3) 触发一次 immediate pull
-                                  ↑ 查看错误 = sheet，列出 attempts > 0 的行
-                                    及其 last_error，可单条 retry / discard
-  上次拉取: 12 秒前 (自动 30 秒)
-  Backfill: 1284 / 1284 (完成)
+— 状态 —
+云端: 1284 条 / 392 MB
+本地未同步: 3 条 (重试中)                          [立刻同步] [查看错误]
+上次拉取: 12 秒前
+Backfill: 1284 / 1284 (完成)
 
-危险区:
-  [清空云端数据 + 撤销同步...]      (二次确认 + 输入 device 名匹配)
-  [重置同步密码...]                (会上传所有对象的重加密版本，慢)
+— 设备 —
+本机:   Mac-Mini-7 (devID 前 8: a1b2c3d4)
+已知:   Mac-Studio-A (12 小时前)、Mac-Air-B (3 天前)
+
+— 危险区 —
+[清空云端数据 + 撤销同步...]
+[重置同步密码...]
 ```
+
+简化版本（v3 实际交付）：先做配置 + 测试连接 + 密码 + 状态 + 错误显示；devices 列表 / 危险区按钮文字明示 "v3.1"。
 
 ### 8.2 Panel 行尾同步状态指示
 
-每行最右加 12pt 宽的小图标：
-
 | 图标 | 含义 |
 |---|---|
-| ☁️ | 已同步到云 |
-| ⏳ | 队列里等待推送 |
-| 🚫 | 用户标记不同步（sync_excluded=1） |
-| 📤 | 跳过（> 2MB image 等技术原因，不是用户意志） |
-| ⚠️ | 推送失败 attempts > 3 |
-| (无) | 本地 only / 未启用同步 |
+| ☁️ | 已同步 |
+| ⏳ | 队列里等待 |
+| 🚫 | sync_excluded=1 |
+| 📤 | > 2MB 图片，技术原因不传 |
+| ⚠️ | attempts > 3 |
+
+v3 必须 ☁️ + 🚫；其它图标可后置（同 v1 的妥协）。
 
 ### 8.3 快捷键
 
-新增：
-| 按键 | 动作 |
-|---|---|
-| ⌘N（panel 内）| toggle 选中行 sync_excluded |
-
-### 8.4 首次启用引导
-
-启用同步开关 → 弹一个 modal sheet：
-
-1. 选 "首台 Mac (新建云端 profile)" 或 "已有云端，加入新设备"
-2. 配 R2 凭据 → 测试连接
-3. 设 / 输密码（首台带强度提示 + 不可恢复警告）
-4. 首台显示 "正在 backfill 1284 条…" 进度条；非首台显示 "正在拉取 1284 条…" 进度条
-5. 完成 → 关 sheet，回 Preferences tab 显示状态
+`⌘N` 同 v1：toggle 选中行 sync_excluded。
 
 ## 9. 性能预算
 
 | 维度 | 预算 |
 |---|---|
-| 推送 idle CPU | < 0.05%（队列空时 sleep） |
-| 拉取 idle CPU | < 0.1%（30s tick + 增量 list；wake/hotkey 触发的 immediate pull 走 5s 合并 token bucket，长期均摊不超过 ~6 pulls/min） |
-| 推送一条 text item | < 200ms 总（encrypt 1ms + put 50-150ms） |
-| 推送一条 2MB image | < 1.5s 总（encrypt 30ms + put ~1s） |
-| 拉取一条 text item | < 150ms（list 摊销 + get + decrypt + insert） |
-| Backfill 1000 条 text + 100 张图 | < 3 min（受限于 R2 PUT 串行 / 总 ~200MB） |
-| panel 显示 lazy 图片 | 命中本地：原 < 50ms；远端 lazy：< 1.5s + spinner |
-| 多余磁盘占用 | 同步未下载的 image 行只占 SQLite 中元数据（每条 ~500B） |
-| 错误后重试 | 指数 backoff，10 次后停（约 17 分钟） |
+| Pull idle CPU | < 0.05%（30s tick + 单条 SQL；返回 0 行成本极低） |
+| Pull idle 带宽 | < 1 KB/tick (`{"results":[]}`)；600 KB/小时 |
+| Push 一条 text | < 250ms (encrypt 1ms + D1 UPSERT 100-200ms RTT) |
+| Push 一条 2MB image | < 1.5s (R2 PUT ~1s + D1 UPSERT) |
+| Pull 100 条 text 一页 | < 600ms (queryChangesSince + 100 × decrypt) |
+| Backfill 1000 条 text | < 4 min (串行 D1 UPSERT，每个 200ms RTT) |
+| 多余磁盘占用（拉端 lazy 图） | < 1KB / 条 |
+| 错误退避封顶 | 15 分钟 |
 
-R2 一次 PUT/GET 假定 50-200ms（中国大陆 → APAC 区）。
+D1 query latency 对中国大陆用户预估 100-300ms RTT (CF Anycast)。
 
-## 10. 错误处理 & 边界 case
+## 10. 错误处理 & 边界
 
 ### 10.1 网络
 
 | 场景 | 处理 |
 |---|---|
-| 完全离线 | enqueue 不阻塞；status bar 显示 "离线"；联网后 SyncEngine 收到 `Reachability` 通知 wakeup |
-| R2 5xx | backoff 重试 |
-| R2 429 throttle | backoff 重试，next_try_at 加随机 jitter |
-| R2 401/403 | token 失效；通知用户去 Preferences 重新粘贴；推送循环暂停直到用户操作 |
-| GET 404 | 该对象在我们 list 后被删；当作 tombstone 走（如果没有 tomb 文件，记 warning） |
+| 离线 | enqueue 不阻塞；status bar "离线"；联网后 NWPathMonitor 唤醒 |
+| D1 5xx | backoff 重试 |
+| D1 401/403 | token 失效；UI 提示去 Preferences；push 暂停直到用户操作（v3.1 实现，v3 走 generic backoff，sync_queue.last_error 可见）|
+| D1 429 throttle | backoff + 随机 jitter |
+| D1 schema drift（未来加列） | upsertClip 用显式列名，不依赖 SELECT *；新列默认 NULL；旧客户端忽略 |
+| R2 5xx / 401 | 同 D1 |
+| GET 404 (blob 缺失) | log warning + 给用户一个"图片已删除"占位 |
 
-### 10.2 加密 / 密码
+### 10.2 加密
 
 | 场景 | 处理 |
 |---|---|
-| 解密失败 | `CryptoBox.Error.decryptionFailed`；UI 提示"密码错或对象损坏"；**不删本地** |
-| 用户改密码 | v3 实现：阻塞式重传所有对象。流程：① 用旧密码派生 old_master 解密；② 用新密码 + 旧 salt 派生 new_master；③ 把新 master 写入 Keychain 的**新** service identifier（`com.zyw.clip.cloud-master-v2-<ts>`）；④ 串行下载所有 items/blobs/tomb 对象 → 用 old key 解 → 用 new key 重新 seal → PUT 覆盖；⑤ 全部成功后从 Keychain **删除** old service identifier，更新 sync_state.kdf_version；任何中途失败 → 保留两个 master key，可手动重启继续 |
-| 密码丢失 | 不可恢复。引导用户用 "清空云端 + 重设" 流程；本地数据无损 |
-| 密码不够强（< 12 字符） | 输入框拒绝 |
+| 解密失败 | log + 跳过；不删本地；UI 提示密码错（首次 pull 失败时全弹） |
+| 用户改密码 | v3 阻塞式：拉所有 D1 row → 旧 key 解 → 新 key seal → upsertClip 全部覆盖；R2 blob 同样按需 redown + reup；进度条；中途失败保留两个 master_key 可手动重启 |
+| 密码丢失 | 引导"清空 D1 表 + 清空 R2 桶 + 重设" |
+| 密码强度 | 输入框拒绝 < 12 字符 |
 
 ### 10.3 数据一致性
 
 | 场景 | 处理 |
 |---|---|
-| 同条目两台同时 PUT | 同 hmac 文件名，S3 LWW；payload 无 mutable 区别（content immutable）→ 无影响 |
-| pin 状态两台冲突 | LWW by **R2 LastModified**（list 返回的 server-side mtime），不是 payload 内字段；用户感知到的是"最近一台 pin/unpin 的状态" |
-| tombstone vs 新 item 同 hash | 比较 `tombstones.tombstoned_at` 和 `payload.created_at`：**tomb 时间 ≥ item 时间 → tomb wins**（视为已删，丢弃新 item）；item 时间 > tomb 时间 → item wins（DELETE FROM tombstones + INSERT 该 item，对应"用户在 tomb 后又复制了相同内容"） |
-| 设备时钟漂移 | created_at 用本地时钟；接受 ±60s 漂移；不做 NTP 校正。漂移 > 60s 的极端情况：可能导致 LWW 判错（例如 device A 时钟超前 5 分钟，A 发的 tomb 会战胜 B 5 分钟内才发的同 hash item）；这是已知限制，依赖系统层 NTP；UI 不弹窗 |
-| Migration 失败 | 沿用现有：弹窗 "备份并重置 / 退出"，绝不静默丢数据 |
-| Migration v3 内 backfill INSERT 爆量 | 不在 migrator block 里 backfill；migrator 只 ALTER + CREATE。backfill 是**启用同步动作**的一部分（不是迁移的一部分），写在 SyncEngine.enableSync() 里，独立事务，失败不影响 schema |
+| 同 hash 两台并发 push | 第一台 INSERT 成功；第二台 push 前 hmac 查询命中第一台的 cloud_id → 改成 UPDATE，覆盖一次（payload 几乎一样） |
+| pin 状态两台冲突 | LWW by D1 server-side updated_at；后写者赢 |
+| 同 hash 删了又 capture | 本地 tombstones 防止 capture 立刻入库；用户必须显式 `⌘N` 取消 exclude 或手动从 history 里复活（v3 实现 §7.5 路径）|
+| 设备时钟漂移 | 服务端 unixepoch() 是 LWW 真源；本地时钟仅用于 capture 排序 |
+| Migration v3 失败 | 沿用现有：弹窗 "备份并重置 / 退出" |
+| D1 schema 损坏 / 表丢失 | ensureSchema CREATE IF NOT EXISTS 自愈；row 数据丢失则等同新 cloud profile，要求用户重新初始化 |
 
-### 10.4 大对象 / 配额
+### 10.4 配额 / 大对象
 
 | 场景 | 处理 |
 |---|---|
-| 单 image > 2MB | A 端：检查 byte_size > 2MB → 不入 sync_queue（既不 put_item 也不 put_blob）→ 行尾显示 📤；item 在云上完全不存在，因此 B 端**永远看不到这条**（无对象可 list / get）。这是设计取舍：避免大图同步；用户感知到"大图只在本地"。`sync_excluded` 不设（区分用户意志 vs 技术限制） |
-| R2 配额超 | put 失败 → attempts++ + backoff；CloudSyncView 状态文本显示"配额超限"红字 + 按钮"打开 R2 dashboard"（外链 https://dash.cloudflare.com/...）；用户处理（升级 plan / 在 R2 端删旧对象 / 在本地清旧 items 让 tombstones 推上去）。v3 不自动收缩本地 retention 来腾配额 |
+| > 2MB image | A 端不入队 → row 不存在；B 永远看不到；A UI 行尾 📤 |
+| D1 写次数到上限（5M/day 免费） | push 失败 → backoff；状态文字"D1 配额超限" + 链接 dashboard |
+| R2 流量 / ops 异常 | 同上 |
 
-### 10.5 启动 / 多实例
+## 11. 测试
 
-沿用原 spec 的 single-instance 守卫；SyncEngine 的 actor 模式天然防多线程并发同 op。多 Mac 间无强制锁——LWW + content-addressed 已经处理。
-
-## 11. 测试策略
-
-### 11.1 单元（pure logic, 无网络）
+### 11.1 单元（pure，无网）
 
 | 文件 | 关键 case |
 |---|---|
-| `KeyDerivationTests` | 同 password+salt 跨平台/跨调用结果一致；不同 password 派生不同；iters / dkLen 边界 |
-| `CryptoBoxTests` | seal → open round-trip；open 错 key 失败；open 篡改 ciphertext 失败；nonce 唯一性（10000 次无重复） |
-| `SyncSchemaTests` | ItemPayload / TombstonePayload Codable round-trip；version v1 解码；缺字段容错 |
-| `SyncQueueTests` | enqueue / dequeue 顺序；backoff 计算；attempts 上限；持久化跨重启 |
+| KeyDerivationTests | (同 v1) |
+| CryptoBoxTests | (同 v1) |
+| KeychainStoreTests | (同 v1) |
+| SyncSchemaTests | RowPayload / DevicePayload Codable round-trip; v1 解码 |
+| SyncQueueTests | enqueue/dequeue/backoff/deleteAllForItem (同 v1) |
+| MigrationV3Tests | 6 列 + tombstones + sync_queue + sync_state 创建 |
 
-### 11.2 集成（用 `LocalDirBackend`，无云）
+### 11.2 集成（用 LocalSqliteDataSource + LocalDirBlobStore，无网）
 
 | 文件 | 关键 case |
 |---|---|
-| `SyncEngineTests` | 推送一条 text → backend 收到加密对象；拉取后另一个 store 解密插入相同 content_hash |
-| `SyncEngineTombstoneTests` | A 端删条目 → tomb/ 出现 → B 端 pull 后本地行删除 + tombstones 表有记录；B 之后即使 items/ 复活也不再 INSERT |
-| `SyncEnginePinTests` | A pin → B pull 后本地 pinned=1；B unpin → A pull 后 pinned=0（LWW） |
-| `SyncEngineImageTests` | A 推 < 2MB image → blobs/ + items/ 都出现；B pull 只插 ref，bytes NULL；store.blob(id) 触发 fetchBlob 解密填充 |
-| `SyncEngineExcludeTests` | 标 sync_excluded → 已 synced 发 tomb；未 synced 不发 |
-| `SyncEngineBackfillTests` | 启用时把全部既有 items 入队；drain 顺序 |
+| SyncEnginePushTests | text upsert → DataSource 收到 ciphertext 行；image 走 BlobStore + DataSource |
+| SyncEnginePullTests | 两个 store 共享一个 DataSource：A push → B pull → 同 content_hash 出现 |
+| SyncEngineTombstoneTests | A 删 → A push tomb (deleted=1) → B pull → B 本地删 + tombstones 表写入 |
+| SyncEnginePinTests | A pin → B pull → B local pinned=1; B unpin → A pull → A pinned=0 (LWW) |
+| SyncEngineImageTests | A push image → BlobStore 有 sealed bytes + DataSource 行；B pull 只插 lazy blob ref；fetchBlob 触发 GET + 解密 + 填本地 |
+| SyncEngineExcludeTests | exclude synced item → setClipDeleted + queue 清；exclude unsynced → 仅 queue 清 |
+| SyncEngineEnableBootstrapTests | 第一台：salt 写 D1 config + master_key 入 Keychain; 第二台：从 D1 读 salt + 派生同 master_key |
 
-### 11.3 真 R2 集成（不进 CI；本地 opt-in）
+### 11.3 真 D1 + 真 R2 集成（opt-in，不进 CI）
 
-`Tests/ClipR2IntegrationTests/`，require `~/.wrangler/clip.env` 加载：
+`Tests/ClipTests/CloudIntegration/`，require `~/.wrangler/clip.env` 加载（包含 R2 + D1 凭据）：
 
-- 用本机 token 跑 SyncEngine 的 push + pull 一遍真 R2，最后清空桶
-- 这个 target 默认 disabled，CI 不跑（CI 没 secrets）；本机用 `swift test --filter R2Integration` 显式跑
+- 整个 push → pull → tomb → fetchBlob 路径打真 D1 + 真 R2
+- 跑完清空 D1 表（DELETE FROM clips; DELETE FROM devices）+ R2 桶
 
 ### 11.4 手动 smoke
 
-加到 `docs/MANUAL_TEST.md`：
+加到 `docs/MANUAL_TEST.md`（取代 v1 的 checklist）：
 
-- 两台 Mac 装最新 build；A 配新 cloud profile；B 用同密码加入；几秒后 A 复制的 text 出现在 B
-- B 删除一条 → A 上消失
-- A pin → B 上 pin 状态同步
-- A 复制一张 1MB 图 → B panel 显示 spinner → 几秒后图片可预览/粘贴
-- A 复制一张 3MB 图 → 行尾显示 "📤 跳过云"，B 看不到该条
-- A `⌘N` 标记不同步一条已有 → B 上消失
-- 改密码 → 提示进度 → 完成；旧密码确认无法解密
-- "清空云端数据" → 确认对话框 → 桶清空，本地保留
-
-### 11.5 CI
-
-新加测试 target `ClipSyncTests`（pure + integration with LocalDirBackend），`swift test` 一并跑。R2 integration target 不进 CI。
+- A B 两台 Mac 装最新 build；A 配 R2 + D1 + 输密码 → "已初始化新云端"；B 配相同 + 同密码 → "已加入" + 拉数据
+- 复制 → 60s 内 B 看到（行尾 ☁️）
+- 删 → B 上消失
+- pin → B pin
+- 1MB image → B 看到行 → 点开预览 spinner → 解密渲染
+- 3MB image → A 行尾 📤；B 看不到
+- ⌘N 标记不同步已有 → B 上消失
+- 重启两台 → 历史保留 + 同步继续
 
 ## 12. 验收标准
 
-1. 全部 `ClipSyncTests` 单元 + 集成测试通过
-2. 真 R2 双机 smoke：A 复制 → B 看到（≤ 60 秒）；A 删除 → B 删除；A pin → B pin
+1. ClipSyncTests 单元 + 集成测试全过
+2. 真 R2 + 真 D1 双机 smoke：A 复制 → B 看到 ≤ 60s；A 删 → B 删；A pin → B pin
 3. 重启两台 Mac 后状态保留
-4. Activity Monitor 实测启用同步 24 小时 idle，CPU < 0.5%
-5. 输错密码不删本地数据
-6. backfill 1000 条不卡 UI > 100ms
+4. Activity Monitor 实测启用同步 24h idle CPU < 0.5%（手动观察）
+5. 输错密码不删本地
+6. backfill 1000 条不卡 UI > 100ms（手动观察）
 
 ## 13. 留待后续 / 已知风险
 
-- **iOS 客户端**：架构已抽到 Sync/ 子目录，无 AppKit 依赖；后续做 iOS app 时把这些文件移到独立 SPM target `ClipKit` 给两个 platform 共享
-- **CloudKit / 自建 backend**：实现新的 `CloudSyncBackend` adapter 即可
-- **密码轮换在线优化**：v3 是阻塞重传；v3.1 做后台 chunked 重加密
-- **带宽 / 配额限制**：v3.x 加 "仅 WiFi" 开关 + 配额监控
-- **同步 Preferences 本身**：v4
-- **冲突 UI**：当前 LWW 静默处理；如果用户报"我的 pin 状态怎么没了"，再加冲突日志
-- **R2 token 撤销 / 轮换**：需要用户手动在 dashboard 撤销 + 在 Preferences 重新粘贴；UI 给链接
-- **Backend abuse**：如果用户的 token 泄漏，攻击者只能往桶里写垃圾或删除（不能解密）；v3.1 加 R2 lifecycle 自动删除 N 天前对象作为兜底
-- **`clip_blobs` 孤儿清理**：原 v2 spec 的 `HistoryStore.prune` 已经在每次跑时清理无 items 引用的 blob 行（删 `clip_blobs WHERE id NOT IN (SELECT blob_id ...)`）。这条逻辑不需要改；同步带来的 lazy blob 占位行（bytes NULL）也会被这个查询保留（因为 `items.blob_id` 仍指向它）。无新增清理需求
+- iOS 客户端
+- 自建 backend (Postgres / Supabase) 替换 D1 = 实现新 `CloudSyncDataSource` adapter
+- D1 401/403 special pause-and-notify
+- 密码轮换在线增量
+- R2 blob lifecycle GC for deleted rows
+- "已知设备"完整 UI（v3 列文字即可，删 / 重命名 / 远程登出留 v3.1）
+- 面板图标 ⏳ / 📤 / ⚠️
+- 首次启用 modal sheet（v3 用 Preferences form 替代）
+- Backend abuse mitigation: D1 token 泄漏 → 攻击者只能写垃圾 / 删数据，不能解密；v3.1 加 row 数量上限触发 + ratelimit warning
+- `clip_blobs` 孤儿清理沿用原 prune 路径（lazy NULL-bytes 占位行不会被清，因为 items.blob_id 仍指向）
+
+---
+
+**v2 与 v1 的核心实现差异（给 plan-rewrite 的索引）**：
+
+| v1 模块 | v2 状态 |
+|---|---|
+| `CloudSyncBackend` (5 ops, 含 list/head) | 拆成 `CloudSyncDataSource` + `CloudSyncBlobStore` |
+| `R2Backend` (含 list + ListV2 XML 解析) | 简化为 `R2BlobBackend` (只 put/get/delete blobs/) |
+| `LocalDirBackend` | 拆成 `LocalSqliteDataSource` + `LocalDirBlobStore` |
+| `cloud_name` 列 (v1 加的 hmac → 文件名映射) | **去掉**；v2 用 `cloud_id` UUID + D1 UPSERT 语义；hmac 在 D1 行里直接是列 |
+| `tomb/<hmac>.bin` 单独对象 | **去掉**；改 D1 `deleted=1` flag |
+| `devices/<id>.bin` 单独对象 | **去掉**；改 D1 `devices` 表 |
+| `config.json` R2 对象 | **去掉**；改 D1 `config` 表 |
+| `last_pull_cursor` JSON map per prefix | 简化为单标量 `cloud_pull_cursor` (max updated_at) |
+| Pull 算法：list + GET | SQL `SELECT WHERE updated_at > ? LIMIT 100` |
+
+新增模块：`D1Backend`（HTTPS REST 客户端）、`LocalSqliteDataSource`（in-memory SQLite 模拟，单测用）。

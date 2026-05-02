@@ -4,6 +4,8 @@
 
 **Goal:** Add E2E-encrypted Cloudflare-R2-backed clipboard history sync across 2-3 Macs, behind a pluggable `CloudSyncBackend` protocol, with selective per-item exclude, lazy image fetch, full backfill, and migration v3 schema additions.
 
+**Scope note (post-review):** see "Out of Scope" section at the end of this doc — UX polish and observability features explicitly deferred to v3.x; this plan ships the load-bearing architecture (crypto + backend + engine + bootstrap + lazy fetch + Preferences enable form + ⌘N exclude).
+
 **Architecture:** All sync code lives under `Sources/Clip/Sync/` (pure Foundation + CryptoKit, no AppKit) so a future `ClipKit` extraction for an iOS client is mechanical. R2 is reached via hand-rolled S3 Signature V4 over `URLSession` — no third-party S3 SDK. Encryption is `ChaChaPoly` with a `PBKDF2-HMAC-SHA256` (200k rounds) derived master key, HKDF-split into separate `kEncrypt` and `kName` subkeys; the master key lives in macOS Keychain (`kSecAttrSynchronizable=false`). Cloud objects are content-addressed via `HMAC(content_hash, kName)` so the same item across devices yields the same filename and dedups for free. `SyncEngine` is a Swift `actor` with two background `Task` loops (push drainer + 30s pull tick) plus signaling on app wake / hotkey trigger.
 
 **Tech Stack:** Swift 6.0 / macOS 13+ / SwiftPM single executable. `CryptoKit` (ChaChaPoly, HMAC, HKDF), `CommonCrypto` (PBKDF2 only), `Network.framework` (NWPathMonitor), `GRDB` (existing). New tests live under `Tests/ClipTests/Sync/` inside the existing test target. R2 integration tests live under `Tests/ClipTests/R2Integration/` and self-skip when `R2_ACCESS_KEY_ID` env is unset (CI doesn't have it; local sources `~/.wrangler/clip.env`).
@@ -85,6 +87,7 @@ final class MigrationV3Tests: XCTestCase {
             XCTAssertTrue(cols.contains("cloud_synced_at"))
             XCTAssertTrue(cols.contains("cloud_etag"))
             XCTAssertTrue(cols.contains("cloud_lastmodified"))
+            XCTAssertTrue(cols.contains("cloud_name"))
             XCTAssertTrue(cols.contains("device_id"))
 
             let blobCols = try Row.fetchAll(db, sql: "PRAGMA table_info(clip_blobs)").map { $0["name"] as String }
@@ -134,12 +137,14 @@ Append to `Sources/Clip/Storage/Migrations.swift` after the v2 migration block:
         // v3: cloud sync columns + tables.
         // Spec: docs/superpowers/specs/2026-05-02-clip-cloud-sync.md §5
         migrator.registerMigration("v3") { db in
-            // items: 5 new columns
+            // items: 6 new columns
             try db.execute(sql: "ALTER TABLE items ADD COLUMN sync_excluded INTEGER NOT NULL DEFAULT 0;")
             try db.execute(sql: "ALTER TABLE items ADD COLUMN cloud_synced_at INTEGER;")
             try db.execute(sql: "ALTER TABLE items ADD COLUMN cloud_etag TEXT;")
             try db.execute(sql: "ALTER TABLE items ADD COLUMN cloud_lastmodified INTEGER;")
+            try db.execute(sql: "ALTER TABLE items ADD COLUMN cloud_name TEXT;")    // hex(hmac), enables ETag tracking
             try db.execute(sql: "ALTER TABLE items ADD COLUMN device_id TEXT;")
+            try db.execute(sql: "CREATE INDEX idx_items_cloud_name ON items(cloud_name);")
 
             // clip_blobs: 2 new columns
             try db.execute(sql: "ALTER TABLE clip_blobs ADD COLUMN cloud_synced_at INTEGER;")
@@ -1028,6 +1033,7 @@ struct ClipItem: Identifiable, Equatable {
     var cloudSyncedAt: Int64? = nil
     var cloudEtag: String? = nil
     var cloudLastModified: Int64? = nil
+    var cloudName: String? = nil      // hex(hmac); set on insert if sync enabled, on UPSERT during pull
     var deviceID: String? = nil
 
     static func byteSize(of s: String) -> Int { s.utf8.count }
@@ -1100,8 +1106,36 @@ In the `HistoryStore` class:
             cloudSyncedAt: row["cloud_synced_at"],
             cloudEtag: row["cloud_etag"],
             cloudLastModified: row["cloud_lastmodified"],
+            cloudName: row["cloud_name"],
             deviceID: row["device_id"]
         )
+    }
+
+    /// Look up the local cloud_etag for a given hmac (used by SyncEngine pull
+    /// to skip GET when local row's cloud_etag already matches the listing
+    /// ETag — fixes the "always re-download" correctness gap flagged by review).
+    func cloudEtagByName(_ name: String, table: String = "items") throws -> String? {
+        try pool.read { db in
+            try String.fetchOne(db,
+                sql: "SELECT cloud_etag FROM \(table) WHERE cloud_name = ? LIMIT 1",
+                arguments: [name])
+        }
+    }
+
+    func tombstoneEtagByName(_ name: String) throws -> String? {
+        try pool.read { db in
+            try String.fetchOne(db,
+                sql: "SELECT cloud_etag FROM tombstones WHERE hmac = ? LIMIT 1",
+                arguments: [name])
+        }
+    }
+
+    /// Set cloud_name on an items row (called by SyncEngine after first PUT).
+    func setItemCloudName(id: Int64, name: String) throws {
+        try pool.write { db in
+            try db.execute(sql: "UPDATE items SET cloud_name = ? WHERE id = ?",
+                           arguments: [name, id])
+        }
     }
 ```
 
@@ -2405,6 +2439,14 @@ actor SyncEngine {
     // MARK: - public enqueue API
 
     func enqueueItemPush(itemID: Int64, at: Int64) throws {
+        // Spec §10.4 — runtime guard against >2MB images. Backfill SQL also
+        // filters but live onChange-fired enqueues need their own check.
+        if let item = try store.itemByID(itemID),
+           item.kind == .image, let blobID = item.blobID,
+           let info = try store.blobInfo(id: blobID),
+           info.size > 2 * 1024 * 1024 {
+            return                  // skip; UI will show 📤 (panel icon task)
+        }
         try queue.enqueue(op: .putItem, targetKey: String(itemID), at: at)
     }
 
@@ -2484,6 +2526,7 @@ actor SyncEngine {
         let (etag, lm) = try await backend.put(key: key, body: sealed,
                                                contentType: "application/octet-stream")
         try store.markItemSynced(id: itemID, at: now, etag: etag, lastModified: lm)
+        try store.setItemCloudName(id: itemID, name: name)   // enables future ETag-skip on pull
     }
 
     private func pushBlob(blobID: Int64) async throws {
@@ -2658,21 +2701,19 @@ Append inside the `actor SyncEngine` body, after the push methods:
         } while cursor != nil
     }
 
+    /// Spec §7.3 — incremental pull: skip GET if list ETag already matches what we
+    /// stored last time. Fixes the "always re-download" correctness gap by querying
+    /// the per-row cloud_etag column added in Migration v3 (Task 1).
     private func lookupLocalEtag(prefix: String, key: String) throws -> String? {
-        try store.pool.read { db in
-            switch prefix {
-            case CloudKey.itemsPrefix:
-                // items.cloud_etag joined to the row whose hmac matches this key
-                // We don't store hmac in items; instead match by the (currently)
-                // single-pass walk: it's fine to GET when local row doesn't have
-                // matching content_hash. Optimization: precompute hmac → item map.
-                // For v3 simplicity: always GET; the GET is the source of truth.
-                // (LocalDirBackend.list is the only consumer here in tests.)
-                return nil
-            case CloudKey.tombPrefix:
-                return nil
-            default: return nil
-            }
+        // Cloud key shape: "<prefix><name>.bin" where name = hex(hmac).
+        let dropped = key.dropFirst(prefix.count)
+        guard dropped.hasSuffix(".bin") else { return nil }
+        let name = String(dropped.dropLast(".bin".count))
+        switch prefix {
+        case CloudKey.itemsPrefix:    return try store.cloudEtagByName(name, table: "items")
+        case CloudKey.tombPrefix:     return try store.tombstoneEtagByName(name)
+        case CloudKey.devicesPrefix:  return nil   // device cache is in-memory only
+        default:                      return nil
         }
     }
 
@@ -2714,12 +2755,12 @@ Append inside the `actor SyncEngine` body, after the push methods:
             deviceID: payload.deviceId)
 
         if item.kind == .image, let blobHmac = payload.blobHmac, let blobSize = payload.blobSize {
-            // Insert lazy blob row (bytes NULL). The blob's sha256 isn't known
-            // until we GET it; for now we use blobHmac as the dedup key in
-            // a side column. v3: store a marker in clip_blobs.sha256 = "lazy:<blobHmac>"
+            // Insert lazy blob row (bytes empty). Real bytes filled by fetchBlob (Task 17A).
             let blobID = try store.insertLazyBlob(blobHmac: blobHmac, byteSize: blobSize, now: now)
             item.blobID = blobID
         }
+        // Set cloud_name so the next pull can ETag-skip this row.
+        item.cloudName = hmac
         _ = try store.insert(item)
     }
 
@@ -2981,7 +3022,7 @@ git commit -m "sync: SyncEngine — tombstone push + propagation, items/<h> clea
 
 ---
 
-### Task 17: SyncEngine — enableSync + backfill
+### Task 17: SyncEngine — backfill
 
 **Files:**
 - Modify: `Sources/Clip/Sync/SyncEngine.swift` — add `enableSync()` and `backfill()`
@@ -3060,8 +3101,8 @@ Expected: compile error.
 
 ```swift
     /// Spec §7.6: enqueue every existing non-excluded item (and its blob if
-    /// ≤ 2MB) into sync_queue. Run once when user enables sync. Independent
-    /// transaction; not part of Migrator.
+    /// ≤ 2MB) into sync_queue. Run once **after** `enableSync` (Task 17A) finishes
+    /// the bootstrap. Independent transaction; not part of Migrator.
     func backfill(now: Int64) async throws {
         try store.pool.write { db in
             try db.execute(sql: """
@@ -3182,6 +3223,338 @@ Expected: 1 test passes.
 ```bash
 git add Sources/Clip/Sync/SyncEngine.swift Tests/ClipTests/Sync/SyncEngineExcludeTests.swift
 git commit -m "sync: SyncEngine — excludeItem (tomb + drop pending pushes)"
+```
+
+---
+
+### Task 17A: SyncEngine — enableSync (config.json bootstrap + master-key derivation)
+
+This task closes the most load-bearing gap surfaced by plan-review pass 1: without it, no device can ever produce a valid `master_key` in Keychain, so `AppDelegate.startCloudSyncIfEnabled` (Task 22) silently no-ops and nothing ever syncs.
+
+**Files:**
+- Modify: `Sources/Clip/Sync/SyncEngine.swift` — add `enableSync(password:)` actor method
+- Modify: `Sources/Clip/Storage/HistoryStore.swift` — no change (uses `SyncStateStore`)
+- Create: `Tests/ClipTests/Sync/SyncEngineEnableBootstrapTests.swift`
+
+- [ ] **Step 1: Write the failing test**
+
+```swift
+// Tests/ClipTests/Sync/SyncEngineEnableBootstrapTests.swift
+import XCTest
+@testable import Clip
+
+final class SyncEngineEnableBootstrapTests: XCTestCase {
+    func makeBackend() -> LocalDirBackend {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("clip-test-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return LocalDirBackend(root: dir)
+    }
+
+    func testFirstDeviceWritesConfigAndDerivesMasterKey() async throws {
+        let backend = makeBackend()
+        let store = try HistoryStore.inMemory()
+        let state = SyncStateStore(store: store)
+        let kc = KeychainStore(service: "com.zyw.clip.test.\(UUID().uuidString)")
+
+        let result = try await SyncEngine.enableSync(
+            password: "correct-horse-battery-staple",
+            backend: backend, state: state, keychain: kc, account: "master")
+
+        XCTAssertEqual(result, .firstDevice)
+        // config.json now exists in cloud
+        XCTAssertNotNil(try await backend.get(key: CloudKey.configKey))
+        // master key in Keychain
+        XCTAssertNotNil(try kc.read(account: "master"))
+        // sync_state populated
+        XCTAssertNotNil(try state.get("kdf_salt_b64"))
+        XCTAssertEqual(try state.get("kdf_iters"), "200000")
+    }
+
+    func testJoiningDeviceRestoresMasterKeyFromExistingConfig() async throws {
+        let backend = makeBackend()
+
+        // Device A: bootstrap
+        let storeA = try HistoryStore.inMemory()
+        let stateA = SyncStateStore(store: storeA)
+        let kcA = KeychainStore(service: "com.zyw.clip.test.\(UUID().uuidString)")
+        _ = try await SyncEngine.enableSync(
+            password: "correct-horse-battery-staple",
+            backend: backend, state: stateA, keychain: kcA, account: "master")
+        let masterA = try kcA.read(account: "master")
+
+        // Device B: joins with same password
+        let storeB = try HistoryStore.inMemory()
+        let stateB = SyncStateStore(store: storeB)
+        let kcB = KeychainStore(service: "com.zyw.clip.test.\(UUID().uuidString)")
+        let result = try await SyncEngine.enableSync(
+            password: "correct-horse-battery-staple",
+            backend: backend, state: stateB, keychain: kcB, account: "master")
+
+        XCTAssertEqual(result, .joinedExisting)
+        XCTAssertEqual(try kcB.read(account: "master"), masterA, "same password+salt → same key")
+    }
+
+    func testJoiningWithWrongPasswordStillDerivesKeyButCallerCanReject() async throws {
+        // The bootstrap function does not itself verify the password against
+        // an existing payload — that's the engine's pull job to surface
+        // (decryption fails on first item GET). This test pins the design.
+        let backend = makeBackend()
+
+        let storeA = try HistoryStore.inMemory()
+        let kcA = KeychainStore(service: "com.zyw.clip.test.\(UUID().uuidString)")
+        _ = try await SyncEngine.enableSync(
+            password: "correct-pass",
+            backend: backend, state: SyncStateStore(store: storeA),
+            keychain: kcA, account: "master")
+
+        let storeB = try HistoryStore.inMemory()
+        let kcB = KeychainStore(service: "com.zyw.clip.test.\(UUID().uuidString)")
+        // Different password: still completes bootstrap (different master_key
+        // gets written). Caller verifies via test-decryption afterward.
+        let result = try await SyncEngine.enableSync(
+            password: "wrong-pass",
+            backend: backend, state: SyncStateStore(store: storeB),
+            keychain: kcB, account: "master")
+        XCTAssertEqual(result, .joinedExisting)
+        XCTAssertNotEqual(try kcA.read(account: "master"),
+                          try kcB.read(account: "master"))
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+```bash
+swift test --filter ClipTests.SyncEngineEnableBootstrapTests
+```
+
+Expected: compile error.
+
+- [ ] **Step 3: Add enableSync to SyncEngine**
+
+Append (as a `static` method on `SyncEngine` because it runs before the engine instance is constructed):
+
+```swift
+extension SyncEngine {
+    enum BootstrapResult: Equatable {
+        case firstDevice         // wrote config.json + new salt
+        case joinedExisting      // read config.json, derived from existing salt
+    }
+
+    /// Spec §7.1 first-time enable flow. Runs before SyncEngine is instantiated;
+    /// once successful, AppDelegate can construct the engine with the freshly
+    /// written master_key and run pull/push as normal.
+    ///
+    /// Side effects:
+    ///   - config.json present in `backend` (created if missing)
+    ///   - kdf_salt_b64 / kdf_iters / kdf_version persisted to sync_state
+    ///   - master_key written to Keychain under `(service:account)`
+    ///   - device_id allocated to sync_state if not already there
+    static func enableSync(
+        password: String,
+        backend: CloudSyncBackend,
+        state: SyncStateStore,
+        keychain: KeychainStore,
+        account: String
+    ) async throws -> BootstrapResult {
+        let iters = 200_000
+        let configBytes = try await backend.get(key: CloudKey.configKey)
+        let result: BootstrapResult
+        let salt: Data
+
+        if let configBytes {
+            let config = try JSONDecoder().decode(CloudConfigPayload.self, from: configBytes)
+            guard let s = Data(base64Encoded: config.kdfSaltB64) else {
+                throw NSError(domain: "SyncEngine", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "config salt malformed"])
+            }
+            salt = s
+            try state.set("kdf_iters", String(config.kdfIters))
+            result = .joinedExisting
+        } else {
+            // First device — generate salt + write config.
+            var fresh = Data(count: 16)
+            _ = fresh.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!) }
+            salt = fresh
+            let payload = CloudConfigPayload(
+                v: 1, kdf: "pbkdf2-hmac-sha256",
+                kdfIters: iters, kdfSaltB64: salt.base64EncodedString(),
+                format: "chacha20-poly1305-ietf-12-16")
+            let json = try JSONEncoder().encode(payload)
+            _ = try await backend.put(key: CloudKey.configKey, body: json,
+                                      contentType: "application/json")
+            try state.set("kdf_iters", String(iters))
+            result = .firstDevice
+        }
+
+        try state.set("kdf_salt_b64", salt.base64EncodedString())
+        try state.set("kdf_version", "1")
+
+        let masterKey = KeyDerivation.pbkdf2_sha256(
+            password: password, salt: salt,
+            iterations: iters, keyLength: 32)
+        try keychain.write(account: account, data: masterKey)
+
+        if try state.get("device_id") == nil {
+            try state.set("device_id", UUID().uuidString)
+        }
+
+        return result
+    }
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+```bash
+swift test --filter ClipTests.SyncEngineEnableBootstrapTests
+```
+
+Expected: 3 tests pass.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add Sources/Clip/Sync/SyncEngine.swift Tests/ClipTests/Sync/SyncEngineEnableBootstrapTests.swift
+git commit -m "sync: SyncEngine.enableSync — config.json bootstrap + master-key derivation"
+```
+
+---
+
+### Task 17B: SyncEngine + HistoryStore — lazy blob fetch
+
+Closes the second load-bearing gap from plan-review: insert side of lazy blobs is in T15, but no read side; image rows on B device would have `bytes` empty forever.
+
+**Files:**
+- Modify: `Sources/Clip/Sync/SyncEngine.swift` — add `fetchBlob(blobHmac:) async throws -> Data`
+- Modify: `Sources/Clip/Storage/HistoryStore.swift` — add `fillBlob`, `lazyBlobHmac` helpers; refactor `blob(id:)` is unchanged (it stays sync; lazy resolution happens in caller)
+- Create: `Tests/ClipTests/Sync/SyncEngineLazyBlobTests.swift`
+
+- [ ] **Step 1: Write the failing test**
+
+```swift
+// Tests/ClipTests/Sync/SyncEngineLazyBlobTests.swift
+import XCTest
+@testable import Clip
+
+final class SyncEngineLazyBlobTests: XCTestCase {
+    func testFetchBlobDecryptsAndFillsLocalRow() async throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("clip-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let backend = LocalDirBackend(root: dir)
+        let crypto = CryptoBox(masterKey: Data(repeating: 0xEE, count: 32))
+
+        let storeA = try HistoryStore.inMemory()
+        let engineA = SyncEngine(store: storeA, backend: backend, crypto: crypto,
+                                 deviceID: "A", state: SyncStateStore(store: storeA))
+        let storeB = try HistoryStore.inMemory()
+        let engineB = SyncEngine(store: storeB, backend: backend, crypto: crypto,
+                                 deviceID: "B", state: SyncStateStore(store: storeB))
+
+        // A inserts an image
+        let bytes = Data(repeating: 0x42, count: 1024)
+        let aID = try storeA.insertImage(
+            bytes: bytes, mimeType: "image/png",
+            sourceBundleID: nil, sourceAppName: nil, now: 100)
+        let aBlobID = try XCTUnwrap(try storeA.itemByID(aID)?.blobID)
+        try await engineA.enqueueItemPush(itemID: aID, at: 100)
+        try await engineA.enqueueBlobPush(blobID: aBlobID, at: 100)
+        _ = try await engineA.pushOnce(now: 100)
+        _ = try await engineA.pushOnce(now: 101)
+
+        // B pulls — has lazy blob row but no bytes
+        try await engineB.pullOnce(now: 200)
+        let bItem = try XCTUnwrap(try storeB.listRecent().first)
+        let bBlobID = try XCTUnwrap(bItem.blobID)
+        let beforeBytes = try storeB.blob(id: bBlobID) ?? Data()
+        XCTAssertTrue(beforeBytes.isEmpty, "lazy row starts empty")
+
+        // B fetches: should hit backend, decrypt, fill local
+        let got = try await engineB.fetchBlob(blobID: bBlobID)
+        XCTAssertEqual(got, bytes)
+        let after = try XCTUnwrap(try storeB.blob(id: bBlobID))
+        XCTAssertEqual(after, bytes, "row now filled")
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+```bash
+swift test --filter ClipTests.SyncEngineLazyBlobTests
+```
+
+Expected: compile error.
+
+- [ ] **Step 3: Implement fetchBlob + HistoryStore helpers**
+
+Append to `Sources/Clip/Sync/SyncEngine.swift` inside the actor:
+
+```swift
+    /// Spec §7.4 — lazy image download. Caller holds a clip_blobs.id whose
+    /// `bytes` is empty (sha256 prefixed `lazy:`). Resolves the blob_hmac,
+    /// GETs blobs/<hmac>.bin, decrypts, fills the local row, returns bytes.
+    func fetchBlob(blobID: Int64) async throws -> Data {
+        guard let info = try store.lazyBlobHmac(id: blobID) else {
+            throw NSError(domain: "SyncEngine", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "blob \(blobID) is not lazy"])
+        }
+        let key = CloudKey.blobKey(name: info.hmac)
+        guard let sealed = try await backend.get(key: key) else {
+            throw NSError(domain: "SyncEngine", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "blob \(info.hmac) missing in cloud"])
+        }
+        let bytes = try crypto.open(sealed)
+        let realSha = ClipItem.contentHash(of: bytes)
+        try store.fillBlob(id: blobID, bytes: bytes, sha256: realSha,
+                          at: Int64(Date().timeIntervalSince1970))
+        return bytes
+    }
+```
+
+Append to `Sources/Clip/Storage/HistoryStore.swift`:
+
+```swift
+    /// If `clip_blobs.sha256` starts with "lazy:", return the hmac suffix
+    /// and current byte_size. Otherwise nil (already filled).
+    func lazyBlobHmac(id: Int64) throws -> (hmac: String, byteSize: Int)? {
+        try pool.read { db in
+            guard let row = try Row.fetchOne(db,
+                sql: "SELECT sha256, byte_size FROM clip_blobs WHERE id = ?",
+                arguments: [id]) else { return nil }
+            let sha: String = row["sha256"]
+            guard sha.hasPrefix("lazy:") else { return nil }
+            return (String(sha.dropFirst("lazy:".count)), row["byte_size"])
+        }
+    }
+
+    /// Replace the lazy placeholder with real bytes + real sha256.
+    /// `cloud_synced_at` is set so subsequent prune knows it's "live".
+    func fillBlob(id: Int64, bytes: Data, sha256: String, at: Int64) throws {
+        try pool.write { db in
+            try db.execute(sql: """
+                UPDATE clip_blobs SET bytes = ?, sha256 = ?, cloud_synced_at = ?
+                WHERE id = ?
+            """, arguments: [bytes, sha256, at, id])
+        }
+    }
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+```bash
+swift test --filter ClipTests.SyncEngineLazyBlobTests
+```
+
+Expected: 1 test passes.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add Sources/Clip/Sync/SyncEngine.swift Sources/Clip/Storage/HistoryStore.swift Tests/ClipTests/Sync/SyncEngineLazyBlobTests.swift
+git commit -m "sync: SyncEngine.fetchBlob — lazy image download + decrypt + local fill"
 ```
 
 ---
@@ -3408,8 +3781,10 @@ struct CloudSyncView: View {
     @State private var bucket: String = "clip-sync"
     @State private var accessKeyID: String = ""
     @State private var secretAccessKey: String = ""
+    @State private var syncPassword: String = ""
     @State private var statusMessage: String = ""
     @State private var testing = false
+    @State private var bootstrapping = false
 
     private var settings: SyncSettings { PreferencesContainer.shared.syncSettings }
 
@@ -3434,8 +3809,15 @@ struct CloudSyncView: View {
                     }
                 }
 
-                Section("说明") {
-                    Text("剪贴板内容在上传前用你的同步密码做端到端加密 (ChaCha20-Poly1305)，云端永远拿不到明文。\n\n密码丢失 = 云端数据全部不可恢复，请使用密码管理器保存。")
+                Section("同步密码 (E2E)") {
+                    SecureField("同步密码 (≥12 字符)", text: $syncPassword)
+                    Button(bootstrapping ? "正在初始化…" : "初始化 / 加入云端") {
+                        bootstrap()
+                    }
+                    .disabled(bootstrapping || syncPassword.count < 12 ||
+                              endpoint.isEmpty || bucket.isEmpty
+                              || accessKeyID.isEmpty || secretAccessKey.isEmpty)
+                    Text("剪贴板内容在上传前用你的同步密码做端到端加密 (ChaCha20-Poly1305)，云端永远拿不到明文。\n\n⚠️ 密码丢失 = 云端数据全部不可恢复，请使用密码管理器保存。")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -3486,6 +3868,56 @@ struct CloudSyncView: View {
 
     @MainActor
     private func setStatus(_ s: String) { statusMessage = s }
+
+    /// Spec §7.1 — call SyncEngine.enableSync(...) to either bootstrap a fresh
+    /// cloud profile (first device) or derive the master key from the existing
+    /// config.json (joining device). Persists settings on success and asks
+    /// AppDelegate to spin up the engine.
+    private func bootstrap() {
+        bootstrapping = true
+        let pwd = syncPassword
+        let endpoint = self.endpoint
+        let bucket = self.bucket
+        let ak = self.accessKeyID
+        let sk = self.secretAccessKey
+        Task {
+            defer { Task { @MainActor in bootstrapping = false } }
+            guard let url = URL(string: endpoint) else {
+                await setStatus("Endpoint URL 无效"); return
+            }
+            let backend = R2Backend(endpoint: url, bucket: bucket,
+                                    accessKeyID: ak, secretAccessKey: sk)
+            // Persist secret first so the engine can pick it up.
+            try? KeychainStore(service: "com.zyw.clip.cloud-r2-secret-v1")
+                .write(account: "current", data: Data(sk.utf8))
+            let store = PreferencesContainer.shared.store!  // wired in AppDelegate
+            let state = SyncStateStore(store: store)
+            let masterKC = KeychainStore(service: "com.zyw.clip.cloud-master-v1")
+            do {
+                let result = try await SyncEngine.enableSync(
+                    password: pwd, backend: backend, state: state,
+                    keychain: masterKC, account: "current")
+                await MainActor.run {
+                    settings.endpoint = endpoint
+                    settings.bucket = bucket
+                    settings.accessKeyID = ak
+                    settings.enabled = true
+                }
+                await setStatus(result == .firstDevice
+                                ? "✓ 已初始化新云端 profile"
+                                : "✓ 已加入现有云端")
+                // Tell AppDelegate to spin up the engine + (if first device) backfill.
+                await NotificationCenter.default.post(
+                    name: .clipCloudSyncDidEnable, object: nil)
+            } catch {
+                await setStatus("✗ 初始化失败: \(error)")
+            }
+        }
+    }
+}
+
+extension Notification.Name {
+    static let clipCloudSyncDidEnable = Notification.Name("clip.cloud.didEnable")
 }
 ```
 
@@ -3613,7 +4045,21 @@ And add this method at the bottom of `AppDelegate`:
     }
 ```
 
-> **Note**: This first-cut wiring assumes the user has already (a) enabled sync via Preferences AND (b) provisioned the Keychain master key out-of-band. For v3, the master-key-setup UI is part of CloudSyncView (extension future work — for autonomous build session, leaving it as "set via test or programmatic call" is acceptable as long as the engine code path is exercised by tests).
+**Bootstrap notification wiring** — also subscribe to the notification CloudSyncView posts after enableSync returns, so the engine spins up immediately (without requiring an app restart) and the first device's backfill kicks off:
+
+```swift
+        NotificationCenter.default.addObserver(
+            forName: .clipCloudSyncDidEnable, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.startCloudSyncIfEnabled()
+            // First-device profile: kick backfill exactly once.
+            // (joinedExisting case: no-op because backfill rows would just dup
+            // existing cloud objects — which is harmless but wasteful.)
+            if let engine = self.syncEngine {
+                Task { try? await engine.backfill(now: Int64(Date().timeIntervalSince1970)) }
+            }
+        }
 
 - [ ] **Step 2: Build to verify it compiles**
 
@@ -3805,6 +4251,27 @@ This is the planner's self-check, not a separate review pass:
 - `setSyncExcluded(id:excluded:)` defined T7, used T18
 
 All consistent.
+
+---
+
+## Out of Scope (explicit) — for STATUS.md handoff
+
+These items appear in the spec (some only as UI affordances) but are **deliberately not implemented in this plan**. STATUS.md must surface them so the user knows what's stubbed vs shipped:
+
+| Spec ref | Item | Why deferred | Workaround for v3 ship |
+|---|---|---|---|
+| §3.14, §7.3 | Wake / hotkey-trigger immediate pull + 5s rate-limit | 30s tick is functional for daily use; immediate-pull is a latency win, not correctness | User waits ≤ 30s for cross-device updates |
+| §6.4 + §7.x | Device push (`pushDevice` actor stub) + `devices/<id>` aggregation in Preferences "已知设备" UI | Cosmetic / observability feature; payload type defined (`DevicePayload`) but PUT/decode pipeline not wired | Sync still works; users can't see device list (use Console.app to identify which Mac wrote what) |
+| §8.1 | "立刻同步" button | Background tick covers it | Quit + relaunch app = same effect |
+| §8.1 | "查看错误" sheet (per-row sync_queue inspection) | Read-only diagnostic — not load-bearing | Inspect `~/Library/Application Support/clip/history.sqlite` directly: `sqlite3 history.sqlite 'SELECT * FROM sync_queue'` |
+| §8.1 | "清空云端数据" button | Use `wrangler r2 object delete` from CLI for now | `wrangler r2 bucket clear clip-sync` (or per-prefix delete) |
+| §8.1 | "重置同步密码" button | Spec'd but full re-encryption flow is non-trivial | "Clear cloud + re-enable with new password" via dashboard |
+| §8.2 | Panel icons ⏳ / 📤 / ⚠️ (only ☁️ / 🚫 in T20) | UX polish; the underlying state (sync_queue / blob skip / failed attempts) is computed correctly, just not surfaced visually | Icons can be added in a follow-up commit |
+| §8.4 | First-launch modal sheet ("first Mac vs join existing" branching with progress bar) | The bootstrap logic IS in T17A; UI shows it as a Preferences form rather than a separate onboarding sheet | Functional — user bootstraps via Preferences instead of modal |
+| §10.2 | Password change flow (5-step blocking re-encrypt) | Heavy feature; reset-cloud-and-re-enable accomplishes the same with minor data loss | Per workaround in §8.1 |
+| §10.4 | In-app quota-exceeded remediation flow | Spec already says "user handles via dashboard" | Dashboard link in CloudSyncView status text (manual step) |
+
+For each item above, the engine architecture is forward-compatible: a follow-up plan can add tasks without touching the core push/pull/crypto/queue modules.
 
 ---
 

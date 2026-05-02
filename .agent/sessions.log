@@ -5,3 +5,7 @@
 2026-05-02T12:32:48Z phase=plan-review agent_id=adb2aa32eac156a67 desc="independent plan review — 10 substantive gaps + T15 ETag stub bug" status=completed verdict=needs_rework
 2026-05-02T12:39:47Z phase=plan-review-2 agent_id=a7d8aedffaa52ebde desc="independent plan re-review pass 2 — minor fixes" status=completed verdict=minor_fixes
 2026-05-02T13:44:25Z phase=spec-rewrite agent_id=local desc="architecture pivot: R2-only objects → Cloudflare D1 (rows) + R2 (blobs only) per user direction" status=launched
+2026-05-02T14:01:17Z phase=d1-setup agent_id=local desc="create D1 database via wrangler (OAuth token has d1:write scope)" status=launched
+2026-05-02T15:22:31Z phase=d1-setup agent_id=local desc="D1 db clip-sync created (UUID ae40b250-...) in APAC; SELECT smoke OK 0.36ms; combined R2+D1 token saved" status=completed verdict=ship
+2026-05-02T16:17:45Z phase=plan-v2-review agent_id=local desc="dispatching fresh general-purpose reviewer for v2 plan against v2 spec" status=launched
+2026-05-02T16:20:40Z phase=plan-v2-review agent_id=a6e396897c2742118 desc="independent v2 plan review — 6 findings (fix E partial / excludeItemByHash blockquote / pasteCallback gap / devices pull missing / NWPathMonitor / 📤 mismatch)" status=completed verdict=minor_fixes

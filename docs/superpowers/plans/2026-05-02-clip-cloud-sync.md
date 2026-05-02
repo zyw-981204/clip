@@ -3499,7 +3499,41 @@ extension SyncEngine {
 
         return iWonSalt ? .firstDevice : .joinedExisting
     }
+
+    /// Spec §5.2 — runs on **every SyncEngine cold start** (not only enable),
+    /// so a remote schema bump while this client was offline is caught next
+    /// launch. Throws SyncError.remoteSchemaNewer when remote > local.
+    /// Idempotent: `ensureSchema` is `CREATE TABLE IF NOT EXISTS`-only.
+    static func verifyRemoteSchema(dataSource: CloudSyncDataSource) async throws {
+        let localSchemaVersion = "3"
+        try await dataSource.ensureSchema()
+        let remote = try await dataSource.getConfig(key: "schema_version") ?? localSchemaVersion
+        if (Int(remote) ?? 0) > (Int(localSchemaVersion) ?? 0) {
+            throw SyncError.remoteSchemaNewer(remote: remote, local: localSchemaVersion)
+        }
+    }
 }
+```
+
+Add an extra failing test in T18's test file (Step 1) for the cold-start guard:
+
+```swift
+    func testVerifyRemoteSchemaThrowsWhenRemoteNewer() async throws {
+        let ds = try makeDS()
+        _ = try await ds.putConfigIfAbsent(key: "schema_version", value: "999")
+        do {
+            try await SyncEngine.verifyRemoteSchema(dataSource: ds)
+            XCTFail("expected throw")
+        } catch SyncError.remoteSchemaNewer(let r, let l) {
+            XCTAssertEqual(r, "999"); XCTAssertEqual(l, "3")
+        }
+    }
+
+    func testVerifyRemoteSchemaPassesWhenEqual() async throws {
+        let ds = try makeDS()
+        _ = try await ds.putConfigIfAbsent(key: "schema_version", value: "3")
+        try await SyncEngine.verifyRemoteSchema(dataSource: ds)   // no throw
+    }
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -3861,13 +3895,45 @@ Replace the placeholder `pushTomb` and add `excludeItem`:
                 sql: "SELECT cloud_id FROM tombstones WHERE content_hash = ?",
                 arguments: [contentHash])
         }
-        guard let cloudID else { return }
+        guard let cloudID, !cloudID.isEmpty else { return }
         let serverUpdatedAt = try await dataSource.setClipDeleted(id: cloudID)
         // Re-stamp local tombstone with server-authoritative updated_at
         try store.upsertTombstone(contentHash: contentHash,
                                   cloudID: cloudID,
                                   tombstonedAt: serverUpdatedAt,
                                   cloudUpdatedAt: serverUpdatedAt)
+    }
+
+    /// Wrapper used by AppDelegate's HistoryStore.onChange handler when a
+    /// `.deleted(itemID:contentHash:)` event arrives — by then the local row
+    /// is already gone, so we can't look it up by id. If a sync_synced item
+    /// with this hash existed, we already wrote its tombstone (the `delete`
+    /// path doesn't, but `excludeItem` does — so plain delete from outside the
+    /// exclude path needs us to still send the tomb). Best-effort: write a
+    /// content_hash-keyed tombstone if missing and enqueue tomb push. The
+    /// pushTomb path above bails out if cloud_id is empty (i.e. row was never
+    /// synced — nothing to delete remotely), which is the desired no-op.
+    func excludeItemByHash(contentHash: String, at: Int64) async throws {
+        // If a row with this hash still exists locally (e.g. because exclude
+        // was a separate event), reuse the structured path.
+        if let item = try store.itemByContentHash(contentHash), let id = item.id {
+            try await excludeItem(id: id, at: at)
+            return
+        }
+        // Otherwise: write a tombstone directly. We don't know the cloud_id
+        // (the row is gone), so pushTomb will bail out — that's fine for rows
+        // that were never synced. For rows that WERE synced, the tombstones
+        // table SHOULD already contain the cloud_id from when they were
+        // pushed (markClipSynced + the delete-time tombstone write), so look
+        // it up before deciding whether to enqueue.
+        let existingCloudID = try store.pool.read { db in
+            try String.fetchOne(db,
+                sql: "SELECT cloud_id FROM tombstones WHERE content_hash = ?",
+                arguments: [contentHash])
+        }
+        if let existingCloudID, !existingCloudID.isEmpty {
+            try queue.enqueue(op: .putTomb, targetKey: contentHash, at: at)
+        }
     }
 ```
 
@@ -4408,6 +4474,39 @@ Add at bottom of `AppDelegate`:
                                   accessKeyID: r2AK, secretAccessKey: r2Secret)
         let ds = D1Backend(accountID: d1AccountID, databaseID: d1DatabaseID,
                            apiToken: d1Token)
+
+        // Spec §5.2 / fix E — verify remote schema on every cold start. Don't
+        // start the engine if remote is newer (refuse to mutate data we don't
+        // understand). Failure is surfaced via NSAlert; sync stays disabled
+        // for this session.
+        Task {
+            do {
+                try await SyncEngine.verifyRemoteSchema(dataSource: ds)
+                await MainActor.run { self.startCloudSyncEngineCore(
+                    ds: ds, blobs: blobs, crypto: crypto, masterKey: masterKey) }
+            } catch let SyncError.remoteSchemaNewer(remote, local) {
+                await MainActor.run {
+                    let alert = NSAlert()
+                    alert.messageText = "需要升级 Clip"
+                    alert.informativeText = "另一台 Mac 装了更新版本的 Clip (云端 schema v\(remote)；本机 v\(local))。请升级本机后重启同步。"
+                    alert.alertStyle = .warning
+                    alert.runModal()
+                }
+            } catch {
+                // Network or auth — log and skip. SyncSettings stays enabled
+                // so a retry on next launch is automatic.
+                NSLog("[clip] verifyRemoteSchema failed: \(error)")
+            }
+        }
+    }
+
+    /// Caller has verified schema; actually wire the engine + start loops.
+    /// Separated from `startCloudSyncIfEnabled` so the schema check is
+    /// strictly first.
+    private func startCloudSyncEngineCore(ds: CloudSyncDataSource,
+                                          blobs: CloudSyncBlobStore,
+                                          crypto: CryptoBox,
+                                          masterKey: Data) {
         let state = SyncStateStore(store: store)
         let deviceID = (try? state.get("device_id")) ?? UUID().uuidString.lowercased()
         try? state.set("device_id", deviceID)
@@ -4446,32 +4545,37 @@ Add at bottom of `AppDelegate`:
             Task { try? await engine.excludeItem(id: id, at: now) }
         }
 
-        // Lazy blob fetch wire-up: replace panelModel paste closure for
-        // image kind so empty bytes trigger engine.fetchBlob first.
-        let originalPaste = panelModel.pasteCallback
-        panelModel.pasteCallback = { [weak self] item in
-            guard let self else { return }
-            if item.kind == .image, let blobID = item.blobID {
-                Task {
-                    var bytes = (try? self.store.blob(id: blobID)) ?? Data()
-                    if bytes.isEmpty, let engine = self.syncEngine {
-                        bytes = (try? await engine.fetchBlob(blobID: blobID)) ?? Data()
-                    }
-                    if !bytes.isEmpty {
-                        await MainActor.run {
-                            self.injector.pasteImage(
-                                bytes: bytes,
-                                mimeType: item.mimeType ?? "image/png"
-                            ) { self.panel.close() }
-                        }
-                    } else {
-                        await MainActor.run { self.panel.close() }
-                    }
-                }
-            } else {
-                originalPaste?(item)
-            }
-        }
+        // Lazy blob fetch wire-up. The original panelModel paste closure
+        // (set in applicationDidFinishLaunching when sync was disabled) reads
+        // bytes synchronously and gives up if empty. Once sync is enabled we
+        // rebuild panelModel with a closure that, for image kind, awaits
+        // engine.fetchBlob if local bytes are empty before pasting. Text
+        // kind path is unchanged.
+        //
+        // Implementation: locate the existing `panelModel = PanelModel(store: store) { ... }`
+        // in applicationDidFinishLaunching and restructure so the image branch is:
+        //
+        //   case .image:
+        //       guard let blobID = item.blobID else { self.panel.close(); return }
+        //       Task {
+        //           var bytes = (try? self.store.blob(id: blobID)) ?? Data()
+        //           if bytes.isEmpty, let engine = self.syncEngine {
+        //               bytes = (try? await engine.fetchBlob(blobID: blobID)) ?? Data()
+        //           }
+        //           await MainActor.run {
+        //               if !bytes.isEmpty {
+        //                   self.injector.pasteImage(
+        //                       bytes: bytes,
+        //                       mimeType: item.mimeType ?? "image/png"
+        //                   ) { self.panel.close() }
+        //               } else {
+        //                   self.panel.close()
+        //               }
+        //           }
+        //       }
+        //
+        // (Don't add a settable `pasteCallback` property to PanelModel — make
+        // the change at the construction site directly.)
 
         // Background push drainer + 30s pull tick
         pushLoopTask = Task { [weak engine] in
@@ -4489,21 +4593,7 @@ Add at bottom of `AppDelegate`:
     }
 ```
 
-> **Note**: this assumes `PanelModel` exposes a settable `pasteCallback`. If it doesn't, refactor to expose it as part of T23, or rebuild `panelModel` here with the lazy-aware closure.
-
-> **Note**: `engine.excludeItemByHash` is a small helper — add to SyncEngine if not present:
-> ```swift
-> func excludeItemByHash(contentHash: String, at: Int64) async throws {
->     if let item = try store.itemByContentHash(contentHash), let id = item.id {
->         try await excludeItem(id: id, at: at)
->     } else {
->         // Local row already deleted — write tombstone directly + push tomb
->         try store.upsertTombstone(contentHash: contentHash, cloudID: "",
->                                   tombstonedAt: at, cloudUpdatedAt: at)
->         try queue.enqueue(op: .putTomb, targetKey: contentHash, at: at)
->     }
-> }
-> ```
+**Note**: `engine.excludeItemByHash(contentHash:at:)` is added in T21 step 3 (see Task 21 below). Don't define it here; just call it.
 
 - [ ] **Step 2: Build to verify it compiles**
 
@@ -4553,7 +4643,7 @@ git commit -m "sync: AppDelegate wire-in — engine + onChange + ⌘N + lazy blo
 - [ ] A 删一条 → B 上消失
 - [ ] A pin 一条 → B 上 pin 状态同步
 - [ ] A 复制一张 1MB 图 → B 看到行（lazy 占位）→ 点开预览 spinner → 解密渲染
-- [ ] A 复制一张 3MB 图 → A 行尾 📤（v3 暂用 ☁️ 替代）；B 永远看不到这条
+- [ ] A 复制一张 3MB 图 → A 行尾**无图标**（v3 ☁️/🚫 only；spec §8.2 的 📤 标志在 v3.x 才加）；不上传，B 永远看不到这条
 - [ ] A 在面板按 ⌘N 标记不同步一条已有 → B 上消失（行尾 🚫 在 A 出现）
 - [ ] 重启两台 Mac → 历史保留 + 后续复制仍同步
 - [ ] 输错密码 → 不删本地数据；statusMessage 显示密码错
@@ -4739,8 +4829,8 @@ These items appear in the spec or were natural follow-ups but are **deliberately
 
 | Spec ref | Item | Why deferred | Workaround for v3 ship |
 |---|---|---|---|
-| §3.16 / §7.3 | Wake / hotkey-trigger immediate pull + 5s rate-limit | 30s tick is functional for daily use; immediate-pull is a latency win, not correctness | User waits ≤ 30s for cross-device updates |
-| §6.4 / §7.x | Device push (`pushDevice` actor stub) + "已知设备" Preferences UI | Cosmetic / observability feature; DevicePayload + DeviceRow are defined and `upsertDevice` / `listDevices` exist on the protocol so v3.1 just wires push + UI | Sync still works; users can't see device list (use Console.app to identify) |
+| §3.16 / §7.3 | Wake / hotkey-trigger immediate pull + 5s rate-limit; **NWPathMonitor reachability wakeup** for offline → online | 30s tick is functional for daily use; immediate-pull is a latency win, not correctness. The `NWPathMonitor` reachability hook would compress offline-recovery latency from "next 30s tick" to "instant"; not load-bearing | User waits ≤ 30s for cross-device updates; offline → online resync waits one tick |
+| §6.4 / §7.x | **Devices push AND devices pull** (`pushDevice` actor stub + the spec §7.3 devices loop in `pullOnce`) + "已知设备" Preferences UI | Cosmetic / observability — and devices pull is pointless when devices push isn't writing anything. DevicePayload + DeviceRow are defined and `upsertDevice` / `listDevices` exist on the protocol; v3.1 wires push + pull + UI together | Sync still works; users can't see device list (use Console.app to identify) |
 | §8.1 | "立刻同步" / "查看错误" / "清空云端" / "重置同步密码" buttons | Read-only diagnostics + dangerous ops; not load-bearing for daily sync | "立刻同步" → quit + relaunch app. "查看错误" → `sqlite3 ~/Library/Application Support/clip/history.sqlite 'SELECT * FROM sync_queue'`. "清空云端" → `wrangler d1 execute clip-sync --command 'DELETE FROM clips; DELETE FROM devices; DELETE FROM config'` + clear R2 bucket. "重置密码" → clear cloud + re-enable |
 | §8.2 | Panel icons ⏳ / 📤 / ⚠️ (only ☁️ / 🚫 in T23) | UX polish; underlying state computed correctly, not surfaced visually | Add in a follow-up commit; trivial UI change |
 | §8.4 | First-launch modal sheet ("first Mac vs join existing" branching with progress bar) | Bootstrap logic IS in T18; UI shows it as Preferences form rather than separate onboarding sheet | Functional via Preferences |

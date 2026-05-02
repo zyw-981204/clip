@@ -13,6 +13,12 @@
 
 **revision 记录**：原 spec line 31 `iCloud / 跨机同步（永远不做）` → 本 spec 取代。
 
+### 0.1 关于实现拆分
+
+本 spec 涵盖 KDF + crypto、S3 v4 签名、queue/backoff、lazy-blob fetch、Preferences 重设计、modal onboarding、migration v3、tombstone 语义、密码轮换、R2 集成测试、panel icon、新热键。reviewer 可能认为这跨越多个独立子系统、应该拆成 3-4 份 spec/plan。
+
+**保持单 spec / 单 plan 的理由**：上述模块之间高度耦合——所有路径都共用 `CryptoBox`、`CloudSyncBackend`、`SyncEngine` 三个核心抽象，拆开后边界处反而要重复定义同样的契约（PayloadVersion、ETag 表示、错误类型）。**拆分应该发生在 plan 内的 task 划分**（pp 1: foundations / 2: backend / 3: engine / 4: UI），而不是 spec 维度。`superpowers:writing-plans` 流程天然把这种规模分解成 bite-sized tasks。
+
 ## 1. 概述
 
 为 clip 增加**端到端加密**的跨 Mac 剪贴板历史同步。后端选 **Cloudflare R2**（S3 兼容对象存储），客户端用 ChaCha20-Poly1305 加密后再上传，云端永远拿不到明文。剪贴板条目是 immutable history events，用 content-addressed 命名 → 同条目跨设备天然去重，无合并冲突。
@@ -41,7 +47,7 @@
 - 同步 Preferences / 黑名单 / 热键设置
 - 多账号 / 多 cloud profile（每台 Mac 一份配置）
 - 端到端**密码恢复**机制（KDF + Keychain，丢密码就是丢数据；UI 上做强提醒）
-- 端到端**密码轮换**（v3.1 再做：旧 key 解密 + 新 key 重加密重传所有对象）
+- 密码轮换的**在线 / 增量 / 后台优化**（v3.1 再做。v3 已含基础密码修改流程，但是阻塞式重传——见 §10.2）
 
 ## 3. 设计决策汇总
 
@@ -54,10 +60,10 @@
 | 5 | 密钥分层 | 主密钥 → HKDF 派生 `kEncrypt`（加密）+ `kName`（HMAC 命名） | 单个泄漏不污染另一个用途；标准 NIST SP 800-108 模式 |
 | 6 | 文件命名 | `HMAC-SHA256(content_hash, kName)` 取 hex → 文件名 | 云端看不到 content_hash 也看不到内容；同 hash 跨设备命名一致 → 天然去重 |
 | 7 | 内容寻址 | 是 | 同一段文字在两台 Mac 复制 → 同 hmac → 第二台 PUT 覆盖第一台，幂等无冲突 |
-| 8 | 冲突解决 | LWW by R2 LastModified；item payload 是 immutable history event，本来无 mutable 冲突 | pin / exclude 是少数 mutable 字段，R2 last-write 即可 |
-| 9 | 图片存储 | 元数据 + 缩略图（≤ 5KB）随 item JSON 一起；原图单独 `blobs/<hmac>` 对象 | 拉取端按需下载原图，避免一同步就占满本地磁盘 |
+| 8 | 冲突解决 | **R2 LastModified 比较**（不是 payload 内的 created_at）。同 hmac 多次 PUT，list 拿到的 LastModified 较新者 wins。pin/exclude 是少数 mutable 字段；payload 内 created_at 用作 tombstone vs item 的复活判定（见 §10.3） | 区分两种比较语义：跨设备并发改 pin → 服务端时间为准；删除复活 → payload 时间为准 |
+| 9 | 图片存储 | 元数据 + 缩略图（≤ 5KB）随 item JSON 一起；原图单独 `blobs/<hmac>` 对象；backfill 与正常 push 共用串行 pushTask（不并行） | 拉取端按需下载原图，避免一同步就占满本地磁盘；串行 push 简化错误恢复 |
 | 10 | 大图阈值 | > 2MB 不上云（本地仍存） | 平衡带宽和实用性；同步 panel 显示 "📤 跳过云"  |
-| 11 | Tombstone | 删除 = 删 `items/<h>` + 写 `tomb/<h>`；本地 `tombstones` 表防"复活" | 单写 `items/` 删的方案在 list-page 边界会复活 |
+| 11 | Tombstone | 删除 = 删 `items/<h>` + 写 `tomb/<h>`；本地 `tombstones` 表防"复活"。复活判定语义见 §10.3 | 单写 `items/` 删的方案在 list-page 边界会复活：A 删后 B 在 list `items/` 拿到陈旧页面（没看到删除），又把它当作"新增"重新 INSERT，所以必须有显式 tomb 标记 |
 | 12 | Pin / Exclude | inline 在 item JSON 里；toggle 即重传同 key | 简单；pin 改一次约几百字节 PUT |
 | 13 | Backfill | 启用时把所有 items + clip_blobs 推入 sync_queue | 用户期望"过去的也能同步" |
 | 14 | 拉取频率 | 30s 轮询 + app launch / wake / hotkey 唤起时 immediate pull | 没 APNS，轮询是唯一选项；30s 在能感知和省电之间 |
@@ -126,7 +132,8 @@ CREATE TABLE tombstones (
   hmac            TEXT PRIMARY KEY,         -- HMAC 后的云端文件名
   content_hash    TEXT NOT NULL,            -- 本地用，确认对应哪条
   tombstoned_at   INTEGER NOT NULL,
-  cloud_synced_at INTEGER                   -- NULL = 本地 only；NN = 已上传 tomb/<h>
+  cloud_synced_at INTEGER,                  -- NULL = 本地 only；NN = 已上传 tomb/<h>
+  cloud_etag      TEXT                      -- last seen ETag of tomb/<h>; 用于 pull 增量判定
 );
 CREATE INDEX idx_tombstones_synced ON tombstones(cloud_synced_at);
 
@@ -134,7 +141,7 @@ CREATE INDEX idx_tombstones_synced ON tombstones(cloud_synced_at);
 CREATE TABLE sync_queue (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   op          TEXT NOT NULL,                -- 'put_item'|'put_blob'|'put_tomb'
-  target_key  TEXT NOT NULL,                -- items.id / clip_blobs.id / tombstones.hmac (序列化为字符串)
+  target_key  TEXT NOT NULL,                -- 见下方 target_key 编码约定
   attempts    INTEGER NOT NULL DEFAULT 0,
   next_try_at INTEGER NOT NULL,             -- unix秒；backoff 后下次最早执行时间
   last_error  TEXT,
@@ -150,11 +157,23 @@ CREATE TABLE sync_state (
 -- 已知 keys:
 --   device_id           UUID
 --   last_pull_at        unix 秒
---   last_pull_cursor    R2 list continuation token (可空)
+--   last_pull_cursor    JSON: {"items/": "<token>"|null, "tomb/": ..., "devices/": ...}
+--                       —— 每个 prefix 一个独立 cursor；新 prefix 默认 null（从头开始）
 --   kdf_salt_b64        base64(salt) - 16 bytes
 --   kdf_iters           integer (200000)
 --   kdf_version         integer (1)
 ```
+
+**`sync_queue.target_key` 编码约定**：
+
+| op | target_key 内容 | 说明 |
+|---|---|---|
+| `put_item` | `items.id` 的十进制字符串 | pusher 取行 → seal → PUT `items/<hmac>.bin` |
+| `put_blob` | `clip_blobs.id` 的十进制字符串 | pusher 取 blob → seal → PUT `blobs/<hmac>.bin`（hmac 由 blob.sha256 派生）|
+| `put_tomb` | `tombstones.hmac` 直接（不查表）| pusher 直接 PUT `tomb/<hmac>.bin` |
+| `put_device` | `device_id` UUID 字符串 | pusher seal `DevicePayload` PUT `devices/<device_id>.bin`（首启 + 改名时） |
+
+**选择性同步取消推送的语义**（替代 §5.2 早期版本里"标记 skip"的设想）：toggle `sync_excluded = 1` 时，**直接 `DELETE FROM sync_queue WHERE op IN ('put_item','put_blob') AND target_key 对应到此 item`**。无需在 sync_queue 加 skip 列。pusher 永远只看到"该跑就跑"的行。
 
 ### 5.3 关键约定
 
@@ -199,8 +218,11 @@ on_disk       := nonce(12) || ciphertext || tag(16)
 config.json                                    # 明文，只含 KDF 参数 (没敏感信息)
 items/<hex(hmac)>.bin                          # 加密 ItemPayload
 blobs/<hex(hmac_of_blob_sha)>.bin              # 加密 BlobPayload (only for image kind, ≤2MB)
-tomb/<hex(hmac)>.bin                           # 加密 TombstonePayload (空 body 也行；带签名防伪)
+tomb/<hex(hmac)>.bin                           # 加密 TombstonePayload
+devices/<device_id>.bin                        # 加密 DevicePayload (首启 + display name 改时上传)
 ```
+
+**`cloud_etag` 来源**：S3 PUT 响应的 `ETag` header（R2 实现：MD5-style hex string，带双引号的版本去引号即用）。`backend.put` 返回这个字符串；`SyncEngine` 把它写入 `items.cloud_etag` / `tombstones.cloud_etag`。pull 阶段 `backend.list` 返回的每个 object 也带 `etag` 字段，与本地存的对比即可判断是否 changed。
 
 **ItemPayload (encrypted JSON)**:
 ```json
@@ -225,6 +247,13 @@ tomb/<hex(hmac)>.bin                           # 加密 TombstonePayload (空 bo
 ```json
 { "v": 1, "content_hash": "<hex>", "tombstoned_at": 1735689600, "device_id": "<UUID>" }
 ```
+
+**DevicePayload (encrypted JSON)** — 用于 §8.1 "已知设备" UI 汇总：
+```json
+{ "v": 1, "device_id": "<UUID>", "display_name": "Mac-Mini-7",
+  "model": "Mac15,12", "first_seen_at": 1735689600, "last_seen_at": 1735776000 }
+```
+设备首启 + 用户改 display name + 每次 app 启动（更新 last_seen_at）时 PUT。CloudSyncView 的 "已知设备" 列表 = 把 `devices/` 全部 GET + 解密 + 按 last_seen_at DESC 排序。
 
 `config.json` 不加密（无敏感数据），但 PUT 时附 metadata `x-amz-meta-version` 防 backend 误读：
 
@@ -287,41 +316,47 @@ pushTask 循环 (Task in actor):
 
 ### 7.3 拉取（云→本地）
 
+**触发**：30s 定时器；app launch；NSWorkspace.didWake；hotkey 唤起 panel。后三种触发会被 **rate-limited**：同 prefix 在 5s 内的多次唤起合并为一次 pull（避免 panel 反复弹出导致 burst）。
+
+**没有独立 cloud_index 表**：每个 object 类型已有"本地映像 + cloud_etag" 的列：
+- `items/<h>` ↔ `items.content_hash` 行的 `cloud_etag`
+- `tomb/<h>` ↔ `tombstones.hmac` 行的 `cloud_etag`
+- `devices/<id>` ↔ in-memory cache（不持久化，每次启动重 GET）
+
 ```
-触发: 30s 定时器；app launch；NSWorkspace.didWake；hotkey 唤起 panel
-  ↓
-pullTask:
-  cursor = sync_state.last_pull_cursor
-  for prefix in ["items/", "tomb/"]:
+触发后 pullTask:
+  cursors = JSON.parse(sync_state.last_pull_cursor) ?? {}
+  for prefix in ["tomb/", "items/", "devices/"]:    # tomb 先于 items 防复活
+    cursor = cursors[prefix]
     while True:
       page = await backend.list(prefix, after: cursor)
       for object in page.objects:
-        local = cloud_index.lookup(key=object.key)   // ETag 缓存
-        if local?.etag == object.etag: continue       // 已知，跳过
+        local_etag = lookupLocalEtag(prefix, object.key)
+        if local_etag == object.etag: continue           # 已知不变
         sealed = await backend.get(object.key)
         plain  = cryptoBox.open(sealed)
-        if prefix == "items/":
-          payload = decode(plain)
-          // 防复活：如果 tombstones 已有这个 hmac 且 tombstoned_at >= payload.created_at, 跳过
-          handleItemPayload(payload, etag: object.etag)
-        else:  // tomb/
-          payload = decode(plain)
-          handleTombstone(payload, etag: object.etag)
+        switch prefix:
+          case "items/":   handleItemPayload(decode(plain), etag: object.etag)
+          case "tomb/":    handleTombstone(decode(plain), etag: object.etag)
+          case "devices/": cacheDevice(decode(plain))
       if !page.hasMore: break
       cursor = page.nextCursor
-  store sync_state.last_pull_at = now, last_pull_cursor = cursor
+    cursors[prefix] = cursor
+  sync_state.last_pull_at = now
+  sync_state.last_pull_cursor = JSON.stringify(cursors)
 ```
 
-`handleItemPayload`：
-- 看 `tombstones` 表，hmac 命中且 tomb 时间 >= payload.created_at → skip
-- 看本地 `items` 表，content_hash 命中：
-  - 是本机刚 PUT 上去再 GET 回来 → 更新 cloud_etag 即可
-  - 是其他设备的：拿 LWW（更新 pinned / device_id 等可变字段）
-- 不命中 → INSERT；如果是 image 且 `blob_hmac` 在 payload 里，**不**立刻拉 blobs/，只插一行 blob ref 占位，bytes 留 NULL；用户点开预览时按需 lazy fetch
+`handleItemPayload(payload, etag)`：
+- 查 `tombstones` 表，hmac 命中且 `tombstoned_at >= payload.created_at` → **skip**（等号情况：tomb wins，与 §10.3 一致；保护"删后又出现陈旧复活"场景）
+- 查本地 `items` 表 by `content_hash`：
+  - 命中：UPDATE 可变字段 `pinned`, `device_id`, `cloud_etag = etag`（payload 内的 created_at 不动；本机 created_at 是本地真值）
+  - 未命中：INSERT，cloud_etag = etag。image kind 时 `clip_blobs` 插占位行（bytes NULL，blob_hmac/byte_size 来自 payload），thumbnail 落 ThumbnailCache
+- 解密失败：log warning + 跳过；不删本地
 
-`handleTombstone`：
-- INSERT into tombstones（如果不存在）
-- DELETE FROM items WHERE content_hash = payload.content_hash AND created_at <= payload.tombstoned_at
+`handleTombstone(payload, etag)`：
+- UPSERT into `tombstones` (hmac, content_hash, tombstoned_at, cloud_etag = etag, cloud_synced_at = now)
+- `DELETE FROM items WHERE content_hash = payload.content_hash AND created_at <= payload.tombstoned_at`（== 时也删；tomb wins）
+- `DELETE FROM clip_blobs WHERE id NOT IN (SELECT blob_id FROM items WHERE blob_id IS NOT NULL)` 的常规清理在 prune 路径里走，不在这里同步做
 
 ### 7.4 Lazy blob fetch（图片按需下载）
 
@@ -343,9 +378,11 @@ UI 在 lazy fetch 期间显示 spinner（PreviewWindow）或灰显 + tooltip（p
 
 ### 7.5 选择性同步
 
-UI 在 panel 行有快捷键 `⌘N` toggle "不上云"：
-- 已 synced 的项 → INSERT tombstone + enqueue tomb push + UPDATE items SET sync_excluded = 1
-- 未 synced 的项 → 仅 UPDATE sync_excluded = 1（push 队列里若已经在排队，标记 skip）
+UI 在 panel 行有快捷键 `⌘N` toggle "不上云"（确认 ⌘N 在现有 panel 键映射中未被占用：现有 ⌘P/⌘D/⌘F/⌘1-9/⌘,/Esc/⌘B/⌘E 都不冲突）：
+- 已 synced 的项 → INSERT tombstone + enqueue tomb push + UPDATE items SET sync_excluded = 1 + **DELETE FROM sync_queue WHERE op IN ('put_item','put_blob') AND target_key 对应到本 item**
+- 未 synced 的项 → UPDATE sync_excluded = 1 + DELETE 相同 sync_queue 行（无 tomb 必要，反正未上传过）
+
+再次 `⌘N` 取消排除：UPDATE sync_excluded = 0 + 重新 enqueue put_item（如果 cloud_synced_at 仍然 NULL）。已上传过的 tomb 不会自动收回——重新出现的 hash 走正常 INSERT，云端会有一份新的 items/<h>，但旧 tomb 文件还在直到 lifecycle 清理。这是已知行为，不在 v3 自动 GC tomb。
 
 Panel 行尾若 `sync_excluded = 1` 显示 🚫；否则若 `cloud_synced_at IS NULL AND sync queue has it` 显示 ⏳；否则若 `cloud_synced_at NOT NULL` 显示 ☁️；否则不显示。
 
@@ -374,10 +411,13 @@ UI 显示 "Backfill: M / N" 进度条，由 sync_queue 长度差驱动。
 [ ] 启用云同步                          (开关；off 时下面灰显)
 
 R2 endpoint:    https://<account>.r2.cloudflarestorage.com
-Bucket name:    clip-sync
+                  (验证：必须 https://; host 须以 .r2.cloudflarestorage.com 结尾或为
+                   用户自定义 endpoint; account ID 32 hex chars)
+Bucket name:    clip-sync           (验证：DNS-safe，3-63 chars，[a-z0-9-])
 Access Key ID:  <…>                    (focus 时显示完整，blur 时遮蔽)
 Secret:         ●●●●●●●●               (写入触发；存 Keychain，读不出)
-                [测试连接]
+                [测试连接]              (动作：HEAD config.json 期望 200 或 404；
+                                        其它 HTTP 状态展示 `测试失败: <code> <body截断>`)
 
 同步密码:        ●●●●●●●●●●●●          (≥12 chars)
                 [设置 / 修改]
@@ -406,8 +446,9 @@ Secret:         ●●●●●●●●               (写入触发；存 Keych
 |---|---|
 | ☁️ | 已同步到云 |
 | ⏳ | 队列里等待推送 |
-| 🚫 | 用户标记不同步 |
-| ⚠️ | 推送失败 attempts>3 |
+| 🚫 | 用户标记不同步（sync_excluded=1） |
+| 📤 | 跳过（> 2MB image 等技术原因，不是用户意志） |
+| ⚠️ | 推送失败 attempts > 3 |
 | (无) | 本地 only / 未启用同步 |
 
 ### 8.3 快捷键
@@ -432,7 +473,7 @@ Secret:         ●●●●●●●●               (写入触发；存 Keych
 | 维度 | 预算 |
 |---|---|
 | 推送 idle CPU | < 0.05%（队列空时 sleep） |
-| 拉取 idle CPU | < 0.1%（30s tick + 增量 list） |
+| 拉取 idle CPU | < 0.1%（30s tick + 增量 list；wake/hotkey 触发的 immediate pull 走 5s 合并 token bucket，长期均摊不超过 ~6 pulls/min） |
 | 推送一条 text item | < 200ms 总（encrypt 1ms + put 50-150ms） |
 | 推送一条 2MB image | < 1.5s 总（encrypt 30ms + put ~1s） |
 | 拉取一条 text item | < 150ms（list 摊销 + get + decrypt + insert） |
@@ -460,7 +501,7 @@ R2 一次 PUT/GET 假定 50-200ms（中国大陆 → APAC 区）。
 | 场景 | 处理 |
 |---|---|
 | 解密失败 | `CryptoBox.Error.decryptionFailed`；UI 提示"密码错或对象损坏"；**不删本地** |
-| 用户改密码 | 当前实现：阻塞 + 重传所有对象（v3.1 优化为后台增量）；UI 显示进度 |
+| 用户改密码 | v3 实现：阻塞式重传所有对象。流程：① 用旧密码派生 old_master 解密；② 用新密码 + 旧 salt 派生 new_master；③ 把新 master 写入 Keychain 的**新** service identifier（`com.zyw.clip.cloud-master-v2-<ts>`）；④ 串行下载所有 items/blobs/tomb 对象 → 用 old key 解 → 用 new key 重新 seal → PUT 覆盖；⑤ 全部成功后从 Keychain **删除** old service identifier，更新 sync_state.kdf_version；任何中途失败 → 保留两个 master key，可手动重启继续 |
 | 密码丢失 | 不可恢复。引导用户用 "清空云端 + 重设" 流程；本地数据无损 |
 | 密码不够强（< 12 字符） | 输入框拒绝 |
 
@@ -469,16 +510,17 @@ R2 一次 PUT/GET 假定 50-200ms（中国大陆 → APAC 区）。
 | 场景 | 处理 |
 |---|---|
 | 同条目两台同时 PUT | 同 hmac 文件名，S3 LWW；payload 无 mutable 区别（content immutable）→ 无影响 |
-| pin 状态两台冲突 | LWW by R2 LastModified；用户感知到的是"最近一台 pin/unpin 的状态" |
-| tombstone vs 新 item 同 hash | tombstone 时间 vs item.created_at；tomb 较新 → 视为已删，丢弃新 item；item 较新 → 删 tombstone + INSERT（用户在 tomb 后又复制了相同内容） |
-| 设备时钟漂移 | created_at 用本地时钟；接受 ±60s 漂移；不做 NTP 校正 |
+| pin 状态两台冲突 | LWW by **R2 LastModified**（list 返回的 server-side mtime），不是 payload 内字段；用户感知到的是"最近一台 pin/unpin 的状态" |
+| tombstone vs 新 item 同 hash | 比较 `tombstones.tombstoned_at` 和 `payload.created_at`：**tomb 时间 ≥ item 时间 → tomb wins**（视为已删，丢弃新 item）；item 时间 > tomb 时间 → item wins（DELETE FROM tombstones + INSERT 该 item，对应"用户在 tomb 后又复制了相同内容"） |
+| 设备时钟漂移 | created_at 用本地时钟；接受 ±60s 漂移；不做 NTP 校正。漂移 > 60s 的极端情况：可能导致 LWW 判错（例如 device A 时钟超前 5 分钟，A 发的 tomb 会战胜 B 5 分钟内才发的同 hash item）；这是已知限制，依赖系统层 NTP；UI 不弹窗 |
 | Migration 失败 | 沿用现有：弹窗 "备份并重置 / 退出"，绝不静默丢数据 |
+| Migration v3 内 backfill INSERT 爆量 | 不在 migrator block 里 backfill；migrator 只 ALTER + CREATE。backfill 是**启用同步动作**的一部分（不是迁移的一部分），写在 SyncEngine.enableSync() 里，独立事务，失败不影响 schema |
 
 ### 10.4 大对象 / 配额
 
 | 场景 | 处理 |
 |---|---|
-| 单 image > 2MB | 跳过 push；本地存；item.sync_excluded 不设（本地选择性是用户意志，大小是技术限制）；行尾显示 📤 跳过云 |
+| 单 image > 2MB | A 端：检查 byte_size > 2MB → 不入 sync_queue（既不 put_item 也不 put_blob）→ 行尾显示 📤；item 在云上完全不存在，因此 B 端**永远看不到这条**（无对象可 list / get）。这是设计取舍：避免大图同步；用户感知到"大图只在本地"。`sync_excluded` 不设（区分用户意志 vs 技术限制） |
 | R2 配额超 | put 失败；状态显示"配额超限"；用户处理（升级 plan / 删旧条目） |
 
 ### 10.5 启动 / 多实例

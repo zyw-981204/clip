@@ -1,70 +1,82 @@
-# Clip Cloud Sync (v3) Implementation Plan
+# Clip Cloud Sync (v3) Implementation Plan — v2 architecture (D1 + R2)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add E2E-encrypted Cloudflare-R2-backed clipboard history sync across 2-3 Macs, behind a pluggable `CloudSyncBackend` protocol, with selective per-item exclude, lazy image fetch, full backfill, and migration v3 schema additions.
+**Goal:** Add E2E-encrypted cross-Mac clipboard history sync. Cloud uses **Cloudflare D1 + R2**: D1 stores per-row encrypted metadata (text content, mime, pin, etc. inside one ChaChaPoly sealed BLOB column) plus plaintext index columns (id, hmac, kind, blob_key, created_at, updated_at, deleted); R2 stores image blobs only as content-addressed encrypted objects.
 
-**Scope note (post-review):** see "Out of Scope" section at the end of this doc — UX polish and observability features explicitly deferred to v3.x; this plan ships the load-bearing architecture (crypto + backend + engine + bootstrap + lazy fetch + Preferences enable form + ⌘N exclude).
+**Architecture (paragraph form):** All sync code lives under `Sources/Clip/Sync/` (pure Foundation + CryptoKit, no AppKit) so a future `ClipKit` extraction for an iOS client is mechanical. The cloud side has two separate protocols — `CloudSyncDataSource` (D1 SQL via REST) and `CloudSyncBlobStore` (R2 PUT/GET via S3v4). Pull is a single SQL query each tick: `SELECT * FROM clips WHERE updated_at > ?ts OR (updated_at = ?ts AND id > ?id) ORDER BY updated_at, id LIMIT 100` — composite cursor (updated_at, id) prevents same-second misses (spec §7.3 "fix A"). Push is per-row UPSERT with cloud_id reuse via hmac lookup that includes `deleted=1` rows (spec §6.3 "fix B"), so re-toggling "do not sync" doesn't create cloud duplicates. Encryption is `ChaChaPoly` with a `PBKDF2-HMAC-SHA256` (200k rounds) derived master key, HKDF-split into separate `kEncrypt` and `kName` subkeys; master key in macOS Keychain (`kSecAttrSynchronizable=false`). Schema bootstrap is fully idempotent (`CREATE TABLE IF NOT EXISTS` + `INSERT OR IGNORE` for config rows including `schema_version='3'`; spec §7.1 "fix C"). `SyncEngine.start` reads `schema_version` and refuses to run if remote > local with a clear UI prompt (spec §10.3 "fix E"). Half-completed pushes (R2 PUT succeeds, D1 UPSERT fails) leave a transient orphan blob accepted as known cruft (spec §10.4 "fix D"); retry covers all cases via idempotent same-hmac PUT.
 
-**Architecture:** All sync code lives under `Sources/Clip/Sync/` (pure Foundation + CryptoKit, no AppKit) so a future `ClipKit` extraction for an iOS client is mechanical. R2 is reached via hand-rolled S3 Signature V4 over `URLSession` — no third-party S3 SDK. Encryption is `ChaChaPoly` with a `PBKDF2-HMAC-SHA256` (200k rounds) derived master key, HKDF-split into separate `kEncrypt` and `kName` subkeys; the master key lives in macOS Keychain (`kSecAttrSynchronizable=false`). Cloud objects are content-addressed via `HMAC(content_hash, kName)` so the same item across devices yields the same filename and dedups for free. `SyncEngine` is a Swift `actor` with two background `Task` loops (push drainer + 30s pull tick) plus signaling on app wake / hotkey trigger.
-
-**Tech Stack:** Swift 6.0 / macOS 13+ / SwiftPM single executable. `CryptoKit` (ChaChaPoly, HMAC, HKDF), `CommonCrypto` (PBKDF2 only), `Network.framework` (NWPathMonitor), `GRDB` (existing). New tests live under `Tests/ClipTests/Sync/` inside the existing test target. R2 integration tests live under `Tests/ClipTests/R2Integration/` and self-skip when `R2_ACCESS_KEY_ID` env is unset (CI doesn't have it; local sources `~/.wrangler/clip.env`).
+**Tech Stack:** Swift 6.0 / macOS 13+ / SwiftPM single executable. `CryptoKit` (ChaChaPoly, HMAC, HKDF), `CommonCrypto` (PBKDF2 only), `Network.framework` (NWPathMonitor), `GRDB` (existing). New tests live under `Tests/ClipTests/Sync/` inside the existing test target. R2+D1 integration tests live under `Tests/ClipTests/CloudIntegration/` and self-skip when `CLOUDFLARE_API_TOKEN` env is unset.
 
 **Files created (new) — quick map:**
 
 ```
 Sources/Clip/Sync/
-├── KeyDerivation.swift       — PBKDF2 wrapper (CommonCrypto)
-├── CryptoBox.swift           — ChaChaPoly seal/open + HMAC namer
-├── KeychainStore.swift       — read/write versioned master_key entry
-├── SyncTypes.swift           — CloudObjectMeta, ListPage, DeviceID, SyncOp
-├── SyncSchema.swift          — ItemPayload / TombstonePayload / DevicePayload Codable
-├── CloudSyncBackend.swift    — protocol
-├── LocalDirBackend.swift     — Backend implementation writing to a local dir (tests)
-├── S3SignerV4.swift          — Sig v4 canonical request + signing key derivation
-├── R2Backend.swift           — Backend implementation: URLSession + S3SignerV4
-├── SyncQueue.swift           — DB-backed retry queue (CRUD on sync_queue table)
-├── SyncEngine.swift          — actor; push loop + pull loop + tombstone + backfill
-├── SyncSettings.swift        — UserDefaults wrapper for endpoint/bucket/access_key_id
-└── SyncStateStore.swift      — DB-backed sync_state table CRUD (device_id, cursors, KDF params)
+├── KeyDerivation.swift           — PBKDF2 wrapper (CommonCrypto)
+├── CryptoBox.swift               — ChaChaPoly seal/open + HMAC namer
+├── KeychainStore.swift           — read/write versioned master_key
+├── SyncTypes.swift               — CloudRow, DeviceRow, ListPage,
+│                                    SyncOp, CloudKey, CloudCursor
+├── SyncSchema.swift              — RowPayload / DevicePayload Codable
+├── CloudSyncDataSource.swift     — protocol (D1 abstraction)
+├── CloudSyncBlobStore.swift      — protocol (R2 blob abstraction)
+├── LocalSqliteDataSource.swift   — in-memory SQLite impl for tests
+├── LocalDirBlobStore.swift       — filesystem impl for tests
+├── S3SignerV4.swift              — AWS Sig V4 (used by R2BlobBackend)
+├── R2BlobBackend.swift           — URLSession + Sig V4 (PUT/GET/DELETE only)
+├── D1Backend.swift               — Cloudflare REST API client (ensureSchema,
+│                                    upsert with hmac dedup, queryChangesSince
+│                                    with composite cursor, schema-version check)
+├── SyncQueue.swift               — DB-backed retry queue
+├── SyncStateStore.swift          — KV wrapper over local sync_state table
+├── SyncEngine.swift              — actor; push + pull + enable + fetchBlob +
+│                                    backfill + excludeItem
+└── SyncSettings.swift            — UserDefaults wrapper for R2/D1 config
 
 Sources/Clip/Preferences/
-└── CloudSyncView.swift       — Preferences "云同步" tab
+└── CloudSyncView.swift           — "云同步" preferences tab
+                                    (parallel test-connection — fix F)
 
-Tests/ClipTests/Sync/         — unit + LocalDirBackend integration tests
-Tests/ClipTests/R2Integration/ — opt-in real-R2 round-trip
+Tests/ClipTests/Sync/             — unit + LocalSqlite/LocalDir integration
+Tests/ClipTests/CloudIntegration/ — opt-in real-D1+R2 round-trip
 ```
 
 **Files modified:**
 - `Sources/Clip/Storage/Migrations.swift` — add v3 migration
-- `Sources/Clip/Storage/HistoryStore.swift` — add `markSynced`, `markBlobSynced`, `setExclusion`, `forSyncBackfill` queries; add `onChange` callback hook
-- `Sources/Clip/Storage/ClipItem.swift` — add `syncExcluded`, `cloudSyncedAt`, `cloudEtag`, `cloudLastModified`, `deviceID` properties
+- `Sources/Clip/Storage/HistoryStore.swift` — sync columns + hooks + new helpers
+- `Sources/Clip/Storage/ClipItem.swift` — 6 new properties
 - `Sources/Clip/Preferences/PreferencesWindow.swift` — add "云同步" tab
-- `Sources/Clip/Panel/PanelView.swift` — add ⌘N exclude toggle + sync status icon
+- `Sources/Clip/Panel/PanelView.swift` — sync status icon
 - `Sources/Clip/Panel/PanelModel.swift` — `toggleExcludeSelected()` action
-- `Sources/Clip/Panel/PanelWindow.swift` — wire ⌘N key to model
-- `Sources/Clip/ClipApp.swift` — wire `SyncEngine` into `AppDelegate.applicationDidFinishLaunching`
+- `Sources/Clip/Panel/PanelWindow.swift` — wire ⌘N
+- `Sources/Clip/ClipApp.swift` — wire `SyncEngine` into `AppDelegate`
 
-**TDD discipline:** every task starts with a failing test, then minimal impl, then verify pass, then commit. Don't batch multiple features into one commit.
+**TDD discipline:** every task starts with a failing test, then minimal impl, then verify pass, then commit. Don't batch features.
 
-**Commit message convention:** `sync: <component> — <one-line summary>` (e.g. `sync: KeyDerivation — PBKDF2-SHA256 wrapper`).
+**Commit convention:** `sync: <component> — <one-line summary>`.
 
-**Build / test commands** (use these exact forms; AGENTS.md explains why CLT toolchain is wrong):
+**Build / test commands:**
 
 ```bash
-swift test                                       # full suite
-swift test --filter ClipTests.<TestClass>        # single file
-swift test --filter ClipTests.R2Integration      # opt-in R2 round-trip (needs env)
-swift build -c release --product Clip            # release sanity (CI runs this too)
+swift test                                          # full suite
+swift test --filter ClipTests.<TestClass>           # single file
+swift test --filter ClipTests.CloudIntegration      # opt-in real cloud (needs env)
+swift build -c release --product Clip               # release sanity (CI)
 ```
+
+**Self-review fixes baked in (referenced by ID throughout):**
+- **fix A** — composite (updated_at, id) cursor (T13 + T17)
+- **fix B** — hmac dedup includes `deleted=1` rows (T13 + T16)
+- **fix C** — `INSERT OR IGNORE` config bootstrap (T13 + T18)
+- **fix D** — orphan-blob acceptance (T16 — documented; no code work)
+- **fix E** — `schema_version` gatekeeping (T13 + T18)
+- **fix F** — parallel "test connection" with three-checkmark UI (T24)
 
 ---
 
 ## Phase P1 — Foundations (storage + crypto)
 
-These are pure-Swift, no network. Ship them all before touching backend code.
-
-### Task 1: Migration v3 — schema additions
+### Task 1: Migration v3 — local schema additions
 
 **Files:**
 - Modify: `Sources/Clip/Storage/Migrations.swift`
@@ -79,31 +91,36 @@ import GRDB
 @testable import Clip
 
 final class MigrationV3Tests: XCTestCase {
-    func testV3AddsExpectedColumns() throws {
+    func testV3AddsExpectedColumnsToItems() throws {
         let s = try HistoryStore.inMemory()
         try s.pool.read { db in
             let cols = try Row.fetchAll(db, sql: "PRAGMA table_info(items)").map { $0["name"] as String }
-            XCTAssertTrue(cols.contains("sync_excluded"))
+            XCTAssertTrue(cols.contains("cloud_id"))
+            XCTAssertTrue(cols.contains("cloud_updated_at"))
             XCTAssertTrue(cols.contains("cloud_synced_at"))
-            XCTAssertTrue(cols.contains("cloud_etag"))
-            XCTAssertTrue(cols.contains("cloud_lastmodified"))
-            XCTAssertTrue(cols.contains("cloud_name"))
+            XCTAssertTrue(cols.contains("cloud_blob_key"))
+            XCTAssertTrue(cols.contains("sync_excluded"))
             XCTAssertTrue(cols.contains("device_id"))
-
-            let blobCols = try Row.fetchAll(db, sql: "PRAGMA table_info(clip_blobs)").map { $0["name"] as String }
-            XCTAssertTrue(blobCols.contains("cloud_synced_at"))
-            XCTAssertTrue(blobCols.contains("cloud_etag"))
         }
     }
 
-    func testV3CreatesNewTables() throws {
+    func testV3CreatesSyncTables() throws {
         let s = try HistoryStore.inMemory()
         try s.pool.read { db in
-            let names = try String.fetchAll(db, sql:
-                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            let names = try String.fetchAll(db,
+                sql: "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
             XCTAssertTrue(names.contains("tombstones"))
             XCTAssertTrue(names.contains("sync_queue"))
             XCTAssertTrue(names.contains("sync_state"))
+        }
+    }
+
+    func testV3UniqueCloudIdIndex() throws {
+        let s = try HistoryStore.inMemory()
+        try s.pool.read { db in
+            let idx = try String.fetchAll(db,
+                sql: "SELECT name FROM sqlite_master WHERE type='index'")
+            XCTAssertTrue(idx.contains("idx_items_cloud_id"))
         }
     }
 
@@ -114,8 +131,7 @@ final class MigrationV3Tests: XCTestCase {
             sourceBundleID: nil, sourceAppName: nil, createdAt: 1,
             pinned: false, byteSize: 1, truncated: false))
         try s.pool.read { db in
-            let v = try Int.fetchOne(db, sql: "SELECT sync_excluded FROM items LIMIT 1")
-            XCTAssertEqual(v, 0)
+            XCTAssertEqual(try Int.fetchOne(db, sql: "SELECT sync_excluded FROM items LIMIT 1"), 0)
         }
     }
 }
@@ -127,41 +143,38 @@ final class MigrationV3Tests: XCTestCase {
 swift test --filter ClipTests.MigrationV3Tests
 ```
 
-Expected: compile error (migration v3 not registered) or test failure ("no column sync_excluded").
+Expected: compile error (no migration v3) or test failure.
 
-- [ ] **Step 3: Implement v3 migration**
+- [ ] **Step 3: Append v3 migration block**
 
-Append to `Sources/Clip/Storage/Migrations.swift` after the v2 migration block:
+In `Sources/Clip/Storage/Migrations.swift`, after the v2 block:
 
 ```swift
         // v3: cloud sync columns + tables.
-        // Spec: docs/superpowers/specs/2026-05-02-clip-cloud-sync.md §5
+        // Spec: docs/superpowers/specs/2026-05-02-clip-cloud-sync.md §5.1
         migrator.registerMigration("v3") { db in
             // items: 6 new columns
-            try db.execute(sql: "ALTER TABLE items ADD COLUMN sync_excluded INTEGER NOT NULL DEFAULT 0;")
+            try db.execute(sql: "ALTER TABLE items ADD COLUMN cloud_id TEXT;")
+            try db.execute(sql: "ALTER TABLE items ADD COLUMN cloud_updated_at INTEGER;")
             try db.execute(sql: "ALTER TABLE items ADD COLUMN cloud_synced_at INTEGER;")
-            try db.execute(sql: "ALTER TABLE items ADD COLUMN cloud_etag TEXT;")
-            try db.execute(sql: "ALTER TABLE items ADD COLUMN cloud_lastmodified INTEGER;")
-            try db.execute(sql: "ALTER TABLE items ADD COLUMN cloud_name TEXT;")    // hex(hmac), enables ETag tracking
+            try db.execute(sql: "ALTER TABLE items ADD COLUMN cloud_blob_key TEXT;")
+            try db.execute(sql: "ALTER TABLE items ADD COLUMN sync_excluded INTEGER NOT NULL DEFAULT 0;")
             try db.execute(sql: "ALTER TABLE items ADD COLUMN device_id TEXT;")
-            try db.execute(sql: "CREATE INDEX idx_items_cloud_name ON items(cloud_name);")
 
-            // clip_blobs: 2 new columns
-            try db.execute(sql: "ALTER TABLE clip_blobs ADD COLUMN cloud_synced_at INTEGER;")
-            try db.execute(sql: "ALTER TABLE clip_blobs ADD COLUMN cloud_etag TEXT;")
+            // Partial unique index: enforce 1 cloud_id per row, but allow many NULL
+            try db.execute(sql: """
+                CREATE UNIQUE INDEX idx_items_cloud_id ON items(cloud_id) WHERE cloud_id IS NOT NULL;
+            """)
 
-            // tombstones
+            // tombstones (local-side; prevents capture-side resurrection)
             try db.execute(sql: """
                 CREATE TABLE tombstones (
-                    hmac               TEXT PRIMARY KEY,
-                    content_hash       TEXT NOT NULL,
-                    tombstoned_at      INTEGER NOT NULL,
-                    cloud_synced_at    INTEGER,
-                    cloud_etag         TEXT,
-                    cloud_lastmodified INTEGER
+                    content_hash      TEXT PRIMARY KEY,
+                    cloud_id          TEXT NOT NULL,
+                    tombstoned_at     INTEGER NOT NULL,
+                    cloud_updated_at  INTEGER NOT NULL
                 );
             """)
-            try db.execute(sql: "CREATE INDEX idx_tombstones_synced ON tombstones(cloud_synced_at);")
 
             // sync_queue
             try db.execute(sql: """
@@ -177,7 +190,7 @@ Append to `Sources/Clip/Storage/Migrations.swift` after the v2 migration block:
             """)
             try db.execute(sql: "CREATE INDEX idx_sync_queue_next ON sync_queue(next_try_at);")
 
-            // sync_state — generic kv
+            // sync_state — generic kv (device_id, cloud_pull_cursor, kdf_*, etc.)
             try db.execute(sql: """
                 CREATE TABLE sync_state (
                     key   TEXT PRIMARY KEY,
@@ -193,18 +206,18 @@ Append to `Sources/Clip/Storage/Migrations.swift` after the v2 migration block:
 swift test --filter ClipTests.MigrationV3Tests
 ```
 
-Expected: 3 tests pass.
+Expected: 4 tests pass.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add Sources/Clip/Storage/Migrations.swift Tests/ClipTests/Sync/MigrationV3Tests.swift
-git commit -m "sync: Migration v3 — schema additions for cloud sync"
+git commit -m "sync: Migration v3 — local schema for D1+R2 cloud sync"
 ```
 
 ---
 
-### Task 2: KeyDerivation — PBKDF2-SHA256 wrapper
+### Task 2: KeyDerivation — PBKDF2-HMAC-SHA256 wrapper
 
 **Files:**
 - Create: `Sources/Clip/Sync/KeyDerivation.swift`
@@ -219,14 +232,11 @@ import XCTest
 
 final class KeyDerivationTests: XCTestCase {
     func testKnownVector() {
-        // RFC 7914 SCRYPT test vectors aren't applicable; use our own deterministic
-        // expectation. PBKDF2-HMAC-SHA256(password="password", salt="salt",
-        // iters=1, dkLen=32). Computed once with Python hashlib and pinned here.
+        // PBKDF2-HMAC-SHA256(password="password", salt="salt", iters=1, dkLen=32).
+        // Pinned via Python hashlib.
         let key = KeyDerivation.pbkdf2_sha256(
-            password: "password",
-            salt: Data("salt".utf8),
-            iterations: 1,
-            keyLength: 32)
+            password: "password", salt: Data("salt".utf8),
+            iterations: 1, keyLength: 32)
         XCTAssertEqual(key.count, 32)
         XCTAssertEqual(key.map { String(format: "%02x", $0) }.joined(),
                        "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b")
@@ -258,7 +268,7 @@ final class KeyDerivationTests: XCTestCase {
 swift test --filter ClipTests.KeyDerivationTests
 ```
 
-Expected: compile error ("no type KeyDerivation").
+Expected: compile error.
 
 - [ ] **Step 3: Implement KeyDerivation**
 
@@ -267,11 +277,9 @@ Expected: compile error ("no type KeyDerivation").
 import Foundation
 import CommonCrypto
 
-/// PBKDF2-HMAC-SHA256 wrapper.
-///
-/// CryptoKit does not expose PBKDF2; CommonCrypto's CCKeyDerivationPBKDF is the
-/// canonical Apple-platform implementation. Spec §6.1 pins iters=200_000,
-/// dkLen=32 for cloud master-key derivation.
+/// PBKDF2-HMAC-SHA256 wrapper. Spec §6.1 pins iters=200_000, dkLen=32 for
+/// cloud master-key derivation. CryptoKit doesn't expose PBKDF2; CommonCrypto's
+/// CCKeyDerivationPBKDF is the canonical Apple-platform implementation.
 enum KeyDerivation {
     static func pbkdf2_sha256(
         password: String,
@@ -331,17 +339,15 @@ import CryptoKit
 
 final class CryptoBoxTests: XCTestCase {
     func makeBox() -> CryptoBox {
-        let master = Data(repeating: 0xAB, count: 32)
-        return CryptoBox(masterKey: master)
+        CryptoBox(masterKey: Data(repeating: 0xAB, count: 32))
     }
 
     func testSealOpenRoundTrip() throws {
         let box = makeBox()
         let plain = Data("hello, world".utf8)
         let sealed = try box.seal(plain)
-        let opened = try box.open(sealed)
-        XCTAssertEqual(opened, plain)
-        XCTAssertGreaterThan(sealed.count, plain.count, "sealed has nonce + tag overhead")
+        XCTAssertEqual(try box.open(sealed), plain)
+        XCTAssertGreaterThan(sealed.count, plain.count)
     }
 
     func testOpenWrongKeyFails() throws {
@@ -354,29 +360,25 @@ final class CryptoBoxTests: XCTestCase {
     func testOpenTamperedFails() throws {
         let box = makeBox()
         var sealed = try box.seal(Data("hello".utf8))
-        sealed[sealed.count - 1] ^= 0x01      // flip last byte of tag
+        sealed[sealed.count - 1] ^= 0x01
         XCTAssertThrowsError(try box.open(sealed))
     }
 
     func testNonceUniqueness() throws {
         let box = makeBox()
-        let plain = Data("same input".utf8)
         var nonces = Set<Data>()
         for _ in 0..<5000 {
-            let sealed = try box.seal(plain)
-            nonces.insert(sealed.prefix(12))   // first 12B = nonce
+            let sealed = try box.seal(Data("same".utf8))
+            nonces.insert(sealed.prefix(12))
         }
-        XCTAssertEqual(nonces.count, 5000, "all nonces must be unique")
+        XCTAssertEqual(nonces.count, 5000)
     }
 
-    func testNameIsDeterministic() {
+    func testNameDeterministic() {
         let box = makeBox()
-        let h = "abc123"
-        XCTAssertEqual(box.name(forContentHash: h), box.name(forContentHash: h))
-        XCTAssertNotEqual(box.name(forContentHash: "abc"),
-                          box.name(forContentHash: "def"))
-        XCTAssertEqual(box.name(forContentHash: h).count, 64,
-                       "HMAC-SHA256 hex = 64 chars")
+        XCTAssertEqual(box.name(forContentHash: "abc"), box.name(forContentHash: "abc"))
+        XCTAssertNotEqual(box.name(forContentHash: "abc"), box.name(forContentHash: "def"))
+        XCTAssertEqual(box.name(forContentHash: "abc").count, 64)
     }
 
     func testDifferentMasterKeysProduceDifferentNames() {
@@ -393,8 +395,6 @@ final class CryptoBoxTests: XCTestCase {
 swift test --filter ClipTests.CryptoBoxTests
 ```
 
-Expected: compile error ("no type CryptoBox").
-
 - [ ] **Step 3: Implement CryptoBox**
 
 ```swift
@@ -403,17 +403,11 @@ import Foundation
 import CryptoKit
 
 /// AEAD seal/open + content-hash → cloud filename mapping.
-///
-/// Master key is HKDF-split into two subkeys (spec §6.1):
-///   k_encrypt — ChaChaPoly seal/open
-///   k_name    — HMAC-SHA256(content_hash) → cloud filename
-///
-/// Sealed format: nonce(12B) || ciphertext || tag(16B) — exactly what
-/// `ChaChaPoly.SealedBox.combined` produces. Opening reverses.
+/// Spec §6.1: master_key HKDF-split into:
+///   k_encrypt — ChaChaPoly seal/open of row payloads + blob bytes
+///   k_name    — HMAC-SHA256(content_hash) → blob filename + cross-device dedup hmac
 struct CryptoBox: Sendable {
-    enum Error: Swift.Error, Equatable {
-        case decryptionFailed
-    }
+    enum Error: Swift.Error, Equatable { case decryptionFailed }
 
     private let kEncrypt: SymmetricKey
     private let kName: SymmetricKey
@@ -432,8 +426,7 @@ struct CryptoBox: Sendable {
     }
 
     func seal(_ plaintext: Data) throws -> Data {
-        let sealed = try ChaChaPoly.seal(plaintext, using: kEncrypt)
-        return sealed.combined
+        try ChaChaPoly.seal(plaintext, using: kEncrypt).combined
     }
 
     func open(_ sealed: Data) throws -> Data {
@@ -445,8 +438,9 @@ struct CryptoBox: Sendable {
         }
     }
 
-    /// HMAC-SHA256(kName, content_hash_utf8) → 64-char hex.
-    /// Used as the leaf of `items/<name>.bin`, `tomb/<name>.bin`, etc.
+    /// Hex-encoded HMAC-SHA256(kName, content_hash). 64 chars. Used for both:
+    ///   - the D1 `clips.hmac` indexed column (cross-device dedup)
+    ///   - the R2 blob key suffix `blobs/<hmac>.bin`
     func name(forContentHash contentHash: String) -> String {
         let mac = HMAC<SHA256>.authenticationCode(
             for: Data(contentHash.utf8), using: kName)
@@ -477,8 +471,6 @@ git commit -m "sync: CryptoBox — ChaChaPoly seal/open + HMAC content-hash nami
 **Files:**
 - Create: `Sources/Clip/Sync/KeychainStore.swift`
 - Create: `Tests/ClipTests/Sync/KeychainStoreTests.swift`
-
-Notes: each test uses a unique service identifier so tests don't collide across runs. We delete on tearDown.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -531,8 +523,6 @@ final class KeychainStoreTests: XCTestCase {
 swift test --filter ClipTests.KeychainStoreTests
 ```
 
-Expected: compile error ("no type KeychainStore").
-
 - [ ] **Step 3: Implement KeychainStore**
 
 ```swift
@@ -540,29 +530,23 @@ Expected: compile error ("no type KeychainStore").
 import Foundation
 import Security
 
-/// Thin wrapper around macOS Keychain `kSecClassGenericPassword`.
-///
-/// Each "account" within a service is one logical key. Spec §6.1 mandates
-/// `kSecAttrSynchronizable = false` — we MUST NOT sync the master key
-/// through iCloud Keychain (that would put Apple in the trust path and
-/// break the E2E promise).
+/// Wrapper around macOS Keychain `kSecClassGenericPassword`. Spec §6.1
+/// mandates `kSecAttrSynchronizable=false` — must NOT sync master key
+/// through iCloud Keychain (would put Apple in the trust path).
 struct KeychainStore: Sendable {
     let service: String
-
     init(service: String) { self.service = service }
 
-    enum Error: Swift.Error {
-        case keychain(OSStatus)
-    }
+    enum Error: Swift.Error { case keychain(OSStatus) }
 
     func read(account: String) throws -> Data? {
         let q: [String: Any] = [
-            kSecClass        as String: kSecClassGenericPassword,
-            kSecAttrService  as String: service,
-            kSecAttrAccount  as String: account,
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
             kSecAttrSynchronizable as String: false,
-            kSecReturnData   as String: true,
-            kSecMatchLimit   as String: kSecMatchLimitOne,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
         ]
         var out: AnyObject?
         let status = SecItemCopyMatching(q as CFDictionary, &out)
@@ -572,19 +556,16 @@ struct KeychainStore: Sendable {
     }
 
     func write(account: String, data: Data) throws {
-        // Try update first.
         let q: [String: Any] = [
-            kSecClass        as String: kSecClassGenericPassword,
-            kSecAttrService  as String: service,
-            kSecAttrAccount  as String: account,
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
             kSecAttrSynchronizable as String: false,
         ]
         let attrs: [String: Any] = [kSecValueData as String: data]
         let upd = SecItemUpdate(q as CFDictionary, attrs as CFDictionary)
         if upd == errSecSuccess { return }
         if upd != errSecItemNotFound { throw Error.keychain(upd) }
-
-        // Insert.
         var add = q
         add[kSecValueData as String] = data
         add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
@@ -594,9 +575,9 @@ struct KeychainStore: Sendable {
 
     func delete(account: String) throws {
         let q: [String: Any] = [
-            kSecClass        as String: kSecClassGenericPassword,
-            kSecAttrService  as String: service,
-            kSecAttrAccount  as String: account,
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
             kSecAttrSynchronizable as String: false,
         ]
         let st = SecItemDelete(q as CFDictionary)
@@ -612,10 +593,6 @@ struct KeychainStore: Sendable {
 swift test --filter ClipTests.KeychainStoreTests
 ```
 
-Expected: 4 tests pass.
-
-> **If tests hang or prompt for keychain access**: the test process may need `--enable-keychain-access` or to be signed. On normal `swift test` invocation in a logged-in user's TTY this works without prompts because `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` is permissive enough. If a UI prompt appears, click "Always Allow".
-
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -625,11 +602,13 @@ git commit -m "sync: KeychainStore — generic-password wrapper, sync disabled"
 
 ---
 
-### Task 5: SyncTypes — value types for backend protocol + queue ops
+### Task 5: SyncTypes — value types + cloud key constants + composite cursor
 
 **Files:**
 - Create: `Sources/Clip/Sync/SyncTypes.swift`
 - Create: `Tests/ClipTests/Sync/SyncTypesTests.swift`
+
+This is where **fix A** (composite cursor) lives as a parseable type.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -645,31 +624,37 @@ final class SyncTypesTests: XCTestCase {
         }
     }
 
-    func testCloudObjectMetaInit() {
-        let m = CloudObjectMeta(key: "items/abc.bin", etag: "deadbeef",
-                                lastModified: 100, size: 50)
-        XCTAssertEqual(m.key, "items/abc.bin")
-        XCTAssertEqual(m.etag, "deadbeef")
-        XCTAssertEqual(m.lastModified, 100)
-        XCTAssertEqual(m.size, 50)
+    func testCloudCursorZero() {
+        let c = CloudCursor.zero
+        XCTAssertEqual(c.serialized, "0:")
+        XCTAssertEqual(c.updatedAt, 0)
+        XCTAssertEqual(c.id, "")
     }
 
-    func testListPageDefaults() {
-        let p = ListPage(objects: [], nextCursor: nil)
-        XCTAssertTrue(p.objects.isEmpty)
-        XCTAssertNil(p.nextCursor)
+    func testCloudCursorSerializeRoundTrip() {
+        let c = CloudCursor(updatedAt: 1735689600, id: "abc-123")
+        XCTAssertEqual(c.serialized, "1735689600:abc-123")
+        XCTAssertEqual(CloudCursor(serialized: c.serialized), c)
     }
 
-    func testCloudPrefixes() {
-        XCTAssertEqual(CloudKey.itemsPrefix, "items/")
-        XCTAssertEqual(CloudKey.tombPrefix, "tomb/")
-        XCTAssertEqual(CloudKey.blobsPrefix, "blobs/")
-        XCTAssertEqual(CloudKey.devicesPrefix, "devices/")
-        XCTAssertEqual(CloudKey.configKey, "config.json")
-        XCTAssertEqual(CloudKey.itemKey(name: "abc"), "items/abc.bin")
-        XCTAssertEqual(CloudKey.tombKey(name: "abc"), "tomb/abc.bin")
+    func testCloudCursorParseInvalidReturnsZero() {
+        XCTAssertEqual(CloudCursor(serialized: "garbage"), CloudCursor.zero)
+        XCTAssertEqual(CloudCursor(serialized: ""), CloudCursor.zero)
+    }
+
+    func testCloudKeyHelpers() {
         XCTAssertEqual(CloudKey.blobKey(name: "abc"), "blobs/abc.bin")
-        XCTAssertEqual(CloudKey.deviceKey(deviceID: "ID"), "devices/ID.bin")
+        XCTAssertEqual(CloudKey.blobsPrefix, "blobs/")
+    }
+
+    func testCloudRowEquality() {
+        let a = CloudRow(id: "1", hmac: "h", ciphertext: Data([0x01]),
+                         kind: "text", blobKey: nil, byteSize: 1,
+                         deviceID: "D", createdAt: 0, updatedAt: 0, deleted: false)
+        var b = a
+        XCTAssertEqual(a, b)
+        b.deleted = true
+        XCTAssertNotEqual(a, b)
     }
 }
 ```
@@ -680,8 +665,6 @@ final class SyncTypesTests: XCTestCase {
 swift test --filter ClipTests.SyncTypesTests
 ```
 
-Expected: compile error.
-
 - [ ] **Step 3: Implement SyncTypes**
 
 ```swift
@@ -690,37 +673,64 @@ import Foundation
 
 /// One row in `sync_queue.op`.
 enum SyncOp: String, CaseIterable, Sendable {
-    case putItem    = "put_item"
-    case putBlob    = "put_blob"
-    case putTomb    = "put_tomb"
-    case putDevice  = "put_device"
+    case putClip   = "put_clip"
+    case putBlob   = "put_blob"
+    case putTomb   = "put_tomb"
+    case putDevice = "put_device"
 }
 
-struct CloudObjectMeta: Sendable, Equatable {
-    var key: String
-    var etag: String
-    var lastModified: Int64    // unix seconds
-    var size: Int
+/// Mirrors a row in the D1 `clips` table.
+struct CloudRow: Sendable, Equatable {
+    var id: String              // UUID, primary key (plaintext)
+    var hmac: String            // HMAC(content_hash, kName) (plaintext, indexed)
+    var ciphertext: Data        // ChaChaPoly sealed JSON of RowPayload
+    var kind: String            // "text" | "image"
+    var blobKey: String?        // R2 object key for image; nil for text
+    var byteSize: Int           // plaintext content size
+    var deviceID: String        // last writer
+    var createdAt: Int64
+    var updatedAt: Int64        // server-side bumped on UPSERT
+    var deleted: Bool           // tombstone flag
 }
 
-struct ListPage: Sendable {
-    var objects: [CloudObjectMeta]
-    var nextCursor: String?
+/// Mirrors a row in the D1 `devices` table.
+struct DeviceRow: Sendable, Equatable {
+    var deviceID: String
+    var ciphertext: Data        // sealed JSON of DevicePayload
+    var lastSeenAt: Int64
 }
 
-/// Centralized cloud key construction. All the prefixes / suffixes live here
-/// so a typo doesn't accidentally split traffic across two key spaces.
+/// Composite pull cursor (spec §7.3 "fix A"). Encodes as
+/// "<unix_sec>:<id_uuid>"; deserialize tolerates garbage by returning .zero.
+struct CloudCursor: Sendable, Equatable {
+    var updatedAt: Int64
+    var id: String
+
+    static let zero = CloudCursor(updatedAt: 0, id: "")
+
+    var serialized: String { "\(updatedAt):\(id)" }
+
+    init(updatedAt: Int64, id: String) {
+        self.updatedAt = updatedAt
+        self.id = id
+    }
+
+    init(serialized: String) {
+        guard let colon = serialized.firstIndex(of: ":"),
+              let ts = Int64(serialized[..<colon])
+        else {
+            self = .zero
+            return
+        }
+        self.updatedAt = ts
+        self.id = String(serialized[serialized.index(after: colon)...])
+    }
+}
+
+/// Cloud object key construction (R2 side only — D1 uses table/column names).
 enum CloudKey {
-    static let itemsPrefix   = "items/"
-    static let tombPrefix    = "tomb/"
-    static let blobsPrefix   = "blobs/"
-    static let devicesPrefix = "devices/"
-    static let configKey     = "config.json"
-
-    static func itemKey(name: String)   -> String { itemsPrefix + name + ".bin" }
-    static func tombKey(name: String)   -> String { tombPrefix + name + ".bin" }
-    static func blobKey(name: String)   -> String { blobsPrefix + name + ".bin" }
-    static func deviceKey(deviceID: String) -> String { devicesPrefix + deviceID + ".bin" }
+    static let blobsPrefix = "blobs/"
+    static func blobKey(name: String) -> String { blobsPrefix + name + ".bin" }
 }
 ```
 
@@ -730,13 +740,13 @@ enum CloudKey {
 swift test --filter ClipTests.SyncTypesTests
 ```
 
-Expected: 4 tests pass.
+Expected: 6 tests pass.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add Sources/Clip/Sync/SyncTypes.swift Tests/ClipTests/Sync/SyncTypesTests.swift
-git commit -m "sync: SyncTypes — backend value types + cloud key constants"
+git commit -m "sync: SyncTypes — CloudRow/DeviceRow/CloudCursor (composite, fix A)"
 ```
 
 ---
@@ -755,52 +765,30 @@ import XCTest
 @testable import Clip
 
 final class SyncSchemaTests: XCTestCase {
-    func testItemPayloadTextRoundTrip() throws {
-        let p = ItemPayload(
-            v: 1, kind: "text", contentHash: "abc",
-            content: "hello", mimeType: nil, blobHmac: nil, blobSize: nil,
-            thumbB64: nil, byteSize: 5, truncated: false,
-            sourceBundleId: "com.apple.Safari", sourceAppName: "Safari",
-            createdAt: 100, pinned: false, deviceId: "DEV1")
+    func testRowPayloadTextRoundTrip() throws {
+        let p = RowPayload(
+            v: 1, content: "hello", thumbB64: nil, mimeType: nil, blobSize: nil,
+            truncated: false, sourceBundleId: "com.apple.Safari", sourceAppName: "Safari",
+            pinned: false, contentHash: "abc")
         let data = try JSONEncoder().encode(p)
-        let back = try JSONDecoder().decode(ItemPayload.self, from: data)
-        XCTAssertEqual(back, p)
+        XCTAssertEqual(try JSONDecoder().decode(RowPayload.self, from: data), p)
     }
 
-    func testItemPayloadImageRoundTrip() throws {
-        let p = ItemPayload(
-            v: 1, kind: "image", contentHash: "def",
-            content: nil, mimeType: "image/png", blobHmac: "fff", blobSize: 12345,
-            thumbB64: "AAA=", byteSize: 0, truncated: false,
-            sourceBundleId: nil, sourceAppName: nil,
-            createdAt: 200, pinned: true, deviceId: "DEV2")
+    func testRowPayloadImageRoundTrip() throws {
+        let p = RowPayload(
+            v: 1, content: nil, thumbB64: "AAAA", mimeType: "image/png",
+            blobSize: 12345, truncated: false, sourceBundleId: nil, sourceAppName: nil,
+            pinned: true, contentHash: "def")
         let data = try JSONEncoder().encode(p)
-        let back = try JSONDecoder().decode(ItemPayload.self, from: data)
-        XCTAssertEqual(back, p)
-    }
-
-    func testTombstonePayloadRoundTrip() throws {
-        let t = TombstonePayload(v: 1, contentHash: "x", tombstonedAt: 999, deviceId: "D")
-        let back = try JSONDecoder().decode(TombstonePayload.self,
-                                            from: try JSONEncoder().encode(t))
-        XCTAssertEqual(back, t)
+        XCTAssertEqual(try JSONDecoder().decode(RowPayload.self, from: data), p)
     }
 
     func testDevicePayloadRoundTrip() throws {
-        let d = DevicePayload(v: 1, deviceId: "ID", displayName: "Mac-Mini-7",
-                              model: "Mac15,12", firstSeenAt: 1, lastSeenAt: 2)
+        let d = DevicePayload(v: 1, displayName: "Mac-Mini-7", model: "Mac15,12",
+                              firstSeenAt: 1)
         let back = try JSONDecoder().decode(DevicePayload.self,
                                             from: try JSONEncoder().encode(d))
         XCTAssertEqual(back, d)
-    }
-
-    func testConfigPayloadRoundTrip() throws {
-        let c = CloudConfigPayload(v: 1, kdf: "pbkdf2-hmac-sha256",
-                                   kdfIters: 200_000, kdfSaltB64: "QUJD",
-                                   format: "chacha20-poly1305-ietf-12-16")
-        let back = try JSONDecoder().decode(CloudConfigPayload.self,
-                                            from: try JSONEncoder().encode(c))
-        XCTAssertEqual(back, c)
     }
 }
 ```
@@ -811,94 +799,48 @@ final class SyncSchemaTests: XCTestCase {
 swift test --filter ClipTests.SyncSchemaTests
 ```
 
-Expected: compile error.
-
 - [ ] **Step 3: Implement SyncSchema**
 
 ```swift
 // Sources/Clip/Sync/SyncSchema.swift
 import Foundation
 
-/// Cloud object payloads. JSON wire format; keys use snake_case to stay
-/// stable across language ports (future iOS Swift, hypothetical CLI tool, etc.).
-///
-/// `v` field on every payload — bump if breaking, current readers must
-/// reject unknown major versions.
-
-struct ItemPayload: Codable, Equatable, Sendable {
+/// JSON wire format for `clips.ciphertext` after decryption. Spec §5.3.
+/// snake_case for cross-language portability.
+struct RowPayload: Codable, Equatable, Sendable {
     var v: Int
-    var kind: String                // "text" | "image"
-    var contentHash: String
-    var content: String?            // text only
-    var mimeType: String?           // image only
-    var blobHmac: String?           // image only — points at blobs/<blobHmac>.bin
-    var blobSize: Int?              // image only
-    var thumbB64: String?           // image only — base64-encoded ≤5KB PNG thumbnail
-    var byteSize: Int
+    var content: String?       // text only
+    var thumbB64: String?      // image only — base64 PNG ≤5KB
+    var mimeType: String?      // image only
+    var blobSize: Int?         // image only — R2 blob byte count
     var truncated: Bool
     var sourceBundleId: String?
     var sourceAppName: String?
-    var createdAt: Int64
     var pinned: Bool
-    var deviceId: String
+    var contentHash: String    // duplicates the indexed clips.hmac source
 
     enum CodingKeys: String, CodingKey {
-        case v, kind, content, truncated, pinned
-        case contentHash       = "content_hash"
-        case mimeType          = "mime_type"
-        case blobHmac          = "blob_hmac"
-        case blobSize          = "blob_size"
-        case thumbB64          = "thumb_b64"
-        case byteSize          = "byte_size"
-        case sourceBundleId    = "source_bundle_id"
-        case sourceAppName     = "source_app_name"
-        case createdAt         = "created_at"
-        case deviceId          = "device_id"
+        case v, content, truncated, pinned
+        case thumbB64        = "thumb_b64"
+        case mimeType        = "mime_type"
+        case blobSize        = "blob_size"
+        case sourceBundleId  = "source_bundle_id"
+        case sourceAppName   = "source_app_name"
+        case contentHash     = "content_hash"
     }
 }
 
-struct TombstonePayload: Codable, Equatable, Sendable {
-    var v: Int
-    var contentHash: String
-    var tombstonedAt: Int64
-    var deviceId: String
-
-    enum CodingKeys: String, CodingKey {
-        case v
-        case contentHash  = "content_hash"
-        case tombstonedAt = "tombstoned_at"
-        case deviceId     = "device_id"
-    }
-}
-
+/// JSON wire format for `devices.ciphertext` after decryption. Spec §5.4.
 struct DevicePayload: Codable, Equatable, Sendable {
     var v: Int
-    var deviceId: String
     var displayName: String
     var model: String
     var firstSeenAt: Int64
-    var lastSeenAt: Int64
 
     enum CodingKeys: String, CodingKey {
         case v, model
-        case deviceId    = "device_id"
         case displayName = "display_name"
         case firstSeenAt = "first_seen_at"
-        case lastSeenAt  = "last_seen_at"
-    }
-}
-
-struct CloudConfigPayload: Codable, Equatable, Sendable {
-    var v: Int
-    var kdf: String
-    var kdfIters: Int
-    var kdfSaltB64: String
-    var format: String
-
-    enum CodingKeys: String, CodingKey {
-        case v, kdf, format
-        case kdfIters    = "kdf_iters"
-        case kdfSaltB64  = "kdf_salt_b64"
     }
 }
 ```
@@ -909,22 +851,22 @@ struct CloudConfigPayload: Codable, Equatable, Sendable {
 swift test --filter ClipTests.SyncSchemaTests
 ```
 
-Expected: 5 tests pass.
+Expected: 3 tests pass.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add Sources/Clip/Sync/SyncSchema.swift Tests/ClipTests/Sync/SyncSchemaTests.swift
-git commit -m "sync: SyncSchema — Codable Item/Tombstone/Device/Config payloads"
+git commit -m "sync: SyncSchema — Codable RowPayload + DevicePayload"
 ```
 
 ---
 
-### Task 7: HistoryStore additions — sync columns + hooks + queries
+### Task 7: HistoryStore additions — sync columns + hooks + new helpers
 
 **Files:**
-- Modify: `Sources/Clip/Storage/ClipItem.swift` — add 5 properties
-- Modify: `Sources/Clip/Storage/HistoryStore.swift` — extend `itemFromRow`, `_insert`; add new methods
+- Modify: `Sources/Clip/Storage/ClipItem.swift`
+- Modify: `Sources/Clip/Storage/HistoryStore.swift`
 - Create: `Tests/ClipTests/Sync/HistoryStoreSyncTests.swift`
 
 - [ ] **Step 1: Write the failing test**
@@ -935,68 +877,84 @@ import XCTest
 @testable import Clip
 
 final class HistoryStoreSyncTests: XCTestCase {
+    func mkItem(_ s: String, at: Int64 = 1) -> ClipItem {
+        ClipItem(id: nil, content: s, contentHash: ClipItem.contentHash(of: s),
+                 sourceBundleID: nil, sourceAppName: nil, createdAt: at,
+                 pinned: false, byteSize: s.utf8.count, truncated: false)
+    }
+
     func testNewItemDefaultsAreUnsynced() throws {
         let s = try HistoryStore.inMemory()
-        let id = try s.insert(ClipItem(
-            id: nil, content: "x", contentHash: ClipItem.contentHash(of: "x"),
-            sourceBundleID: nil, sourceAppName: nil, createdAt: 1,
-            pinned: false, byteSize: 1, truncated: false))
+        let id = try s.insert(mkItem("x"))
         let item = try XCTUnwrap(try s.itemByID(id))
         XCTAssertEqual(item.syncExcluded, false)
+        XCTAssertNil(item.cloudID)
+        XCTAssertNil(item.cloudUpdatedAt)
         XCTAssertNil(item.cloudSyncedAt)
-        XCTAssertNil(item.cloudEtag)
-        XCTAssertNil(item.cloudLastModified)
+        XCTAssertNil(item.cloudBlobKey)
         XCTAssertNil(item.deviceID)
     }
 
-    func testMarkSyncedWritesCloudFields() throws {
+    func testMarkClipSyncedWritesCloudFields() throws {
         let s = try HistoryStore.inMemory()
-        let id = try s.insert(ClipItem(
-            id: nil, content: "y", contentHash: ClipItem.contentHash(of: "y"),
-            sourceBundleID: nil, sourceAppName: nil, createdAt: 1,
-            pinned: false, byteSize: 1, truncated: false))
-        try s.markItemSynced(id: id, at: 100, etag: "deadbeef", lastModified: 99)
+        let id = try s.insert(mkItem("y"))
+        try s.markClipSynced(id: id, cloudID: "uuid-123", updatedAt: 99, at: 100)
         let item = try XCTUnwrap(try s.itemByID(id))
+        XCTAssertEqual(item.cloudID, "uuid-123")
+        XCTAssertEqual(item.cloudUpdatedAt, 99)
         XCTAssertEqual(item.cloudSyncedAt, 100)
-        XCTAssertEqual(item.cloudEtag, "deadbeef")
-        XCTAssertEqual(item.cloudLastModified, 99)
     }
 
-    func testSetExclusionTogglesFlag() throws {
+    func testItemByCloudID() throws {
         let s = try HistoryStore.inMemory()
-        let id = try s.insert(ClipItem(
-            id: nil, content: "z", contentHash: ClipItem.contentHash(of: "z"),
-            sourceBundleID: nil, sourceAppName: nil, createdAt: 1,
-            pinned: false, byteSize: 1, truncated: false))
+        let id = try s.insert(mkItem("z"))
+        try s.markClipSynced(id: id, cloudID: "abc", updatedAt: 1, at: 2)
+        let found = try XCTUnwrap(try s.itemByCloudID("abc"))
+        XCTAssertEqual(found.id, id)
+        XCTAssertNil(try s.itemByCloudID("missing"))
+    }
+
+    func testSetSyncExcludedToggles() throws {
+        let s = try HistoryStore.inMemory()
+        let id = try s.insert(mkItem("a"))
         try s.setSyncExcluded(id: id, excluded: true)
         XCTAssertEqual(try s.itemByID(id)?.syncExcluded, true)
         try s.setSyncExcluded(id: id, excluded: false)
         XCTAssertEqual(try s.itemByID(id)?.syncExcluded, false)
     }
 
-    func testOnChangeFiresOnInsert() throws {
+    func testOnChangeFiresOnInsertAndDelete() throws {
         let s = try HistoryStore.inMemory()
         var calls: [HistoryStoreChange] = []
         s.onChange = { calls.append($0) }
-        try s.insert(ClipItem(
-            id: nil, content: "x", contentHash: ClipItem.contentHash(of: "x"),
-            sourceBundleID: nil, sourceAppName: nil, createdAt: 1,
-            pinned: false, byteSize: 1, truncated: false))
-        XCTAssertEqual(calls.count, 1)
-        if case .inserted = calls[0] {} else { XCTFail("expected .inserted") }
+        let id = try s.insert(mkItem("c"))
+        try s.delete(id: id)
+        XCTAssertEqual(calls.count, 2)
+        if case .inserted = calls[0] {} else { XCTFail() }
+        if case .deleted = calls[1] {} else { XCTFail() }
     }
 
-    func testOnChangeFiresOnDelete() throws {
+    func testTombstoneRoundTrip() throws {
         let s = try HistoryStore.inMemory()
-        var calls: [HistoryStoreChange] = []
-        let id = try s.insert(ClipItem(
-            id: nil, content: "x", contentHash: ClipItem.contentHash(of: "x"),
-            sourceBundleID: nil, sourceAppName: nil, createdAt: 1,
-            pinned: false, byteSize: 1, truncated: false))
-        s.onChange = { calls.append($0) }
-        try s.delete(id: id)
-        XCTAssertEqual(calls.count, 1)
-        if case .deleted = calls[0] {} else { XCTFail("expected .deleted") }
+        try s.upsertTombstone(contentHash: "h", cloudID: "id1",
+                              tombstonedAt: 100, cloudUpdatedAt: 100)
+        XCTAssertEqual(try s.tombstoneAt(contentHash: "h"), 100)
+        // re-upsert with newer time → updates
+        try s.upsertTombstone(contentHash: "h", cloudID: "id1",
+                              tombstonedAt: 200, cloudUpdatedAt: 200)
+        XCTAssertEqual(try s.tombstoneAt(contentHash: "h"), 200)
+    }
+
+    func testLazyBlobInsertAndFill() throws {
+        let s = try HistoryStore.inMemory()
+        let blobID = try s.insertLazyBlob(blobHmac: "hash1", byteSize: 1024, now: 1)
+        let lazy = try XCTUnwrap(try s.lazyBlobHmac(id: blobID))
+        XCTAssertEqual(lazy.hmac, "hash1")
+        XCTAssertEqual(lazy.byteSize, 1024)
+        let bytes = Data(repeating: 0xFF, count: 1024)
+        try s.fillBlob(id: blobID, bytes: bytes, sha256: "real-sha", at: 2)
+        XCTAssertEqual(try s.blob(id: blobID), bytes)
+        XCTAssertNil(try s.lazyBlobHmac(id: blobID))   // no longer lazy
     }
 }
 ```
@@ -1007,11 +965,9 @@ final class HistoryStoreSyncTests: XCTestCase {
 swift test --filter ClipTests.HistoryStoreSyncTests
 ```
 
-Expected: compile errors (missing properties / methods).
+- [ ] **Step 3: Extend ClipItem (add 6 properties)**
 
-- [ ] **Step 3: Extend ClipItem**
-
-In `Sources/Clip/Storage/ClipItem.swift`, replace the existing `ClipItem` struct with the version below (preserves all existing fields, adds 5 new ones):
+In `Sources/Clip/Storage/ClipItem.swift`, replace the `ClipItem` struct:
 
 ```swift
 struct ClipItem: Identifiable, Equatable {
@@ -1028,12 +984,12 @@ struct ClipItem: Identifiable, Equatable {
     var blobID: Int64? = nil
     var mimeType: String? = nil
     // v3 cloud sync columns (Migration v3) — all default-nil so callsites
-    // not concerned with sync don't change.
-    var syncExcluded: Bool = false
+    // that never touch sync don't break.
+    var cloudID: String? = nil
+    var cloudUpdatedAt: Int64? = nil
     var cloudSyncedAt: Int64? = nil
-    var cloudEtag: String? = nil
-    var cloudLastModified: Int64? = nil
-    var cloudName: String? = nil      // hex(hmac); set on insert if sync enabled, on UPSERT during pull
+    var cloudBlobKey: String? = nil
+    var syncExcluded: Bool = false
     var deviceID: String? = nil
 
     static func byteSize(of s: String) -> Int { s.utf8.count }
@@ -1056,15 +1012,11 @@ struct ClipItem: Identifiable, Equatable {
 }
 ```
 
-(`import CryptoKit` was already at the top.)
+- [ ] **Step 4: Add HistoryStoreChange + extend HistoryStore**
 
-- [ ] **Step 4: Add change-notification type and extend HistoryStore**
-
-Add at the top of `Sources/Clip/Storage/HistoryStore.swift`, before the class:
+In `Sources/Clip/Storage/HistoryStore.swift`, before the class:
 
 ```swift
-/// Events emitted when the store is mutated. Sync engine subscribes to these
-/// to know what to push.
 enum HistoryStoreChange: Sendable {
     case inserted(itemID: Int64)
     case deleted(itemID: Int64, contentHash: String)
@@ -1073,17 +1025,13 @@ enum HistoryStoreChange: Sendable {
 }
 ```
 
-In the `HistoryStore` class:
+Add to the class:
 
-1. Add a stored callback near the other properties:
 ```swift
-    /// Called after every mutation. Set by AppDelegate to wire SyncEngine.
-    /// May be invoked from any queue — implementer must hop to its own actor
-    /// if needed.
     var onChange: (@Sendable (HistoryStoreChange) -> Void)?
 ```
 
-2. Update `_insert` to read 5 new columns when called via the public API. Actually `_insert` writes — leave it. Update `itemFromRow` to read them:
+Update `itemFromRow`:
 
 ```swift
     static func itemFromRow(_ row: Row) -> ClipItem {
@@ -1102,59 +1050,29 @@ In the `HistoryStore` class:
             kind: kind,
             blobID: row["blob_id"],
             mimeType: row["mime_type"],
-            syncExcluded: ((row["sync_excluded"] as Int64?) ?? 0) != 0,
+            cloudID: row["cloud_id"],
+            cloudUpdatedAt: row["cloud_updated_at"],
             cloudSyncedAt: row["cloud_synced_at"],
-            cloudEtag: row["cloud_etag"],
-            cloudLastModified: row["cloud_lastmodified"],
-            cloudName: row["cloud_name"],
+            cloudBlobKey: row["cloud_blob_key"],
+            syncExcluded: ((row["sync_excluded"] as Int64?) ?? 0) != 0,
             deviceID: row["device_id"]
         )
     }
-
-    /// Look up the local cloud_etag for a given hmac (used by SyncEngine pull
-    /// to skip GET when local row's cloud_etag already matches the listing
-    /// ETag — fixes the "always re-download" correctness gap flagged by review).
-    func cloudEtagByName(_ name: String, table: String = "items") throws -> String? {
-        try pool.read { db in
-            try String.fetchOne(db,
-                sql: "SELECT cloud_etag FROM \(table) WHERE cloud_name = ? LIMIT 1",
-                arguments: [name])
-        }
-    }
-
-    func tombstoneEtagByName(_ name: String) throws -> String? {
-        try pool.read { db in
-            try String.fetchOne(db,
-                sql: "SELECT cloud_etag FROM tombstones WHERE hmac = ? LIMIT 1",
-                arguments: [name])
-        }
-    }
-
-    /// Set cloud_name on an items row (called by SyncEngine after first PUT).
-    func setItemCloudName(id: Int64, name: String) throws {
-        try pool.write { db in
-            try db.execute(sql: "UPDATE items SET cloud_name = ? WHERE id = ?",
-                           arguments: [name, id])
-        }
-    }
 ```
 
-3. Wrap existing `insert`, `insertOrPromote`, `insertImage`, `delete`, `togglePin` to fire `onChange` after success. Example for `insert`:
+Wrap mutations to fire `onChange`. Replace `insert`, `insertOrPromote`, `insertImage`, `delete`, `togglePin`. Example for `insert`:
 
 ```swift
     @discardableResult
     func insert(_ item: ClipItem) throws -> Int64 {
-        let id = try pool.write { db in
-            try Self._insert(db, item: item)
-        }
+        let id = try pool.write { db in try Self._insert(db, item: item) }
         onChange?(.inserted(itemID: id))
         return id
     }
 ```
 
-Apply the same pattern to `insertOrPromote` (`.inserted`), `insertImage` (`.inserted`), `delete` (`.deleted` — but you need `contentHash` first; query before delete or via the `Row` you fetch), `togglePin` (`.pinToggled`).
+For `delete` capture the hash before removing:
 
-For `delete`:
 ```swift
     func delete(id: Int64) throws {
         let hash = try pool.read { db in
@@ -1169,10 +1087,13 @@ For `delete`:
     }
 ```
 
-4. Add new methods:
+Apply parallel patterns to `insertOrPromote`/`insertImage` (`.inserted`) and `togglePin` (`.pinToggled`).
+
+Add new methods:
 
 ```swift
-    /// Fetch a single item by id (used by sync push pipeline).
+    // MARK: - Sync helpers (Migration v3)
+
     func itemByID(_ id: Int64) throws -> ClipItem? {
         try pool.read { db in
             try Row.fetchOne(db, sql: "SELECT * FROM items WHERE id = ?", arguments: [id])
@@ -1180,26 +1101,44 @@ For `delete`:
         }
     }
 
-    /// Mark an item as cloud-synced (called by SyncEngine after successful PUT).
-    func markItemSynced(id: Int64, at: Int64, etag: String, lastModified: Int64) throws {
+    func itemByCloudID(_ cloudID: String) throws -> ClipItem? {
+        try pool.read { db in
+            try Row.fetchOne(db, sql: "SELECT * FROM items WHERE cloud_id = ? LIMIT 1",
+                             arguments: [cloudID]).map(Self.itemFromRow)
+        }
+    }
+
+    func itemByContentHash(_ hash: String) throws -> ClipItem? {
+        try pool.read { db in
+            try Row.fetchOne(db, sql: "SELECT * FROM items WHERE content_hash = ? LIMIT 1",
+                             arguments: [hash]).map(Self.itemFromRow)
+        }
+    }
+
+    func markClipSynced(id: Int64, cloudID: String, updatedAt: Int64, at: Int64) throws {
         try pool.write { db in
             try db.execute(sql: """
-                UPDATE items SET cloud_synced_at = ?, cloud_etag = ?, cloud_lastmodified = ?
+                UPDATE items SET cloud_id = ?, cloud_updated_at = ?, cloud_synced_at = ?
                 WHERE id = ?
-            """, arguments: [at, etag, lastModified, id])
+            """, arguments: [cloudID, updatedAt, at, id])
         }
     }
 
-    /// Mark a blob as cloud-synced.
-    func markBlobSynced(id: Int64, at: Int64, etag: String) throws {
+    func markBlobSynced(id: Int64, at: Int64) throws {
         try pool.write { db in
             try db.execute(sql: """
-                UPDATE clip_blobs SET cloud_synced_at = ?, cloud_etag = ? WHERE id = ?
-            """, arguments: [at, etag, id])
+                UPDATE clip_blobs SET cloud_synced_at = ? WHERE id = ?
+            """, arguments: [at, id])
         }
     }
 
-    /// Toggle the per-item exclude flag and fire onChange.
+    func setItemCloudBlobKey(id: Int64, blobKey: String) throws {
+        try pool.write { db in
+            try db.execute(sql: "UPDATE items SET cloud_blob_key = ? WHERE id = ?",
+                           arguments: [blobKey, id])
+        }
+    }
+
     func setSyncExcluded(id: Int64, excluded: Bool) throws {
         try pool.write { db in
             try db.execute(sql: "UPDATE items SET sync_excluded = ? WHERE id = ?",
@@ -1207,112 +1146,481 @@ For `delete`:
         }
         onChange?(.excludedToggled(itemID: id))
     }
+
+    // MARK: - Tombstones (local; prevents capture-side resurrection)
+
+    func upsertTombstone(contentHash: String, cloudID: String,
+                         tombstonedAt: Int64, cloudUpdatedAt: Int64) throws {
+        try pool.write { db in
+            try db.execute(sql: """
+                INSERT INTO tombstones (content_hash, cloud_id, tombstoned_at, cloud_updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(content_hash) DO UPDATE SET
+                  tombstoned_at = excluded.tombstoned_at,
+                  cloud_updated_at = excluded.cloud_updated_at
+            """, arguments: [contentHash, cloudID, tombstonedAt, cloudUpdatedAt])
+        }
+    }
+
+    func tombstoneAt(contentHash: String) throws -> Int64? {
+        try pool.read { db in
+            try Int64.fetchOne(db,
+                sql: "SELECT tombstoned_at FROM tombstones WHERE content_hash = ?",
+                arguments: [contentHash])
+        }
+    }
+
+    func deleteItemsByContentHashOlderThan(_ contentHash: String, _ tombstonedAt: Int64) throws {
+        try pool.write { db in
+            try db.execute(sql: """
+                DELETE FROM items WHERE content_hash = ? AND created_at <= ?
+            """, arguments: [contentHash, tombstonedAt])
+        }
+    }
+
+    // MARK: - Lazy blob (image rows pulled before bytes downloaded)
+
+    func insertLazyBlob(blobHmac: String, byteSize: Int, now: Int64) throws -> Int64 {
+        try pool.write { db in
+            try db.execute(sql: """
+                INSERT INTO clip_blobs (sha256, bytes, byte_size, created_at)
+                VALUES (?, ?, ?, ?)
+            """, arguments: ["lazy:" + blobHmac, Data(), byteSize, now])
+            return db.lastInsertedRowID
+        }
+    }
+
+    func lazyBlobHmac(id: Int64) throws -> (hmac: String, byteSize: Int)? {
+        try pool.read { db in
+            guard let row = try Row.fetchOne(db,
+                sql: "SELECT sha256, byte_size FROM clip_blobs WHERE id = ?",
+                arguments: [id]) else { return nil }
+            let sha: String = row["sha256"]
+            guard sha.hasPrefix("lazy:") else { return nil }
+            return (String(sha.dropFirst("lazy:".count)), row["byte_size"])
+        }
+    }
+
+    func fillBlob(id: Int64, bytes: Data, sha256: String, at: Int64) throws {
+        try pool.write { db in
+            try db.execute(sql: """
+                UPDATE clip_blobs SET bytes = ?, sha256 = ?, cloud_synced_at = ?
+                WHERE id = ?
+            """, arguments: [bytes, sha256, at, id])
+        }
+    }
 ```
 
-- [ ] **Step 5: Run test to verify it passes**
+Update `_insert` to write the 6 new columns. Adjust the SQL:
+
+```swift
+    fileprivate static func _insert(_ db: Database, item: ClipItem) throws -> Int64 {
+        try db.execute(sql: """
+            INSERT INTO items
+                (content, content_hash, source_bundle_id, source_app_name,
+                 created_at, pinned, byte_size, truncated,
+                 kind, blob_id, mime_type,
+                 cloud_id, cloud_updated_at, cloud_synced_at, cloud_blob_key,
+                 sync_excluded, device_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, arguments: [
+            item.content, item.contentHash, item.sourceBundleID,
+            item.sourceAppName, item.createdAt, item.pinned ? 1 : 0,
+            item.byteSize, item.truncated ? 1 : 0,
+            item.kind.rawValue, item.blobID, item.mimeType,
+            item.cloudID, item.cloudUpdatedAt, item.cloudSyncedAt, item.cloudBlobKey,
+            item.syncExcluded ? 1 : 0, item.deviceID,
+        ])
+        return db.lastInsertedRowID
+    }
+```
+
+- [ ] **Step 5: Run test + full suite**
 
 ```bash
 swift test --filter ClipTests.HistoryStoreSyncTests
-```
-
-Expected: 5 tests pass.
-
-- [ ] **Step 6: Run the full existing suite (regression guard)**
-
-```bash
 swift test
 ```
 
-Expected: all pre-existing tests still pass (HistoryStoreTests, MigrationTests, etc.).
+Both must pass.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add Sources/Clip/Storage/ClipItem.swift Sources/Clip/Storage/HistoryStore.swift Tests/ClipTests/Sync/HistoryStoreSyncTests.swift
-git commit -m "sync: HistoryStore — sync columns, onChange hook, markSynced helpers"
+git commit -m "sync: HistoryStore — sync columns + onChange + tombstones + lazy blob helpers"
 ```
 
 ---
 
-## Phase P2 — Backend (protocol, local impl, R2 impl)
+## Phase P2 — Backend (protocols + impls)
 
-### Task 8: CloudSyncBackend protocol
+### Task 8: CloudSyncDataSource + CloudSyncBlobStore protocols
 
 **Files:**
-- Create: `Sources/Clip/Sync/CloudSyncBackend.swift`
+- Create: `Sources/Clip/Sync/CloudSyncDataSource.swift`
+- Create: `Sources/Clip/Sync/CloudSyncBlobStore.swift`
 
-(No test for the protocol itself — it's tested via the implementations.)
+(No test for protocols themselves — exercised via implementations.)
 
-- [ ] **Step 1: Write the protocol**
+- [ ] **Step 1: Write the protocols**
 
 ```swift
-// Sources/Clip/Sync/CloudSyncBackend.swift
+// Sources/Clip/Sync/CloudSyncDataSource.swift
 import Foundation
 
-/// Object-store abstraction. Spec §4.3 contract.
-///
-/// Implementations: LocalDirBackend (tests), R2Backend (production).
-/// Keep small: 5 operations, all async, no streaming, no auth refresh
-/// (engine layer handles 401/403 by surfacing to user).
-protocol CloudSyncBackend: Sendable {
-    /// PUT object. Returns `(etag, lastModified)` from the response headers.
-    func put(key: String, body: Data, contentType: String?) async throws -> (etag: String, lastModified: Int64)
+/// D1 abstraction. Spec §4.2. Two-table model (clips + devices) plus a
+/// generic config KV. Implementations: D1Backend (production),
+/// LocalSqliteDataSource (tests).
+protocol CloudSyncDataSource: Sendable {
+    /// Idempotent: `CREATE TABLE IF NOT EXISTS` for clips/devices/config
+    /// + indices. Run on every SyncEngine cold start.
+    func ensureSchema() async throws
 
-    /// GET object. Returns nil when 404; throws on other errors.
-    func get(key: String) async throws -> Data?
+    // Clips
+    /// UPSERT (INSERT ... ON CONFLICT(id) DO UPDATE). Returns server-side
+    /// `updated_at` from RETURNING clause.
+    func upsertClip(_ row: CloudRow) async throws -> Int64
 
-    /// HEAD object. Returns metadata or nil on 404.
-    func head(key: String) async throws -> CloudObjectMeta?
+    /// Lookup for hmac-based dedup. **Returns even deleted=1 rows** so that
+    /// re-toggling exclude reuses the same cloud_id (spec §6.3 fix B).
+    func queryClipByHmac(_ hmac: String) async throws -> (id: String, deleted: Bool)?
 
-    /// DELETE object. 404 is treated as success (idempotent).
-    func delete(key: String) async throws
+    /// Composite-cursor pull (spec §7.3 fix A).
+    func queryClipsChangedSince(cursor: CloudCursor, limit: Int) async throws -> [CloudRow]
 
-    /// LIST a prefix. Pagination via `cursor`; nil = first page.
-    /// Each page is up to backend-defined max (R2: 1000).
-    func list(prefix: String, after cursor: String?) async throws -> ListPage
+    /// Soft-delete: UPDATE deleted=1, updated_at=unixepoch() WHERE id=?
+    /// Returns the new updated_at.
+    func setClipDeleted(id: String) async throws -> Int64
+
+    // Devices
+    func upsertDevice(_ row: DeviceRow) async throws
+    func listDevices() async throws -> [DeviceRow]
+
+    // Config (KDF salt, schema_version, etc.)
+    func getConfig(key: String) async throws -> String?
+    /// Returns true iff the row was INSERTed (we won the race);
+    /// false if it already existed (someone else won).
+    func putConfigIfAbsent(key: String, value: String) async throws -> Bool
 }
 ```
 
-- [ ] **Step 2: Verify it compiles**
+```swift
+// Sources/Clip/Sync/CloudSyncBlobStore.swift
+import Foundation
+
+/// R2 blob abstraction — only PUT/GET/DELETE (no list, no head).
+/// Spec §4.4. Implementations: R2BlobBackend (production),
+/// LocalDirBlobStore (tests).
+protocol CloudSyncBlobStore: Sendable {
+    func putBlob(key: String, body: Data) async throws
+    func getBlob(key: String) async throws -> Data?    // nil = 404
+    func deleteBlob(key: String) async throws           // idempotent
+}
+```
+
+- [ ] **Step 2: Build to verify compiles**
 
 ```bash
 swift build
 ```
 
-Expected: success.
-
 - [ ] **Step 3: Commit**
 
 ```bash
-git add Sources/Clip/Sync/CloudSyncBackend.swift
-git commit -m "sync: CloudSyncBackend protocol — 5-op contract"
+git add Sources/Clip/Sync/CloudSyncDataSource.swift Sources/Clip/Sync/CloudSyncBlobStore.swift
+git commit -m "sync: CloudSyncDataSource + CloudSyncBlobStore protocols (D1+R2 split)"
 ```
 
 ---
 
-### Task 9: LocalDirBackend — write to a local dir for tests
+### Task 9: LocalSqliteDataSource — in-memory SQLite for tests
 
 **Files:**
-- Create: `Sources/Clip/Sync/LocalDirBackend.swift`
-- Create: `Tests/ClipTests/Sync/LocalDirBackendTests.swift`
+- Create: `Sources/Clip/Sync/LocalSqliteDataSource.swift`
+- Create: `Tests/ClipTests/Sync/LocalSqliteDataSourceTests.swift`
+
+In-memory backed by a fresh GRDB DatabasePool per instance. Mirrors the D1 schema exactly (so SQL semantics match production).
 
 - [ ] **Step 1: Write the failing test**
 
 ```swift
-// Tests/ClipTests/Sync/LocalDirBackendTests.swift
+// Tests/ClipTests/Sync/LocalSqliteDataSourceTests.swift
 import XCTest
 @testable import Clip
 
-final class LocalDirBackendTests: XCTestCase {
+final class LocalSqliteDataSourceTests: XCTestCase {
+    func makeDS() throws -> LocalSqliteDataSource {
+        let ds = try LocalSqliteDataSource()
+        let group = DispatchGroup()
+        group.enter()
+        Task { try? await ds.ensureSchema(); group.leave() }
+        group.wait()
+        return ds
+    }
+
+    func testUpsertThenQueryByHmac() async throws {
+        let ds = try makeDS()
+        let row = CloudRow(id: "id1", hmac: "hmac1", ciphertext: Data([0xAA]),
+                           kind: "text", blobKey: nil, byteSize: 5,
+                           deviceID: "DEV", createdAt: 100, updatedAt: 0,
+                           deleted: false)
+        let updatedAt = try await ds.upsertClip(row)
+        XCTAssertGreaterThan(updatedAt, 0, "server bumped updated_at")
+        let found = try await ds.queryClipByHmac("hmac1")
+        XCTAssertEqual(found?.id, "id1")
+        XCTAssertEqual(found?.deleted, false)
+    }
+
+    func testQueryByHmacReturnsDeleted() async throws {
+        let ds = try makeDS()
+        let row = CloudRow(id: "x", hmac: "h", ciphertext: Data([0x01]),
+                           kind: "text", blobKey: nil, byteSize: 1,
+                           deviceID: "D", createdAt: 1, updatedAt: 0, deleted: false)
+        _ = try await ds.upsertClip(row)
+        _ = try await ds.setClipDeleted(id: "x")
+        let found = try await ds.queryClipByHmac("h")
+        XCTAssertEqual(found?.id, "x")
+        XCTAssertEqual(found?.deleted, true, "deleted rows must be returned (fix B)")
+    }
+
+    func testQueryClipsChangedSinceCompositeCursor() async throws {
+        let ds = try makeDS()
+        // Manually insert two rows with the same updated_at (impossible via
+        // upsert which uses unixepoch(); use a direct call for the test).
+        try ds.testDirectInsert(
+            CloudRow(id: "a", hmac: "ha", ciphertext: Data(), kind: "text",
+                     blobKey: nil, byteSize: 0, deviceID: "D",
+                     createdAt: 0, updatedAt: 100, deleted: false))
+        try ds.testDirectInsert(
+            CloudRow(id: "b", hmac: "hb", ciphertext: Data(), kind: "text",
+                     blobKey: nil, byteSize: 0, deviceID: "D",
+                     createdAt: 0, updatedAt: 100, deleted: false))
+        // Cursor at (100, "a") should pick up only "b" — not "a" again.
+        let rows = try await ds.queryClipsChangedSince(
+            cursor: CloudCursor(updatedAt: 100, id: "a"), limit: 100)
+        XCTAssertEqual(rows.map(\.id), ["b"])
+    }
+
+    func testPutConfigIfAbsentRaceSemantics() async throws {
+        let ds = try makeDS()
+        let won1 = try await ds.putConfigIfAbsent(key: "k", value: "v1")
+        let won2 = try await ds.putConfigIfAbsent(key: "k", value: "v2")
+        XCTAssertTrue(won1)
+        XCTAssertFalse(won2)
+        XCTAssertEqual(try await ds.getConfig(key: "k"), "v1")
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+```bash
+swift test --filter ClipTests.LocalSqliteDataSourceTests
+```
+
+- [ ] **Step 3: Implement LocalSqliteDataSource**
+
+```swift
+// Sources/Clip/Sync/LocalSqliteDataSource.swift
+import Foundation
+import GRDB
+
+/// In-memory SQLite that mirrors the D1 schema exactly. Used by tests so
+/// SyncEngine can exercise the full push/pull pipeline without network.
+/// Production uses D1Backend — same protocol, same SQL semantics.
+final class LocalSqliteDataSource: CloudSyncDataSource, @unchecked Sendable {
+    let pool: DatabasePool
+
+    init() throws {
+        let tmp = NSTemporaryDirectory() + UUID().uuidString + ".sqlite"
+        var cfg = Configuration()
+        cfg.prepareDatabase { db in try db.execute(sql: "PRAGMA journal_mode=WAL") }
+        self.pool = try DatabasePool(path: tmp, configuration: cfg)
+    }
+
+    func ensureSchema() async throws {
+        try pool.write { db in
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS clips (
+                    id           TEXT PRIMARY KEY,
+                    hmac         TEXT NOT NULL,
+                    ciphertext   BLOB NOT NULL,
+                    kind         TEXT NOT NULL,
+                    blob_key     TEXT,
+                    byte_size    INTEGER NOT NULL,
+                    device_id    TEXT NOT NULL,
+                    created_at   INTEGER NOT NULL,
+                    updated_at   INTEGER NOT NULL,
+                    deleted      INTEGER NOT NULL DEFAULT 0
+                );
+            """)
+            try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_clips_updated_at ON clips(updated_at);")
+            try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_clips_hmac ON clips(hmac);")
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS devices (
+                    device_id    TEXT PRIMARY KEY,
+                    ciphertext   BLOB NOT NULL,
+                    last_seen_at INTEGER NOT NULL
+                );
+            """)
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS config (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+            """)
+        }
+    }
+
+    func upsertClip(_ row: CloudRow) async throws -> Int64 {
+        try pool.write { db in
+            try db.execute(sql: """
+                INSERT INTO clips (id, hmac, ciphertext, kind, blob_key, byte_size,
+                                   device_id, created_at, updated_at, deleted)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch(), 0)
+                ON CONFLICT(id) DO UPDATE SET
+                  hmac=excluded.hmac, ciphertext=excluded.ciphertext,
+                  kind=excluded.kind, blob_key=excluded.blob_key,
+                  byte_size=excluded.byte_size, device_id=excluded.device_id,
+                  updated_at=unixepoch(), deleted=0
+            """, arguments: [row.id, row.hmac, row.ciphertext, row.kind,
+                             row.blobKey, row.byteSize, row.deviceID,
+                             row.createdAt])
+            return try Int64.fetchOne(db,
+                sql: "SELECT updated_at FROM clips WHERE id = ?",
+                arguments: [row.id]) ?? 0
+        }
+    }
+
+    func queryClipByHmac(_ hmac: String) async throws -> (id: String, deleted: Bool)? {
+        try pool.read { db in
+            try Row.fetchOne(db,
+                sql: "SELECT id, deleted FROM clips WHERE hmac = ? LIMIT 1",
+                arguments: [hmac]).map { (id: $0["id"], deleted: ($0["deleted"] as Int64) != 0) }
+        }
+    }
+
+    func queryClipsChangedSince(cursor: CloudCursor, limit: Int) async throws -> [CloudRow] {
+        try pool.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT * FROM clips
+                WHERE updated_at > ? OR (updated_at = ? AND id > ?)
+                ORDER BY updated_at, id
+                LIMIT ?
+            """, arguments: [cursor.updatedAt, cursor.updatedAt, cursor.id, limit])
+            .map(Self.cloudRowFromRow)
+        }
+    }
+
+    func setClipDeleted(id: String) async throws -> Int64 {
+        try pool.write { db in
+            try db.execute(sql: """
+                UPDATE clips SET deleted = 1, updated_at = unixepoch() WHERE id = ?
+            """, arguments: [id])
+            return try Int64.fetchOne(db,
+                sql: "SELECT updated_at FROM clips WHERE id = ?",
+                arguments: [id]) ?? 0
+        }
+    }
+
+    func upsertDevice(_ row: DeviceRow) async throws {
+        try pool.write { db in
+            try db.execute(sql: """
+                INSERT INTO devices (device_id, ciphertext, last_seen_at)
+                VALUES (?, ?, unixepoch())
+                ON CONFLICT(device_id) DO UPDATE SET
+                  ciphertext = excluded.ciphertext,
+                  last_seen_at = unixepoch()
+            """, arguments: [row.deviceID, row.ciphertext])
+        }
+    }
+
+    func listDevices() async throws -> [DeviceRow] {
+        try pool.read { db in
+            try Row.fetchAll(db, sql: "SELECT * FROM devices ORDER BY last_seen_at DESC")
+                .map { DeviceRow(deviceID: $0["device_id"],
+                                 ciphertext: $0["ciphertext"],
+                                 lastSeenAt: $0["last_seen_at"]) }
+        }
+    }
+
+    func getConfig(key: String) async throws -> String? {
+        try pool.read { db in
+            try String.fetchOne(db, sql: "SELECT value FROM config WHERE key = ?", arguments: [key])
+        }
+    }
+
+    func putConfigIfAbsent(key: String, value: String) async throws -> Bool {
+        try pool.write { db in
+            try db.execute(sql: "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
+                           arguments: [key, value])
+            return db.changesCount == 1
+        }
+    }
+
+    // Test-only direct insert for cursor / LWW tests where unixepoch() can't help.
+    func testDirectInsert(_ row: CloudRow) throws {
+        try pool.write { db in
+            try db.execute(sql: """
+                INSERT INTO clips (id, hmac, ciphertext, kind, blob_key, byte_size,
+                                   device_id, created_at, updated_at, deleted)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, arguments: [row.id, row.hmac, row.ciphertext, row.kind,
+                             row.blobKey, row.byteSize, row.deviceID,
+                             row.createdAt, row.updatedAt, row.deleted ? 1 : 0])
+        }
+    }
+
+    static func cloudRowFromRow(_ r: Row) -> CloudRow {
+        CloudRow(id: r["id"], hmac: r["hmac"], ciphertext: r["ciphertext"],
+                 kind: r["kind"], blobKey: r["blob_key"], byteSize: r["byte_size"],
+                 deviceID: r["device_id"], createdAt: r["created_at"],
+                 updatedAt: r["updated_at"], deleted: (r["deleted"] as Int64) != 0)
+    }
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+```bash
+swift test --filter ClipTests.LocalSqliteDataSourceTests
+```
+
+Expected: 4 tests pass.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add Sources/Clip/Sync/LocalSqliteDataSource.swift Tests/ClipTests/Sync/LocalSqliteDataSourceTests.swift
+git commit -m "sync: LocalSqliteDataSource — in-memory CloudSyncDataSource for tests"
+```
+
+---
+
+### Task 10: LocalDirBlobStore — filesystem CloudSyncBlobStore for tests
+
+**Files:**
+- Create: `Sources/Clip/Sync/LocalDirBlobStore.swift`
+- Create: `Tests/ClipTests/Sync/LocalDirBlobStoreTests.swift`
+
+- [ ] **Step 1: Write the failing test**
+
+```swift
+// Tests/ClipTests/Sync/LocalDirBlobStoreTests.swift
+import XCTest
+@testable import Clip
+
+final class LocalDirBlobStoreTests: XCTestCase {
     var dir: URL!
-    var backend: LocalDirBackend!
+    var store: LocalDirBlobStore!
 
     override func setUp() {
         super.setUp()
         dir = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("clip-test-\(UUID().uuidString)")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        backend = LocalDirBackend(root: dir)
+        store = LocalDirBlobStore(root: dir)
     }
     override func tearDown() {
         try? FileManager.default.removeItem(at: dir)
@@ -1321,39 +1629,19 @@ final class LocalDirBackendTests: XCTestCase {
 
     func testPutGetRoundTrip() async throws {
         let body = Data("hello".utf8)
-        let (etag, lm) = try await backend.put(key: "items/abc.bin", body: body, contentType: nil)
-        XCTAssertFalse(etag.isEmpty)
-        XCTAssertGreaterThan(lm, 0)
-        let got = try await backend.get(key: "items/abc.bin")
-        XCTAssertEqual(got, body)
+        try await store.putBlob(key: "blobs/abc.bin", body: body)
+        XCTAssertEqual(try await store.getBlob(key: "blobs/abc.bin"), body)
     }
 
-    func testGetMissing() async throws {
-        XCTAssertNil(try await backend.get(key: "nope.bin"))
-    }
-
-    func testHead() async throws {
-        let body = Data("xyz".utf8)
-        _ = try await backend.put(key: "k.bin", body: body, contentType: nil)
-        let meta = try XCTUnwrap(try await backend.head(key: "k.bin"))
-        XCTAssertEqual(meta.size, 3)
-        XCTAssertNil(try await backend.head(key: "missing.bin"))
+    func testGetMissingReturnsNil() async throws {
+        XCTAssertNil(try await store.getBlob(key: "nope.bin"))
     }
 
     func testDeleteIdempotent() async throws {
-        _ = try await backend.put(key: "d.bin", body: Data([0x01]), contentType: nil)
-        try await backend.delete(key: "d.bin")
-        try await backend.delete(key: "d.bin")  // again, must not throw
-        XCTAssertNil(try await backend.get(key: "d.bin"))
-    }
-
-    func testListByPrefix() async throws {
-        _ = try await backend.put(key: "items/a.bin", body: Data([0x01]), contentType: nil)
-        _ = try await backend.put(key: "items/b.bin", body: Data([0x02, 0x03]), contentType: nil)
-        _ = try await backend.put(key: "tomb/c.bin",  body: Data([0x04]), contentType: nil)
-        let page = try await backend.list(prefix: "items/", after: nil)
-        XCTAssertNil(page.nextCursor)
-        XCTAssertEqual(Set(page.objects.map(\.key)), ["items/a.bin", "items/b.bin"])
+        try await store.putBlob(key: "k.bin", body: Data([0x01]))
+        try await store.deleteBlob(key: "k.bin")
+        try await store.deleteBlob(key: "k.bin")  // again, must not throw
+        XCTAssertNil(try await store.getBlob(key: "k.bin"))
     }
 }
 ```
@@ -1361,25 +1649,18 @@ final class LocalDirBackendTests: XCTestCase {
 - [ ] **Step 2: Run test to verify it fails**
 
 ```bash
-swift test --filter ClipTests.LocalDirBackendTests
+swift test --filter ClipTests.LocalDirBlobStoreTests
 ```
 
-Expected: compile error ("no type LocalDirBackend").
-
-- [ ] **Step 3: Implement LocalDirBackend**
+- [ ] **Step 3: Implement LocalDirBlobStore**
 
 ```swift
-// Sources/Clip/Sync/LocalDirBackend.swift
+// Sources/Clip/Sync/LocalDirBlobStore.swift
 import Foundation
-import CryptoKit
 
-/// Filesystem-backed CloudSyncBackend used in unit / integration tests so
-/// the engine can be exercised without network. Each `key` becomes a
-/// nested file under `root`.
-///
-/// `etag` is computed as the hex MD5 of the body (matches what real R2
-/// returns for non-multipart uploads).
-final class LocalDirBackend: CloudSyncBackend, @unchecked Sendable {
+/// Filesystem-backed BlobStore. Each key becomes a nested file under `root`.
+/// Used in unit / integration tests so SyncEngine can run without network.
+final class LocalDirBlobStore: CloudSyncBlobStore, @unchecked Sendable {
     let root: URL
     init(root: URL) { self.root = root }
 
@@ -1387,67 +1668,24 @@ final class LocalDirBackend: CloudSyncBackend, @unchecked Sendable {
         root.appendingPathComponent(key)
     }
 
-    func put(key: String, body: Data, contentType _: String?) async throws -> (etag: String, lastModified: Int64) {
+    func putBlob(key: String, body: Data) async throws {
         let u = url(for: key)
         try FileManager.default.createDirectory(
             at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
         try body.write(to: u, options: .atomic)
-        let md5 = Insecure.MD5.hash(data: body)
-        let etag = md5.map { String(format: "%02x", $0) }.joined()
-        let lm = Int64(Date().timeIntervalSince1970)
-        return (etag, lm)
     }
 
-    func get(key: String) async throws -> Data? {
+    func getBlob(key: String) async throws -> Data? {
         let u = url(for: key)
         guard FileManager.default.fileExists(atPath: u.path) else { return nil }
         return try Data(contentsOf: u)
     }
 
-    func head(key: String) async throws -> CloudObjectMeta? {
-        let u = url(for: key)
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: u.path)
-        else { return nil }
-        let size = (attrs[.size] as? Int) ?? 0
-        let mtime = (attrs[.modificationDate] as? Date) ?? Date()
-        let body = (try? Data(contentsOf: u)) ?? Data()
-        let etag = Insecure.MD5.hash(data: body).map { String(format: "%02x", $0) }.joined()
-        return CloudObjectMeta(key: key, etag: etag,
-                               lastModified: Int64(mtime.timeIntervalSince1970),
-                               size: size)
-    }
-
-    func delete(key: String) async throws {
+    func deleteBlob(key: String) async throws {
         let u = url(for: key)
         if FileManager.default.fileExists(atPath: u.path) {
             try FileManager.default.removeItem(at: u)
         }
-    }
-
-    func list(prefix: String, after _: String?) async throws -> ListPage {
-        let prefixURL = root.appendingPathComponent(prefix)
-        guard let it = FileManager.default.enumerator(
-            at: prefixURL,
-            includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        ) else { return ListPage(objects: [], nextCursor: nil) }
-
-        var objects: [CloudObjectMeta] = []
-        for case let url as URL in it {
-            let v = try url.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey,
-                                                     .contentModificationDateKey])
-            if v.isDirectory ?? false { continue }
-            let key = String(url.path.dropFirst(root.path.count + 1))
-            let body = (try? Data(contentsOf: url)) ?? Data()
-            let etag = Insecure.MD5.hash(data: body).map { String(format: "%02x", $0) }.joined()
-            objects.append(CloudObjectMeta(
-                key: key,
-                etag: etag,
-                lastModified: Int64(v.contentModificationDate?.timeIntervalSince1970 ?? 0),
-                size: v.fileSize ?? 0))
-        }
-        // No pagination — local backend always returns everything.
-        return ListPage(objects: objects, nextCursor: nil)
     }
 }
 ```
@@ -1455,27 +1693,27 @@ final class LocalDirBackend: CloudSyncBackend, @unchecked Sendable {
 - [ ] **Step 4: Run test to verify it passes**
 
 ```bash
-swift test --filter ClipTests.LocalDirBackendTests
+swift test --filter ClipTests.LocalDirBlobStoreTests
 ```
 
-Expected: 5 tests pass.
+Expected: 3 tests pass.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add Sources/Clip/Sync/LocalDirBackend.swift Tests/ClipTests/Sync/LocalDirBackendTests.swift
-git commit -m "sync: LocalDirBackend — filesystem CloudSyncBackend for tests"
+git add Sources/Clip/Sync/LocalDirBlobStore.swift Tests/ClipTests/Sync/LocalDirBlobStoreTests.swift
+git commit -m "sync: LocalDirBlobStore — filesystem CloudSyncBlobStore for tests"
 ```
 
 ---
 
-### Task 10: S3SignerV4 — AWS Sig V4 implementation
+### Task 11: S3SignerV4 — AWS Sig V4 implementation
 
 **Files:**
 - Create: `Sources/Clip/Sync/S3SignerV4.swift`
 - Create: `Tests/ClipTests/Sync/S3SignerV4Tests.swift`
 
-The test pins one of AWS's official Sig V4 test vectors (`get-vanilla` from `aws4_testsuite`, with the canonical request hash and final signature pinned). This way we know the implementation is correct independent of any S3 round-trip.
+(Used only by R2BlobBackend; D1Backend uses Bearer auth.)
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1485,58 +1723,40 @@ import XCTest
 @testable import Clip
 
 final class S3SignerV4Tests: XCTestCase {
-    // Pinned from the AWS aws4_testsuite "get-vanilla" test vector,
-    // recomputed for service="s3" / region="us-east-1" / payload="UNSIGNED-PAYLOAD"
-    // with a known fixed date and creds. Independent of any real network call.
-    func testSignReturnsExpectedHeaders() {
-        let signer = S3SignerV4(
-            accessKeyID: "AKIDEXAMPLE",
-            secretAccessKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
-            region: "us-east-1",
-            service: "s3"
-        )
-        var req = URLRequest(url: URL(string: "https://example.com/")!)
-        req.httpMethod = "GET"
+    func testSignReturnsExpectedHeaderShape() {
+        let signer = S3SignerV4(accessKeyID: "AKIDEXAMPLE",
+                                secretAccessKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                                region: "auto", service: "s3")
+        var req = URLRequest(url: URL(string: "https://x.r2.cloudflarestorage.com/clip-sync/blobs/abc.bin")!)
+        req.httpMethod = "PUT"
+        let date = ISO8601DateFormatter().date(from: "2026-05-02T12:00:00Z")!
+        let signed = signer.sign(request: req, payloadSha256: "UNSIGNED-PAYLOAD", date: date)
 
-        let date = ISO8601DateFormatter().date(from: "2015-08-30T12:36:00Z")!
-        let result = signer.sign(request: req, payloadSha256: "UNSIGNED-PAYLOAD", date: date)
-
-        // We're not asserting the entire signature byte-for-byte (the AWS
-        // suite's reference signature is for SignedPayload, not UNSIGNED).
-        // We assert structure: required headers exist + parse correctly.
-        XCTAssertNotNil(result.value(forHTTPHeaderField: "Authorization"))
-        let auth = result.value(forHTTPHeaderField: "Authorization")!
-        XCTAssertTrue(auth.hasPrefix("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/s3/aws4_request"))
+        XCTAssertEqual(signed.value(forHTTPHeaderField: "x-amz-date"), "20260502T120000Z")
+        XCTAssertEqual(signed.value(forHTTPHeaderField: "x-amz-content-sha256"), "UNSIGNED-PAYLOAD")
+        let auth = try XCTUnwrap(signed.value(forHTTPHeaderField: "Authorization"))
+        XCTAssertTrue(auth.hasPrefix("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260502/auto/s3/aws4_request"))
         XCTAssertTrue(auth.contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date"))
         XCTAssertTrue(auth.contains("Signature="))
-        XCTAssertEqual(result.value(forHTTPHeaderField: "x-amz-date"), "20150830T123600Z")
-        XCTAssertEqual(result.value(forHTTPHeaderField: "x-amz-content-sha256"), "UNSIGNED-PAYLOAD")
     }
 
     func testSignaturesDifferByDate() {
-        let s = S3SignerV4(accessKeyID: "AK", secretAccessKey: "SK",
-                           region: "auto", service: "s3")
-        let req = URLRequest(url: URL(string: "https://x.r2.cloudflarestorage.com/b/k")!)
-        let date1 = Date(timeIntervalSince1970: 1_700_000_000)
-        let date2 = Date(timeIntervalSince1970: 1_700_000_001)
-        let r1 = s.sign(request: req, payloadSha256: "UNSIGNED-PAYLOAD", date: date1)
-        let r2 = s.sign(request: req, payloadSha256: "UNSIGNED-PAYLOAD", date: date2)
+        let s = S3SignerV4(accessKeyID: "AK", secretAccessKey: "SK", region: "auto", service: "s3")
+        let req = URLRequest(url: URL(string: "https://x/k")!)
+        let r1 = s.sign(request: req, payloadSha256: "UNSIGNED-PAYLOAD",
+                        date: Date(timeIntervalSince1970: 1_700_000_000))
+        let r2 = s.sign(request: req, payloadSha256: "UNSIGNED-PAYLOAD",
+                        date: Date(timeIntervalSince1970: 1_700_000_001))
         XCTAssertNotEqual(r1.value(forHTTPHeaderField: "Authorization"),
                           r2.value(forHTTPHeaderField: "Authorization"))
     }
 
-    func testCanonicalUriEncoding() {
-        // /items/abc.bin should NOT have its / encoded.
-        let s = S3SignerV4(accessKeyID: "AK", secretAccessKey: "SK",
-                           region: "auto", service: "s3")
-        let url = URL(string: "https://x.r2.cloudflarestorage.com/clip-sync/items/abc.bin")!
-        let req = URLRequest(url: url)
-        let signed = s.sign(request: req, payloadSha256: "UNSIGNED-PAYLOAD", date: Date())
-        // the signing process internally must use "/clip-sync/items/abc.bin"
-        // (slashes intact) — if it didn't, the signature would be invalid
-        // server-side. We can't easily assert that without parsing the
-        // canonical request, so we sanity check the URL is preserved.
-        XCTAssertEqual(signed.url?.path, "/clip-sync/items/abc.bin")
+    func testCanonicalUriPreservesSlashes() {
+        let s = S3SignerV4(accessKeyID: "AK", secretAccessKey: "SK", region: "auto", service: "s3")
+        let url = URL(string: "https://x.r2.cloudflarestorage.com/clip-sync/blobs/abc.bin")!
+        let signed = s.sign(request: URLRequest(url: url),
+                            payloadSha256: "UNSIGNED-PAYLOAD", date: Date())
+        XCTAssertEqual(signed.url?.path, "/clip-sync/blobs/abc.bin")
     }
 }
 ```
@@ -1546,8 +1766,6 @@ final class S3SignerV4Tests: XCTestCase {
 ```bash
 swift test --filter ClipTests.S3SignerV4Tests
 ```
-
-Expected: compile error.
 
 - [ ] **Step 3: Implement S3SignerV4**
 
@@ -1562,30 +1780,23 @@ import CryptoKit
 struct S3SignerV4: Sendable {
     let accessKeyID: String
     let secretAccessKey: String
-    let region: String              // R2: "auto"; AWS examples: "us-east-1"
-    let service: String             // "s3"
+    let region: String
+    let service: String
 
-    /// Returns a copy of `request` with `Authorization`, `x-amz-date`, and
-    /// `x-amz-content-sha256` headers set. `payloadSha256` is the literal
-    /// string `"UNSIGNED-PAYLOAD"` for v3 use; could be a real hex digest
-    /// if a future caller wants signed payloads.
     func sign(request: URLRequest, payloadSha256: String, date: Date = Date()) -> URLRequest {
         var req = request
-
-        let amzDate = Self.amzDateFormatter.string(from: date)         // "20150830T123600Z"
-        let dateStamp = String(amzDate.prefix(8))                      // "20150830"
+        let amzDate = Self.amzDateFormatter.string(from: date)
+        let dateStamp = String(amzDate.prefix(8))
 
         req.setValue(amzDate, forHTTPHeaderField: "x-amz-date")
         req.setValue(payloadSha256, forHTTPHeaderField: "x-amz-content-sha256")
 
-        // Canonical request --------------------------------------------------
         let method = req.httpMethod ?? "GET"
         let url = req.url!
         let canonicalURI = url.path.isEmpty ? "/" : url.path
         let canonicalQuery = Self.canonicalQuery(url: url)
-
-        // Build sorted host; x-amz-content-sha256; x-amz-date headers.
         let host = url.host ?? ""
+
         let headerPairs: [(String, String)] = [
             ("host", host),
             ("x-amz-content-sha256", payloadSha256),
@@ -1595,25 +1806,15 @@ struct S3SignerV4: Sendable {
         let signedHeaders = headerPairs.map { $0.0 }.joined(separator: ";")
 
         let canonicalRequest = [
-            method,
-            canonicalURI,
-            canonicalQuery,
-            canonicalHeaders,
-            signedHeaders,
-            payloadSha256,
+            method, canonicalURI, canonicalQuery,
+            canonicalHeaders, signedHeaders, payloadSha256,
         ].joined(separator: "\n")
 
-        // String to sign -----------------------------------------------------
         let credentialScope = "\(dateStamp)/\(region)/\(service)/aws4_request"
         let crSha = Self.sha256Hex(Data(canonicalRequest.utf8))
-        let stringToSign = [
-            "AWS4-HMAC-SHA256",
-            amzDate,
-            credentialScope,
-            crSha,
-        ].joined(separator: "\n")
+        let stringToSign = ["AWS4-HMAC-SHA256", amzDate, credentialScope, crSha]
+            .joined(separator: "\n")
 
-        // Signing key --------------------------------------------------------
         let kDate    = Self.hmac(key: Data("AWS4\(secretAccessKey)".utf8), data: Data(dateStamp.utf8))
         let kRegion  = Self.hmac(key: kDate, data: Data(region.utf8))
         let kService = Self.hmac(key: kRegion, data: Data(service.utf8))
@@ -1621,15 +1822,13 @@ struct S3SignerV4: Sendable {
         let signature = Self.hmac(key: kSigning, data: Data(stringToSign.utf8))
             .map { String(format: "%02x", $0) }.joined()
 
-        let auth = "AWS4-HMAC-SHA256 " +
-            "Credential=\(accessKeyID)/\(credentialScope), " +
-            "SignedHeaders=\(signedHeaders), " +
-            "Signature=\(signature)"
-        req.setValue(auth, forHTTPHeaderField: "Authorization")
+        req.setValue("AWS4-HMAC-SHA256 " +
+                     "Credential=\(accessKeyID)/\(credentialScope), " +
+                     "SignedHeaders=\(signedHeaders), " +
+                     "Signature=\(signature)",
+                     forHTTPHeaderField: "Authorization")
         return req
     }
-
-    // MARK: - helpers
 
     private static let amzDateFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -1642,15 +1841,11 @@ struct S3SignerV4: Sendable {
     private static func canonicalQuery(url: URL) -> String {
         let comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
         let items = comps?.queryItems ?? []
-        // Sort by name, then percent-encode each name+value per RFC 3986.
         return items.sorted(by: { $0.name < $1.name }).map { item in
-            let n = Self.rfc3986Encode(item.name)
-            let v = Self.rfc3986Encode(item.value ?? "")
-            return "\(n)=\(v)"
+            "\(rfc3986Encode(item.name))=\(rfc3986Encode(item.value ?? ""))"
         }.joined(separator: "&")
     }
 
-    /// RFC 3986 unreserved chars only: A–Z a–z 0–9 - _ . ~
     private static let unreserved: CharacterSet = {
         var s = CharacterSet()
         s.insert(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~")
@@ -1659,14 +1854,11 @@ struct S3SignerV4: Sendable {
     static func rfc3986Encode(_ s: String) -> String {
         s.addingPercentEncoding(withAllowedCharacters: unreserved) ?? s
     }
-
     private static func sha256Hex(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
-
     private static func hmac(key: Data, data: Data) -> Data {
-        let mac = HMAC<SHA256>.authenticationCode(for: data, using: SymmetricKey(data: key))
-        return Data(mac)
+        Data(HMAC<SHA256>.authenticationCode(for: data, using: SymmetricKey(data: key)))
     }
 }
 ```
@@ -1688,21 +1880,19 @@ git commit -m "sync: S3SignerV4 — pure-Swift AWS Sig V4 (UNSIGNED-PAYLOAD mode
 
 ---
 
-### Task 11: R2Backend — URLSession + S3SignerV4
+### Task 12: R2BlobBackend — URLSession + S3SignerV4 (PUT/GET/DELETE only)
 
 **Files:**
-- Create: `Sources/Clip/Sync/R2Backend.swift`
-- Create: `Tests/ClipTests/Sync/R2BackendTests.swift` (no real network — uses `URLProtocol` stub to verify correct request shape)
+- Create: `Sources/Clip/Sync/R2BlobBackend.swift`
+- Create: `Tests/ClipTests/Sync/R2BlobBackendTests.swift`
 
 - [ ] **Step 1: Write the failing test**
 
 ```swift
-// Tests/ClipTests/Sync/R2BackendTests.swift
+// Tests/ClipTests/Sync/R2BlobBackendTests.swift
 import XCTest
 @testable import Clip
 
-/// Stub URLProtocol that captures requests and returns canned responses.
-/// Lets us verify R2Backend builds the right URLs/headers without network.
 final class StubProto: URLProtocol {
     nonisolated(unsafe) static var handler: ((URLRequest) -> (HTTPURLResponse, Data?))?
     override class func canInit(with _: URLRequest) -> Bool { true }
@@ -1717,22 +1907,18 @@ final class StubProto: URLProtocol {
     override func stopLoading() {}
 }
 
-final class R2BackendTests: XCTestCase {
+final class R2BlobBackendTests: XCTestCase {
     var session: URLSession!
-
     override func setUp() {
         super.setUp()
         let cfg = URLSessionConfiguration.ephemeral
         cfg.protocolClasses = [StubProto.self]
         session = URLSession(configuration: cfg)
     }
-    override func tearDown() {
-        StubProto.handler = nil
-        super.tearDown()
-    }
+    override func tearDown() { StubProto.handler = nil; super.tearDown() }
 
-    func makeBackend() -> R2Backend {
-        R2Backend(
+    func makeBackend() -> R2BlobBackend {
+        R2BlobBackend(
             endpoint: URL(string: "https://account.r2.cloudflarestorage.com")!,
             bucket: "clip-sync",
             accessKeyID: "AK",
@@ -1744,56 +1930,39 @@ final class R2BackendTests: XCTestCase {
         var captured: URLRequest?
         StubProto.handler = { req in
             captured = req
-            let r = HTTPURLResponse(
-                url: req.url!,
-                statusCode: 200,
-                httpVersion: "HTTP/1.1",
-                headerFields: ["ETag": "\"deadbeef\"",
-                               "Last-Modified": "Wed, 21 Oct 2015 07:28:00 GMT"])!
-            return (r, nil)
+            return (HTTPURLResponse(url: req.url!, statusCode: 200,
+                                    httpVersion: nil, headerFields: nil)!, nil)
         }
-        let backend = makeBackend()
-        let (etag, lm) = try await backend.put(
-            key: "items/abc.bin", body: Data([0xAA]), contentType: "application/octet-stream")
-
-        XCTAssertEqual(etag, "deadbeef", "ETag quotes stripped")
-        XCTAssertGreaterThan(lm, 0)
-
+        try await makeBackend().putBlob(key: "blobs/abc.bin", body: Data([0xAA]))
         let req = try XCTUnwrap(captured)
         XCTAssertEqual(req.httpMethod, "PUT")
         XCTAssertEqual(req.url?.absoluteString,
-                       "https://account.r2.cloudflarestorage.com/clip-sync/items/abc.bin")
+                       "https://account.r2.cloudflarestorage.com/clip-sync/blobs/abc.bin")
         XCTAssertNotNil(req.value(forHTTPHeaderField: "Authorization"))
-        XCTAssertEqual(req.value(forHTTPHeaderField: "x-amz-content-sha256"), "UNSIGNED-PAYLOAD")
     }
 
     func testGetReturnsBodyOn200() async throws {
         StubProto.handler = { req in
-            let r = HTTPURLResponse(url: req.url!, statusCode: 200,
-                                    httpVersion: nil, headerFields: nil)!
-            return (r, Data("payload".utf8))
+            (HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+             Data("payload".utf8))
         }
-        let body = try await makeBackend().get(key: "k.bin")
+        let body = try await makeBackend().getBlob(key: "k.bin")
         XCTAssertEqual(body, Data("payload".utf8))
     }
 
     func testGetReturnsNilOn404() async throws {
         StubProto.handler = { req in
-            let r = HTTPURLResponse(url: req.url!, statusCode: 404,
-                                    httpVersion: nil, headerFields: nil)!
-            return (r, nil)
+            (HTTPURLResponse(url: req.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!, nil)
         }
-        XCTAssertNil(try await makeBackend().get(key: "missing.bin"))
+        XCTAssertNil(try await makeBackend().getBlob(key: "missing.bin"))
     }
 
-    func testDeleteOk() async throws {
+    func testDeleteIdempotentOn404() async throws {
         StubProto.handler = { req in
             XCTAssertEqual(req.httpMethod, "DELETE")
-            let r = HTTPURLResponse(url: req.url!, statusCode: 204,
-                                    httpVersion: nil, headerFields: nil)!
-            return (r, nil)
+            return (HTTPURLResponse(url: req.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!, nil)
         }
-        try await makeBackend().delete(key: "x.bin")  // no throw
+        try await makeBackend().deleteBlob(key: "x.bin")  // no throw on 404
     }
 }
 ```
@@ -1801,26 +1970,24 @@ final class R2BackendTests: XCTestCase {
 - [ ] **Step 2: Run test to verify it fails**
 
 ```bash
-swift test --filter ClipTests.R2BackendTests
+swift test --filter ClipTests.R2BlobBackendTests
 ```
 
-Expected: compile error.
-
-- [ ] **Step 3: Implement R2Backend**
+- [ ] **Step 3: Implement R2BlobBackend**
 
 ```swift
-// Sources/Clip/Sync/R2Backend.swift
+// Sources/Clip/Sync/R2BlobBackend.swift
 import Foundation
 
-/// CloudSyncBackend implementation against Cloudflare R2 over the S3 API.
-/// Pure Foundation + S3SignerV4. No third-party SDK.
-final class R2Backend: CloudSyncBackend, @unchecked Sendable {
+/// CloudSyncBlobStore implementation against Cloudflare R2 over the S3 API.
+/// Only PUT / GET / DELETE blobs/<key>. No list / no head — D1 row drives
+/// "what blobs exist".
+final class R2BlobBackend: CloudSyncBlobStore, @unchecked Sendable {
     enum Error: Swift.Error {
         case http(status: Int, body: String)
-        case missingHeader(String)
     }
 
-    let endpoint: URL              // e.g. https://account.r2.cloudflarestorage.com
+    let endpoint: URL
     let bucket: String
     let signer: S3SignerV4
     let session: URLSession
@@ -1836,19 +2003,14 @@ final class R2Backend: CloudSyncBackend, @unchecked Sendable {
     }
 
     private func url(for key: String) -> URL {
-        // Path-style: https://endpoint/bucket/key
         endpoint.appendingPathComponent(bucket).appendingPathComponent(key)
     }
 
-    // MARK: - put
-
-    func put(key: String, body: Data, contentType: String?) async throws -> (etag: String, lastModified: Int64) {
+    func putBlob(key: String, body: Data) async throws {
         var req = URLRequest(url: url(for: key))
         req.httpMethod = "PUT"
         req.httpBody = body
-        if let contentType {
-            req.setValue(contentType, forHTTPHeaderField: "Content-Type")
-        }
+        req.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         req.setValue("\(body.count)", forHTTPHeaderField: "Content-Length")
         let signed = signer.sign(request: req, payloadSha256: "UNSIGNED-PAYLOAD")
         let (data, resp) = try await session.data(for: signed)
@@ -1857,18 +2019,9 @@ final class R2Backend: CloudSyncBackend, @unchecked Sendable {
             throw Error.http(status: http.statusCode,
                              body: String(data: data, encoding: .utf8) ?? "")
         }
-        guard let rawEtag = http.value(forHTTPHeaderField: "ETag") else {
-            throw Error.missingHeader("ETag")
-        }
-        let etag = rawEtag.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-        let lm = Self.parseHttpDate(http.value(forHTTPHeaderField: "Last-Modified"))
-            ?? Int64(Date().timeIntervalSince1970)
-        return (etag, lm)
     }
 
-    // MARK: - get
-
-    func get(key: String) async throws -> Data? {
+    func getBlob(key: String) async throws -> Data? {
         var req = URLRequest(url: url(for: key))
         req.httpMethod = "GET"
         let signed = signer.sign(request: req, payloadSha256: "UNSIGNED-PAYLOAD")
@@ -1882,128 +2035,17 @@ final class R2Backend: CloudSyncBackend, @unchecked Sendable {
         return data
     }
 
-    // MARK: - head
-
-    func head(key: String) async throws -> CloudObjectMeta? {
-        var req = URLRequest(url: url(for: key))
-        req.httpMethod = "HEAD"
-        let signed = signer.sign(request: req, payloadSha256: "UNSIGNED-PAYLOAD")
-        let (_, resp) = try await session.data(for: signed)
-        let http = resp as! HTTPURLResponse
-        if http.statusCode == 404 { return nil }
-        guard (200..<300).contains(http.statusCode) else {
-            throw Error.http(status: http.statusCode, body: "")
-        }
-        let etag = (http.value(forHTTPHeaderField: "ETag") ?? "")
-            .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-        let lm = Self.parseHttpDate(http.value(forHTTPHeaderField: "Last-Modified"))
-            ?? Int64(Date().timeIntervalSince1970)
-        let size = Int(http.value(forHTTPHeaderField: "Content-Length") ?? "0") ?? 0
-        return CloudObjectMeta(key: key, etag: etag, lastModified: lm, size: size)
-    }
-
-    // MARK: - delete
-
-    func delete(key: String) async throws {
+    func deleteBlob(key: String) async throws {
         var req = URLRequest(url: url(for: key))
         req.httpMethod = "DELETE"
         let signed = signer.sign(request: req, payloadSha256: "UNSIGNED-PAYLOAD")
         let (data, resp) = try await session.data(for: signed)
         let http = resp as! HTTPURLResponse
-        // 204 No Content is the normal success; 404 is OK (idempotent).
         if http.statusCode == 404 { return }
         guard (200..<300).contains(http.statusCode) else {
             throw Error.http(status: http.statusCode,
                              body: String(data: data, encoding: .utf8) ?? "")
         }
-    }
-
-    // MARK: - list
-
-    func list(prefix: String, after cursor: String?) async throws -> ListPage {
-        var comps = URLComponents(url: endpoint.appendingPathComponent(bucket),
-                                  resolvingAgainstBaseURL: false)!
-        var q = [URLQueryItem(name: "list-type", value: "2"),
-                 URLQueryItem(name: "prefix", value: prefix),
-                 URLQueryItem(name: "max-keys", value: "1000")]
-        if let cursor { q.append(URLQueryItem(name: "continuation-token", value: cursor)) }
-        comps.queryItems = q
-        var req = URLRequest(url: comps.url!)
-        req.httpMethod = "GET"
-        let signed = signer.sign(request: req, payloadSha256: "UNSIGNED-PAYLOAD")
-        let (data, resp) = try await session.data(for: signed)
-        let http = resp as! HTTPURLResponse
-        guard (200..<300).contains(http.statusCode) else {
-            throw Error.http(status: http.statusCode,
-                             body: String(data: data, encoding: .utf8) ?? "")
-        }
-        return Self.parseListV2(data)
-    }
-
-    /// Minimal XML parser for ListBucketResult. Extracts the fields we
-    /// need (Key, ETag, LastModified, Size) plus the IsTruncated /
-    /// NextContinuationToken pagination fields.
-    static func parseListV2(_ xml: Data) -> ListPage {
-        let parser = ListV2Parser()
-        let p = XMLParser(data: xml)
-        p.delegate = parser
-        p.parse()
-        return ListPage(objects: parser.objects, nextCursor: parser.nextCursor)
-    }
-
-    private final class ListV2Parser: NSObject, XMLParserDelegate {
-        var objects: [CloudObjectMeta] = []
-        var nextCursor: String?
-        private var element = ""
-        private var key = ""; private var etag = ""; private var size = 0; private var lm: Int64 = 0
-        private var inContents = false; private var truncated = false
-
-        func parser(_ p: XMLParser, didStartElement n: String, namespaceURI: String?,
-                    qualifiedName q: String?, attributes a: [String : String] = [:]) {
-            element = n
-            if n == "Contents" {
-                inContents = true
-                key = ""; etag = ""; size = 0; lm = 0
-            }
-        }
-        func parser(_ p: XMLParser, foundCharacters s: String) {
-            switch element {
-            case "Key" where inContents: key += s
-            case "ETag" where inContents: etag += s
-            case "Size" where inContents: size = (Int(size.description + s) ?? size)
-            case "LastModified" where inContents:
-                let f = ISO8601DateFormatter()
-                f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-                if let d = f.date(from: s) { lm = Int64(d.timeIntervalSince1970) }
-            case "IsTruncated": truncated = (s.trimmingCharacters(in: .whitespaces) == "true")
-            case "NextContinuationToken":
-                nextCursor = (nextCursor ?? "") + s
-            default: break
-            }
-        }
-        func parser(_ p: XMLParser, didEndElement n: String, namespaceURI: String?,
-                    qualifiedName q: String?) {
-            if n == "Contents" {
-                let cleanEtag = etag.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-                objects.append(CloudObjectMeta(key: key, etag: cleanEtag,
-                                               lastModified: lm, size: size))
-                inContents = false
-            }
-            element = ""
-        }
-    }
-
-    private static let httpDateFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.timeZone = TimeZone(identifier: "GMT")
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
-        return f
-    }()
-
-    static func parseHttpDate(_ s: String?) -> Int64? {
-        guard let s, let d = httpDateFormatter.date(from: s) else { return nil }
-        return Int64(d.timeIntervalSince1970)
     }
 }
 ```
@@ -2011,7 +2053,7 @@ final class R2Backend: CloudSyncBackend, @unchecked Sendable {
 - [ ] **Step 4: Run test to verify it passes**
 
 ```bash
-swift test --filter ClipTests.R2BackendTests
+swift test --filter ClipTests.R2BlobBackendTests
 ```
 
 Expected: 4 tests pass.
@@ -2019,15 +2061,440 @@ Expected: 4 tests pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add Sources/Clip/Sync/R2Backend.swift Tests/ClipTests/Sync/R2BackendTests.swift
-git commit -m "sync: R2Backend — URLSession + Sig V4, S3 ListV2 XML parser"
+git add Sources/Clip/Sync/R2BlobBackend.swift Tests/ClipTests/Sync/R2BlobBackendTests.swift
+git commit -m "sync: R2BlobBackend — PUT/GET/DELETE blobs only via Sig V4"
+```
+
+---
+
+### Task 13: D1Backend — Cloudflare REST API client
+
+**Files:**
+- Create: `Sources/Clip/Sync/D1Backend.swift`
+- Create: `Tests/ClipTests/Sync/D1BackendTests.swift`
+
+This is the **biggest task in P2**. Implements all `CloudSyncDataSource` methods over Cloudflare's D1 REST API. Uses Bearer auth (no Sig V4). Bakes in fixes A (composite cursor SQL), B (hmac dedup includes deleted=1), C (INSERT OR IGNORE), E (schema_version row in ensureSchema).
+
+- [ ] **Step 1: Write the failing test**
+
+```swift
+// Tests/ClipTests/Sync/D1BackendTests.swift
+import XCTest
+@testable import Clip
+
+final class D1BackendTests: XCTestCase {
+    var session: URLSession!
+    override func setUp() {
+        super.setUp()
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [StubProto.self]
+        session = URLSession(configuration: cfg)
+    }
+    override func tearDown() { StubProto.handler = nil; super.tearDown() }
+
+    func makeBackend() -> D1Backend {
+        D1Backend(accountID: "acct", databaseID: "db",
+                  apiToken: "tok", session: session)
+    }
+
+    /// Helper: wrap a SQL response in the D1 REST envelope.
+    func wrapResults(_ rows: [[String: Any]], rowsWritten: Int = 0) -> Data {
+        let env: [String: Any] = [
+            "result": [[
+                "results": rows,
+                "success": true,
+                "meta": ["rows_read": rows.count, "rows_written": rowsWritten,
+                         "changes": rowsWritten, "last_row_id": 0]
+            ]],
+            "errors": [], "messages": [], "success": true
+        ]
+        return try! JSONSerialization.data(withJSONObject: env)
+    }
+
+    func testQueryClipByHmacReturnsDeleted() async throws {
+        StubProto.handler = { req in
+            let body = self.wrapResults([["id": "uuid1", "deleted": 1]])
+            return (HTTPURLResponse(url: req.url!, statusCode: 200,
+                                    httpVersion: nil, headerFields: nil)!, body)
+        }
+        let r = try await makeBackend().queryClipByHmac("hmac1")
+        XCTAssertEqual(r?.id, "uuid1")
+        XCTAssertEqual(r?.deleted, true)
+    }
+
+    func testQueryClipByHmacReturnsNilOnEmpty() async throws {
+        StubProto.handler = { req in
+            (HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+             self.wrapResults([]))
+        }
+        XCTAssertNil(try await makeBackend().queryClipByHmac("nope"))
+    }
+
+    func testUpsertClipReturnsServerUpdatedAt() async throws {
+        var captured: URLRequest?
+        var body: Data?
+        StubProto.handler = { req in
+            captured = req
+            // Capture sent body for assertions
+            if let s = req.httpBodyStream {
+                let buf = NSMutableData()
+                s.open(); defer { s.close() }
+                var b = [UInt8](repeating: 0, count: 4096)
+                while s.hasBytesAvailable {
+                    let n = s.read(&b, maxLength: b.count)
+                    if n > 0 { buf.append(b, length: n) }
+                    if n <= 0 { break }
+                }
+                body = buf as Data
+            } else { body = req.httpBody }
+            return (HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                    self.wrapResults([["updated_at": 12345]], rowsWritten: 1))
+        }
+        let row = CloudRow(id: "id1", hmac: "h1", ciphertext: Data([0x01]),
+                           kind: "text", blobKey: nil, byteSize: 5,
+                           deviceID: "DEV", createdAt: 100, updatedAt: 0,
+                           deleted: false)
+        let updated = try await makeBackend().upsertClip(row)
+        XCTAssertEqual(updated, 12345)
+        XCTAssertEqual(captured?.httpMethod, "POST")
+        XCTAssertTrue(captured?.url?.absoluteString.contains("/d1/database/db/query") ?? false)
+        XCTAssertEqual(captured?.value(forHTTPHeaderField: "Authorization"), "Bearer tok")
+        // Body must reference INSERT ... ON CONFLICT and unixepoch()
+        let s = String(data: body ?? Data(), encoding: .utf8) ?? ""
+        XCTAssertTrue(s.contains("INSERT INTO clips"))
+        XCTAssertTrue(s.contains("ON CONFLICT(id)"))
+        XCTAssertTrue(s.contains("unixepoch()"))
+    }
+
+    func testQueryClipsChangedSinceCompositeCursorSQL() async throws {
+        var bodyStr = ""
+        StubProto.handler = { req in
+            if let b = req.httpBody {
+                bodyStr = String(data: b, encoding: .utf8) ?? ""
+            } else if let s = req.httpBodyStream {
+                let buf = NSMutableData()
+                s.open(); defer { s.close() }
+                var b = [UInt8](repeating: 0, count: 4096)
+                while s.hasBytesAvailable {
+                    let n = s.read(&b, maxLength: b.count)
+                    if n > 0 { buf.append(b, length: n) }
+                    if n <= 0 { break }
+                }
+                bodyStr = String(data: buf as Data, encoding: .utf8) ?? ""
+            }
+            return (HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                    self.wrapResults([]))
+        }
+        _ = try await makeBackend().queryClipsChangedSince(
+            cursor: CloudCursor(updatedAt: 100, id: "abc"), limit: 50)
+        // SQL must contain composite WHERE (fix A) + ORDER BY updated_at, id
+        XCTAssertTrue(bodyStr.contains("WHERE updated_at > "))
+        XCTAssertTrue(bodyStr.contains("OR (updated_at = "))
+        XCTAssertTrue(bodyStr.contains("ORDER BY updated_at, id"))
+    }
+
+    func testPutConfigIfAbsentReportsRowsWritten() async throws {
+        StubProto.handler = { req in
+            (HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+             self.wrapResults([], rowsWritten: 1))
+        }
+        let won = try await makeBackend().putConfigIfAbsent(key: "k", value: "v")
+        XCTAssertTrue(won)
+    }
+
+    func testPutConfigIfAbsentReportsExisting() async throws {
+        StubProto.handler = { req in
+            (HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+             self.wrapResults([], rowsWritten: 0))
+        }
+        let won = try await makeBackend().putConfigIfAbsent(key: "k", value: "v")
+        XCTAssertFalse(won)
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+```bash
+swift test --filter ClipTests.D1BackendTests
+```
+
+- [ ] **Step 3: Implement D1Backend**
+
+```swift
+// Sources/Clip/Sync/D1Backend.swift
+import Foundation
+
+/// CloudSyncDataSource implementation over the Cloudflare D1 REST API.
+/// All requests: POST {accountID}/d1/database/{databaseID}/query with
+/// Bearer auth. SQL is sent as JSON body { sql, params }.
+///
+/// Bakes in fixes A (composite cursor SQL), B (hmac dedup includes deleted=1),
+/// C (INSERT OR IGNORE on config), E (schema_version row in ensureSchema).
+final class D1Backend: CloudSyncDataSource, @unchecked Sendable {
+    enum Error: Swift.Error {
+        case http(status: Int, body: String)
+        case d1(messages: [String])
+        case decode(String)
+    }
+
+    let accountID: String
+    let databaseID: String
+    let apiToken: String
+    let session: URLSession
+
+    init(accountID: String, databaseID: String, apiToken: String,
+         session: URLSession = .shared) {
+        self.accountID = accountID
+        self.databaseID = databaseID
+        self.apiToken = apiToken
+        self.session = session
+    }
+
+    private var endpoint: URL {
+        URL(string: "https://api.cloudflare.com/client/v4/accounts/\(accountID)/d1/database/\(databaseID)/query")!
+    }
+
+    // MARK: - Generic SQL execution
+
+    private struct ResultEnvelope: Decodable {
+        struct Inner: Decodable {
+            var results: [[String: AnyCodable]]?
+            var success: Bool
+            var meta: Meta?
+        }
+        struct Meta: Decodable {
+            var rows_read: Int?
+            var rows_written: Int?
+            var changes: Int?
+            var last_row_id: Int?
+        }
+        struct ApiMessage: Decodable { var code: Int?; var message: String? }
+        var result: [Inner]?
+        var success: Bool
+        var errors: [ApiMessage]?
+        var messages: [ApiMessage]?
+    }
+
+    // Minimal Codable-any for deserializing result rows
+    struct AnyCodable: Decodable {
+        let value: Any?
+        init(from decoder: Decoder) throws {
+            let c = try decoder.singleValueContainer()
+            if c.decodeNil() { value = nil; return }
+            if let i = try? c.decode(Int64.self) { value = i; return }
+            if let d = try? c.decode(Double.self) { value = d; return }
+            if let s = try? c.decode(String.self) { value = s; return }
+            if let b = try? c.decode(Bool.self) { value = b; return }
+            value = nil
+        }
+    }
+
+    private func runSQL(_ sql: String, params: [Any?] = []) async throws -> ResultEnvelope.Inner {
+        var req = URLRequest(url: endpoint)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(apiToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: Any] = [
+            "sql": sql,
+            "params": params.map { $0 ?? NSNull() }
+        ]
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, resp) = try await session.data(for: req)
+        let http = resp as! HTTPURLResponse
+        guard (200..<300).contains(http.statusCode) else {
+            throw Error.http(status: http.statusCode,
+                             body: String(data: data, encoding: .utf8) ?? "")
+        }
+        let env = try JSONDecoder().decode(ResultEnvelope.self, from: data)
+        guard env.success, let inner = env.result?.first else {
+            let msgs = (env.errors ?? []).compactMap(\.message)
+            throw Error.d1(messages: msgs)
+        }
+        return inner
+    }
+
+    // MARK: - ensureSchema (fix C + fix E)
+
+    func ensureSchema() async throws {
+        let stmts = [
+            """
+            CREATE TABLE IF NOT EXISTS clips (
+                id           TEXT PRIMARY KEY,
+                hmac         TEXT NOT NULL,
+                ciphertext   BLOB NOT NULL,
+                kind         TEXT NOT NULL,
+                blob_key     TEXT,
+                byte_size    INTEGER NOT NULL,
+                device_id    TEXT NOT NULL,
+                created_at   INTEGER NOT NULL,
+                updated_at   INTEGER NOT NULL,
+                deleted      INTEGER NOT NULL DEFAULT 0
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_clips_updated_at ON clips(updated_at)",
+            "CREATE INDEX IF NOT EXISTS idx_clips_hmac ON clips(hmac)",
+            """
+            CREATE TABLE IF NOT EXISTS devices (
+                device_id    TEXT PRIMARY KEY,
+                ciphertext   BLOB NOT NULL,
+                last_seen_at INTEGER NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS config (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """,
+        ]
+        for s in stmts { _ = try await runSQL(s) }
+        // schema_version stamp (fix E). INSERT OR IGNORE: only first device sets it.
+        _ = try await runSQL(
+            "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
+            params: ["schema_version", "3"])
+    }
+
+    // MARK: - Clips
+
+    func upsertClip(_ row: CloudRow) async throws -> Int64 {
+        // INSERT/UPDATE in one round trip; RETURNING-style follow-up SELECT
+        // because D1 REST doesn't expose RETURNING values.
+        _ = try await runSQL("""
+            INSERT INTO clips (id, hmac, ciphertext, kind, blob_key, byte_size,
+                               device_id, created_at, updated_at, deleted)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch(), 0)
+            ON CONFLICT(id) DO UPDATE SET
+              hmac=excluded.hmac, ciphertext=excluded.ciphertext,
+              kind=excluded.kind, blob_key=excluded.blob_key,
+              byte_size=excluded.byte_size, device_id=excluded.device_id,
+              updated_at=unixepoch(), deleted=0
+            """,
+            params: [row.id, row.hmac, row.ciphertext.base64EncodedString(),
+                     row.kind, row.blobKey, row.byteSize,
+                     row.deviceID, row.createdAt])
+        let inner = try await runSQL(
+            "SELECT updated_at FROM clips WHERE id = ?", params: [row.id])
+        let n = (inner.results?.first?["updated_at"]?.value as? Int64) ?? 0
+        return n
+    }
+
+    func queryClipByHmac(_ hmac: String) async throws -> (id: String, deleted: Bool)? {
+        // Fix B: do NOT filter deleted=0 here.
+        let inner = try await runSQL(
+            "SELECT id, deleted FROM clips WHERE hmac = ? LIMIT 1", params: [hmac])
+        guard let row = inner.results?.first else { return nil }
+        let id = (row["id"]?.value as? String) ?? ""
+        let del = ((row["deleted"]?.value as? Int64) ?? 0) != 0
+        return (id, del)
+    }
+
+    func queryClipsChangedSince(cursor: CloudCursor, limit: Int) async throws -> [CloudRow] {
+        // Fix A: composite (updated_at, id) cursor.
+        let inner = try await runSQL("""
+            SELECT id, hmac, ciphertext, kind, blob_key, byte_size,
+                   device_id, created_at, updated_at, deleted
+            FROM clips
+            WHERE updated_at > ? OR (updated_at = ? AND id > ?)
+            ORDER BY updated_at, id
+            LIMIT ?
+            """,
+            params: [cursor.updatedAt, cursor.updatedAt, cursor.id, limit])
+        return (inner.results ?? []).map(Self.cloudRowFrom)
+    }
+
+    func setClipDeleted(id: String) async throws -> Int64 {
+        _ = try await runSQL(
+            "UPDATE clips SET deleted = 1, updated_at = unixepoch() WHERE id = ?",
+            params: [id])
+        let inner = try await runSQL(
+            "SELECT updated_at FROM clips WHERE id = ?", params: [id])
+        return (inner.results?.first?["updated_at"]?.value as? Int64) ?? 0
+    }
+
+    // MARK: - Devices
+
+    func upsertDevice(_ row: DeviceRow) async throws {
+        _ = try await runSQL("""
+            INSERT INTO devices (device_id, ciphertext, last_seen_at)
+            VALUES (?, ?, unixepoch())
+            ON CONFLICT(device_id) DO UPDATE SET
+              ciphertext = excluded.ciphertext,
+              last_seen_at = unixepoch()
+            """,
+            params: [row.deviceID, row.ciphertext.base64EncodedString()])
+    }
+
+    func listDevices() async throws -> [DeviceRow] {
+        let inner = try await runSQL(
+            "SELECT device_id, ciphertext, last_seen_at FROM devices ORDER BY last_seen_at DESC")
+        return (inner.results ?? []).map { row in
+            let ciphertext = (row["ciphertext"]?.value as? String)
+                .flatMap { Data(base64Encoded: $0) } ?? Data()
+            return DeviceRow(deviceID: (row["device_id"]?.value as? String) ?? "",
+                             ciphertext: ciphertext,
+                             lastSeenAt: (row["last_seen_at"]?.value as? Int64) ?? 0)
+        }
+    }
+
+    // MARK: - Config
+
+    func getConfig(key: String) async throws -> String? {
+        let inner = try await runSQL(
+            "SELECT value FROM config WHERE key = ?", params: [key])
+        return inner.results?.first?["value"]?.value as? String
+    }
+
+    func putConfigIfAbsent(key: String, value: String) async throws -> Bool {
+        // Fix C: idempotent.
+        let inner = try await runSQL(
+            "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
+            params: [key, value])
+        return (inner.meta?.rows_written ?? 0) > 0
+    }
+
+    // MARK: - Helpers
+
+    static func cloudRowFrom(_ row: [String: AnyCodable]) -> CloudRow {
+        let ciphertext = (row["ciphertext"]?.value as? String)
+            .flatMap { Data(base64Encoded: $0) } ?? Data()
+        return CloudRow(
+            id: (row["id"]?.value as? String) ?? "",
+            hmac: (row["hmac"]?.value as? String) ?? "",
+            ciphertext: ciphertext,
+            kind: (row["kind"]?.value as? String) ?? "text",
+            blobKey: row["blob_key"]?.value as? String,
+            byteSize: Int((row["byte_size"]?.value as? Int64) ?? 0),
+            deviceID: (row["device_id"]?.value as? String) ?? "",
+            createdAt: (row["created_at"]?.value as? Int64) ?? 0,
+            updatedAt: (row["updated_at"]?.value as? Int64) ?? 0,
+            deleted: ((row["deleted"]?.value as? Int64) ?? 0) != 0
+        )
+    }
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+```bash
+swift test --filter ClipTests.D1BackendTests
+```
+
+Expected: 6 tests pass.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add Sources/Clip/Sync/D1Backend.swift Tests/ClipTests/Sync/D1BackendTests.swift
+git commit -m "sync: D1Backend — REST API client w/ fixes A+B+C+E baked in"
 ```
 
 ---
 
 ## Phase P3 — Engine
 
-### Task 12: SyncQueue — DB-backed retry queue
+### Task 14: SyncQueue — DB-backed retry queue with backoff
 
 **Files:**
 - Create: `Sources/Clip/Sync/SyncQueue.swift`
@@ -2044,11 +2511,11 @@ final class SyncQueueTests: XCTestCase {
     func testEnqueueDequeueOrderByNextTryAt() throws {
         let s = try HistoryStore.inMemory()
         let q = SyncQueue(store: s)
-        try q.enqueue(op: .putItem, targetKey: "1", at: 100)
-        try q.enqueue(op: .putItem, targetKey: "2", at: 50)
-        try q.enqueue(op: .putItem, targetKey: "3", at: 200)
+        try q.enqueue(op: .putClip, targetKey: "1", at: 100)
+        try q.enqueue(op: .putClip, targetKey: "2", at: 50)
+        try q.enqueue(op: .putClip, targetKey: "3", at: 200)
         let r1 = try XCTUnwrap(try q.dequeueDueAt(now: 1000))
-        XCTAssertEqual(r1.targetKey, "2")  // smallest next_try_at first
+        XCTAssertEqual(r1.targetKey, "2")
         try q.delete(id: r1.id)
         let r2 = try XCTUnwrap(try q.dequeueDueAt(now: 1000))
         XCTAssertEqual(r2.targetKey, "1")
@@ -2057,18 +2524,18 @@ final class SyncQueueTests: XCTestCase {
     func testDequeueRespectsNextTryAt() throws {
         let s = try HistoryStore.inMemory()
         let q = SyncQueue(store: s)
-        try q.enqueue(op: .putItem, targetKey: "future", at: 1000)
+        try q.enqueue(op: .putClip, targetKey: "future", at: 1000)
         XCTAssertNil(try q.dequeueDueAt(now: 500))
         XCTAssertNotNil(try q.dequeueDueAt(now: 1500))
     }
 
-    func testRecordFailureAppliesBackoff() throws {
+    func testRecordFailureExponentialBackoff() throws {
         let s = try HistoryStore.inMemory()
         let q = SyncQueue(store: s)
-        try q.enqueue(op: .putItem, targetKey: "x", at: 100)
+        try q.enqueue(op: .putClip, targetKey: "x", at: 100)
         let r = try XCTUnwrap(try q.dequeueDueAt(now: 1000))
-        try q.recordFailure(id: r.id, attempts: r.attempts + 1, error: "boom", at: 1000)
-        // attempts=1 → backoff = 2^1 = 2s; next_try_at = 1002
+        try q.recordFailure(id: r.id, attempts: 1, error: "boom", at: 1000)
+        // attempts=1 → backoff 2s
         XCTAssertNil(try q.dequeueDueAt(now: 1001))
         XCTAssertNotNil(try q.dequeueDueAt(now: 1002))
     }
@@ -2076,24 +2543,22 @@ final class SyncQueueTests: XCTestCase {
     func testBackoffCappedAt900() throws {
         let s = try HistoryStore.inMemory()
         let q = SyncQueue(store: s)
-        try q.enqueue(op: .putItem, targetKey: "x", at: 0)
+        try q.enqueue(op: .putClip, targetKey: "x", at: 0)
         let r = try XCTUnwrap(try q.dequeueDueAt(now: 1000))
-        // attempts=20 → 2^20 = 1M; capped at 900s
         try q.recordFailure(id: r.id, attempts: 20, error: "boom", at: 1000)
         XCTAssertNil(try q.dequeueDueAt(now: 1899))
         XCTAssertNotNil(try q.dequeueDueAt(now: 1900))
     }
 
-    func testDeleteByItemTargetKey() throws {
+    func testDeleteAllForItem() throws {
         let s = try HistoryStore.inMemory()
         let q = SyncQueue(store: s)
-        try q.enqueue(op: .putItem, targetKey: "5", at: 0)
+        try q.enqueue(op: .putClip, targetKey: "5", at: 0)
         try q.enqueue(op: .putBlob, targetKey: "5", at: 0)
         try q.enqueue(op: .putTomb, targetKey: "x", at: 0)
         try q.deleteAllForItem(itemID: 5)
-        let remaining = try q.peekAll()
-        XCTAssertEqual(remaining.count, 1)
-        XCTAssertEqual(remaining.first?.op, .putTomb)
+        XCTAssertEqual(try q.peekAll().count, 1)
+        XCTAssertEqual(try q.peekAll().first?.op, .putTomb)
     }
 }
 ```
@@ -2104,8 +2569,6 @@ final class SyncQueueTests: XCTestCase {
 swift test --filter ClipTests.SyncQueueTests
 ```
 
-Expected: compile error.
-
 - [ ] **Step 3: Implement SyncQueue**
 
 ```swift
@@ -2113,9 +2576,8 @@ Expected: compile error.
 import Foundation
 import GRDB
 
-/// DB-backed retry queue (table sync_queue, created in Migration v3).
-/// Spec §7.2: pusher dequeues lowest next_try_at <= now; on failure,
-/// recordFailure with backoff = min(900, 2^attempts) seconds.
+/// DB-backed retry queue (sync_queue, created in Migration v3). On failure
+/// applies exponential backoff capped at 900s.
 struct SyncQueue: Sendable {
     let store: HistoryStore
 
@@ -2138,7 +2600,6 @@ struct SyncQueue: Sendable {
         }
     }
 
-    /// Dequeue is a peek — caller deletes after success or recordFailure on error.
     func dequeueDueAt(now: Int64) throws -> Row? {
         try store.pool.read { db in
             try GRDB.Row.fetchOne(db, sql: """
@@ -2156,7 +2617,6 @@ struct SyncQueue: Sendable {
         }
     }
 
-    /// Apply exponential backoff: next_try_at = now + min(900, 2^attempts).
     func recordFailure(id: Int64, attempts: Int, error: String, at now: Int64) throws {
         let backoff = min(900, Int(truncatingIfNeeded: 1 &<< min(attempts, 20)))
         try store.pool.write { db in
@@ -2167,14 +2627,12 @@ struct SyncQueue: Sendable {
         }
     }
 
-    /// Remove all queue rows referencing a given items.id (op = put_item or put_blob).
     func deleteAllForItem(itemID: Int64) throws {
         let target = String(itemID)
         try store.pool.write { db in
             try db.execute(sql: """
                 DELETE FROM sync_queue
-                WHERE op IN ('put_item', 'put_blob')
-                  AND target_key = ?
+                WHERE op IN ('put_clip', 'put_blob') AND target_key = ?
             """, arguments: [target])
         }
     }
@@ -2188,7 +2646,7 @@ struct SyncQueue: Sendable {
 
     private static func fromRow(_ r: GRDB.Row) -> Row {
         Row(id: r["id"],
-            op: SyncOp(rawValue: r["op"]) ?? .putItem,
+            op: SyncOp(rawValue: r["op"]) ?? .putClip,
             targetKey: r["target_key"],
             attempts: r["attempts"],
             nextTryAt: r["next_try_at"],
@@ -2204,8 +2662,6 @@ struct SyncQueue: Sendable {
 swift test --filter ClipTests.SyncQueueTests
 ```
 
-Expected: 5 tests pass.
-
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -2215,7 +2671,7 @@ git commit -m "sync: SyncQueue — DB-backed retry queue with exponential backof
 
 ---
 
-### Task 13: SyncStateStore — KV access to `sync_state` table
+### Task 15: SyncStateStore — KV wrapper over local sync_state
 
 **Files:**
 - Create: `Sources/Clip/Sync/SyncStateStore.swift`
@@ -2231,8 +2687,7 @@ import XCTest
 final class SyncStateStoreTests: XCTestCase {
     func testGetMissingReturnsNil() throws {
         let s = try HistoryStore.inMemory()
-        let kv = SyncStateStore(store: s)
-        XCTAssertNil(try kv.get("device_id"))
+        XCTAssertNil(try SyncStateStore(store: s).get("device_id"))
     }
 
     func testSetThenGet() throws {
@@ -2258,8 +2713,6 @@ final class SyncStateStoreTests: XCTestCase {
 swift test --filter ClipTests.SyncStateStoreTests
 ```
 
-Expected: compile error.
-
 - [ ] **Step 3: Implement SyncStateStore**
 
 ```swift
@@ -2267,8 +2720,7 @@ Expected: compile error.
 import Foundation
 import GRDB
 
-/// Tiny KV wrapper around the sync_state table. Keys/values both TEXT;
-/// callers responsible for JSON-encoding non-string values.
+/// Tiny KV wrapper around the sync_state table.
 struct SyncStateStore: Sendable {
     let store: HistoryStore
 
@@ -2302,8 +2754,6 @@ struct SyncStateStore: Sendable {
 swift test --filter ClipTests.SyncStateStoreTests
 ```
 
-Expected: 3 tests pass.
-
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -2313,13 +2763,15 @@ git commit -m "sync: SyncStateStore — kv wrapper over sync_state table"
 
 ---
 
-### Task 14: SyncEngine — push loop only
-
-This task adds the actor with a `pushOnce()` method that drains exactly one queue row. The full loop (`runForever`) and pull are added in subsequent tasks.
+### Task 16: SyncEngine push — text + image (R2-then-D1; hmac dedup with deleted=1)
 
 **Files:**
-- Create: `Sources/Clip/Sync/SyncEngine.swift`
+- Create: `Sources/Clip/Sync/SyncEngine.swift` (initial scaffold + pushOnce)
 - Create: `Tests/ClipTests/Sync/SyncEnginePushTests.swift`
+
+This task introduces the `actor SyncEngine` skeleton and `pushOnce(now:)`. Pull / enable / fetchBlob / backfill / exclude come in subsequent tasks.
+
+The push path bakes in **fix B** (hmac dedup includes deleted=1; reuses cloud_id) and the **R2-then-D1** ordering from spec §7.2 (so a partial failure leaves an idempotent orphan blob).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2329,74 +2781,139 @@ import XCTest
 @testable import Clip
 
 final class SyncEnginePushTests: XCTestCase {
-    func makeBackend() -> LocalDirBackend {
+    func makePair() throws -> (HistoryStore, SyncEngine, LocalSqliteDataSource, LocalDirBlobStore) {
+        let store = try HistoryStore.inMemory()
+        let ds = try LocalSqliteDataSource()
+        let group = DispatchGroup()
+        group.enter(); Task { try? await ds.ensureSchema(); group.leave() }
+        group.wait()
         let dir = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("clip-test-\(UUID().uuidString)")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return LocalDirBackend(root: dir)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let blobs = LocalDirBlobStore(root: dir)
+        let crypto = CryptoBox(masterKey: Data(repeating: 0xAA, count: 32))
+        let state = SyncStateStore(store: store)
+        let engine = SyncEngine(store: store, dataSource: ds, blobStore: blobs,
+                                crypto: crypto, deviceID: "DEV", state: state)
+        return (store, engine, ds, blobs)
     }
 
-    func testPushOnceUploadsItemPayload() async throws {
-        let store = try HistoryStore.inMemory()
-        let backend = makeBackend()
-        let crypto = CryptoBox(masterKey: Data(repeating: 1, count: 32))
-        let engine = SyncEngine(store: store, backend: backend, crypto: crypto,
-                                deviceID: "DEV", state: SyncStateStore(store: store))
-
+    func testPushTextRoundTripsToD1() async throws {
+        let (store, engine, ds, _) = try makePair()
         let id = try store.insert(ClipItem(
             id: nil, content: "hello", contentHash: ClipItem.contentHash(of: "hello"),
             sourceBundleID: nil, sourceAppName: nil, createdAt: 100,
             pinned: false, byteSize: 5, truncated: false))
-
-        try await engine.enqueueItemPush(itemID: id, at: 100)
+        try await engine.enqueueClipPush(itemID: id, at: 100)
         let did = try await engine.pushOnce(now: 200)
         XCTAssertTrue(did)
 
-        // After push: item should be marked synced + cloud should have an items/ object
+        // Item now marked synced
         let item = try XCTUnwrap(try store.itemByID(id))
-        XCTAssertNotNil(item.cloudSyncedAt)
-        XCTAssertNotNil(item.cloudEtag)
+        XCTAssertNotNil(item.cloudID)
+        XCTAssertNotNil(item.cloudUpdatedAt)
 
-        let name = crypto.name(forContentHash: item.contentHash)
-        let bytes = try await backend.get(key: CloudKey.itemKey(name: name))
-        XCTAssertNotNil(bytes)
-
-        // And: no more rows due
-        let again = try await engine.pushOnce(now: 200)
-        XCTAssertFalse(again)
+        // D1 has the row
+        let crypto = CryptoBox(masterKey: Data(repeating: 0xAA, count: 32))
+        let hmac = crypto.name(forContentHash: item.contentHash)
+        let found = try await ds.queryClipByHmac(hmac)
+        XCTAssertNotNil(found)
+        XCTAssertEqual(found?.deleted, false)
     }
 
-    func testPushOnceFailureAppliesBackoff() async throws {
+    func testPushImageDoesR2ThenD1() async throws {
+        let (store, engine, ds, blobs) = try makePair()
+        let bytes = Data(repeating: 0xFF, count: 1024)
+        let id = try store.insertImage(
+            bytes: bytes, mimeType: "image/png",
+            sourceBundleID: nil, sourceAppName: nil, now: 100)
+        try await engine.enqueueClipPush(itemID: id, at: 100)
+        try await engine.enqueueBlobPush(blobID: store.itemByID(id)!.blobID!, at: 100)
+
+        // Two queue rows: drain both
+        _ = try await engine.pushOnce(now: 200)
+        _ = try await engine.pushOnce(now: 201)
+
+        let item = try XCTUnwrap(try store.itemByID(id))
+        let crypto = CryptoBox(masterKey: Data(repeating: 0xAA, count: 32))
+        let blobHmac = crypto.name(forContentHash: item.contentHash)
+        // R2 has the encrypted blob
+        XCTAssertNotNil(try await blobs.getBlob(key: "blobs/\(blobHmac).bin"))
+        // D1 has the row with blob_key
+        let row = try await ds.queryClipByHmac(crypto.name(forContentHash: item.contentHash))
+        XCTAssertNotNil(row)
+    }
+
+    func testHmacDedupReusesCloudIDIncludingDeleted() async throws {
+        // Prime: existing D1 row with hmac H, deleted=1
+        let (store, engine, ds, _) = try makePair()
+        let crypto = CryptoBox(masterKey: Data(repeating: 0xAA, count: 32))
+        let hash = ClipItem.contentHash(of: "foo")
+        let hmac = crypto.name(forContentHash: hash)
+        // Insert pre-existing tombstoned row directly into DS
+        try ds.testDirectInsert(CloudRow(
+            id: "EXISTING-CLOUD-ID",
+            hmac: hmac, ciphertext: Data([0x00]),
+            kind: "text", blobKey: nil, byteSize: 3,
+            deviceID: "OTHER", createdAt: 50, updatedAt: 100, deleted: true))
+
+        // Local capture of same content
+        let id = try store.insert(ClipItem(
+            id: nil, content: "foo", contentHash: hash,
+            sourceBundleID: nil, sourceAppName: nil, createdAt: 200,
+            pinned: false, byteSize: 3, truncated: false))
+        try await engine.enqueueClipPush(itemID: id, at: 200)
+        _ = try await engine.pushOnce(now: 300)
+
+        // Local row should now be synced with the EXISTING cloud_id (reused)
+        let item = try XCTUnwrap(try store.itemByID(id))
+        XCTAssertEqual(item.cloudID, "EXISTING-CLOUD-ID")
+
+        // D1 should have ONE row at hmac, deleted flipped to 0
+        let row = try await ds.queryClipByHmac(hmac)
+        XCTAssertEqual(row?.id, "EXISTING-CLOUD-ID")
+        XCTAssertEqual(row?.deleted, false, "upsert revives deleted=1 → 0")
+    }
+
+    func testFailureAppliesBackoff() async throws {
         let store = try HistoryStore.inMemory()
-        let backend = AlwaysFailBackend()
-        let crypto = CryptoBox(masterKey: Data(repeating: 1, count: 32))
-        let engine = SyncEngine(store: store, backend: backend, crypto: crypto,
-                                deviceID: "DEV", state: SyncStateStore(store: store))
+        let ds = AlwaysFailDataSource()
+        let blobs = AlwaysFailBlobStore()
+        let crypto = CryptoBox(masterKey: Data(repeating: 0xAA, count: 32))
+        let engine = SyncEngine(store: store, dataSource: ds, blobStore: blobs,
+                                crypto: crypto, deviceID: "DEV",
+                                state: SyncStateStore(store: store))
 
         let id = try store.insert(ClipItem(
-            id: nil, content: "h", contentHash: ClipItem.contentHash(of: "h"),
+            id: nil, content: "x", contentHash: ClipItem.contentHash(of: "x"),
             sourceBundleID: nil, sourceAppName: nil, createdAt: 100,
             pinned: false, byteSize: 1, truncated: false))
-        try await engine.enqueueItemPush(itemID: id, at: 100)
-
-        let didTry = try await engine.pushOnce(now: 200)
-        XCTAssertTrue(didTry)
-        // attempts=1 → backoff = 2; not due at 201, is due at 202
-        let again = try await engine.pushOnce(now: 201)
-        XCTAssertFalse(again)
-        let dueAt202 = try await engine.pushOnce(now: 202)
-        XCTAssertTrue(dueAt202)
+        try await engine.enqueueClipPush(itemID: id, at: 100)
+        XCTAssertTrue(try await engine.pushOnce(now: 200))   // attempted, failed
+        XCTAssertFalse(try await engine.pushOnce(now: 201))  // backed off
+        XCTAssertTrue(try await engine.pushOnce(now: 202))   // due again
     }
 }
 
-/// Backend that throws on every operation. For backoff testing.
-final class AlwaysFailBackend: CloudSyncBackend, @unchecked Sendable {
+// Stub that throws on every operation
+final class AlwaysFailDataSource: CloudSyncDataSource, @unchecked Sendable {
     struct E: Error {}
-    func put(key: String, body: Data, contentType: String?) async throws -> (etag: String, lastModified: Int64) { throw E() }
-    func get(key: String) async throws -> Data? { throw E() }
-    func head(key: String) async throws -> CloudObjectMeta? { throw E() }
-    func delete(key: String) async throws { throw E() }
-    func list(prefix: String, after cursor: String?) async throws -> ListPage { throw E() }
+    func ensureSchema() async throws { throw E() }
+    func upsertClip(_ row: CloudRow) async throws -> Int64 { throw E() }
+    func queryClipByHmac(_ hmac: String) async throws -> (id: String, deleted: Bool)? { throw E() }
+    func queryClipsChangedSince(cursor: CloudCursor, limit: Int) async throws -> [CloudRow] { throw E() }
+    func setClipDeleted(id: String) async throws -> Int64 { throw E() }
+    func upsertDevice(_ row: DeviceRow) async throws { throw E() }
+    func listDevices() async throws -> [DeviceRow] { throw E() }
+    func getConfig(key: String) async throws -> String? { throw E() }
+    func putConfigIfAbsent(key: String, value: String) async throws -> Bool { throw E() }
+}
+
+final class AlwaysFailBlobStore: CloudSyncBlobStore, @unchecked Sendable {
+    struct E: Error {}
+    func putBlob(key: String, body: Data) async throws { throw E() }
+    func getBlob(key: String) async throws -> Data? { throw E() }
+    func deleteBlob(key: String) async throws { throw E() }
 }
 ```
 
@@ -2406,30 +2923,31 @@ final class AlwaysFailBackend: CloudSyncBackend, @unchecked Sendable {
 swift test --filter ClipTests.SyncEnginePushTests
 ```
 
-Expected: compile error.
-
-- [ ] **Step 3: Implement SyncEngine (push half only)**
+- [ ] **Step 3: Implement SyncEngine (init + push half)**
 
 ```swift
 // Sources/Clip/Sync/SyncEngine.swift
 import Foundation
 
-/// Cloud sync orchestrator. Spec §4.2: actor; two background loops
-/// (push drainer + 30s pull tick) plus signal-based wakeups. This
-/// initial implementation has push only; pull, tombstones, blob
-/// fetch, backfill come in subsequent tasks.
+/// Cloud sync orchestrator. Spec §4.1: actor; two background loops
+/// (push drainer + 30s pull tick) plus signal-based wakeups.
+/// This task adds push-only; pull / enableSync / fetchBlob / backfill /
+/// excludeItem follow in T17–T21.
 actor SyncEngine {
     let store: HistoryStore
-    let backend: CloudSyncBackend
+    let dataSource: CloudSyncDataSource
+    let blobStore: CloudSyncBlobStore
     let crypto: CryptoBox
     let deviceID: String
     let state: SyncStateStore
     let queue: SyncQueue
 
-    init(store: HistoryStore, backend: CloudSyncBackend,
-         crypto: CryptoBox, deviceID: String, state: SyncStateStore) {
+    init(store: HistoryStore, dataSource: CloudSyncDataSource,
+         blobStore: CloudSyncBlobStore, crypto: CryptoBox,
+         deviceID: String, state: SyncStateStore) {
         self.store = store
-        self.backend = backend
+        self.dataSource = dataSource
+        self.blobStore = blobStore
         self.crypto = crypto
         self.deviceID = deviceID
         self.state = state
@@ -2438,16 +2956,16 @@ actor SyncEngine {
 
     // MARK: - public enqueue API
 
-    func enqueueItemPush(itemID: Int64, at: Int64) throws {
+    func enqueueClipPush(itemID: Int64, at: Int64) throws {
         // Spec §10.4 — runtime guard against >2MB images. Backfill SQL also
         // filters but live onChange-fired enqueues need their own check.
         if let item = try store.itemByID(itemID),
            item.kind == .image, let blobID = item.blobID,
            let info = try store.blobInfo(id: blobID),
            info.size > 2 * 1024 * 1024 {
-            return                  // skip; UI will show 📤 (panel icon task)
+            return
         }
-        try queue.enqueue(op: .putItem, targetKey: String(itemID), at: at)
+        try queue.enqueue(op: .putClip, targetKey: String(itemID), at: at)
     }
 
     func enqueueBlobPush(blobID: Int64, at: Int64) throws {
@@ -2456,8 +2974,7 @@ actor SyncEngine {
 
     // MARK: - push drainer
 
-    /// Drain at most one queue row. Returns true iff a row was attempted
-    /// (success or failure both count). Returns false iff nothing was due.
+    /// Drain at most one queue row. Returns true iff a row was attempted.
     @discardableResult
     func pushOnce(now: Int64) async throws -> Bool {
         guard let row = try queue.dequeueDueAt(now: now) else { return false }
@@ -2475,78 +2992,78 @@ actor SyncEngine {
 
     private func execute(_ row: SyncQueue.Row) async throws {
         switch row.op {
-        case .putItem:
-            try await pushItem(itemID: Int64(row.targetKey)!)
-        case .putBlob:
-            try await pushBlob(blobID: Int64(row.targetKey)!)
-        case .putTomb:
-            try await pushTomb(hmac: row.targetKey)
-        case .putDevice:
-            try await pushDevice()
+        case .putClip:   try await pushClip(itemID: Int64(row.targetKey)!)
+        case .putBlob:   try await pushBlob(blobID: Int64(row.targetKey)!)
+        case .putTomb:   try await pushTomb(contentHash: row.targetKey)
+        case .putDevice: try await pushDevice()
         }
     }
 
-    private func pushItem(itemID: Int64) async throws {
+    private func pushClip(itemID: Int64) async throws {
         guard let item = try store.itemByID(itemID) else { return }
 
-        // Resolve blob_hmac for image items so the lazy-fetch pull can locate
-        // blobs/<name>.bin. Text items leave blobHmac = nil.
-        var blobHmac: String? = nil
+        // Resolve blob_hmac for image items
+        var blobKey: String? = nil
         var blobSize: Int? = nil
         if item.kind == .image, let blobID = item.blobID,
            let info = try store.blobInfo(id: blobID) {
-            // store.blobInfo(id:) is the existing v2 API: returns (size, sha)
-            blobHmac = crypto.name(forContentHash: info.sha)
+            blobKey = CloudKey.blobKey(name: crypto.name(forContentHash: info.sha))
             blobSize = info.size
         }
 
-        let payload = ItemPayload(
-            v: 1, kind: item.kind.rawValue, contentHash: item.contentHash,
+        let payload = RowPayload(
+            v: 1,
             content: item.kind == .text ? item.content : nil,
+            thumbB64: nil,    // v3 leaves thumbnail generation to v3.x
             mimeType: item.mimeType,
-            blobHmac: blobHmac,
             blobSize: blobSize,
-            thumbB64: nil,
-            byteSize: item.byteSize, truncated: item.truncated,
+            truncated: item.truncated,
             sourceBundleId: item.sourceBundleID,
             sourceAppName: item.sourceAppName,
-            createdAt: item.createdAt, pinned: item.pinned,
-            deviceId: item.deviceID ?? deviceID)
+            pinned: item.pinned,
+            contentHash: item.contentHash)
 
         let json = try JSONEncoder().encode(payload)
         let sealed = try crypto.seal(json)
-        let name = crypto.name(forContentHash: item.contentHash)
-        let key = CloudKey.itemKey(name: name)
+        let hmac = crypto.name(forContentHash: item.contentHash)
+
+        // Fix B: hmac dedup includes deleted=1
+        let existing = try await dataSource.queryClipByHmac(hmac)
+        let cloudID = item.cloudID ?? existing?.id ?? UUID().uuidString.lowercased()
+
+        let row = CloudRow(
+            id: cloudID, hmac: hmac, ciphertext: sealed,
+            kind: item.kind.rawValue, blobKey: blobKey,
+            byteSize: item.byteSize, deviceID: deviceID,
+            createdAt: item.createdAt, updatedAt: 0, deleted: false)
+
+        let serverUpdatedAt = try await dataSource.upsertClip(row)
         let now = Int64(Date().timeIntervalSince1970)
-        let (etag, lm) = try await backend.put(key: key, body: sealed,
-                                               contentType: "application/octet-stream")
-        try store.markItemSynced(id: itemID, at: now, etag: etag, lastModified: lm)
-        try store.setItemCloudName(id: itemID, name: name)   // enables future ETag-skip on pull
+        try store.markClipSynced(id: itemID, cloudID: cloudID,
+                                 updatedAt: serverUpdatedAt, at: now)
+        if let blobKey {
+            try store.setItemCloudBlobKey(id: itemID, blobKey: blobKey)
+        }
     }
 
     private func pushBlob(blobID: Int64) async throws {
         guard let bytes = try store.blob(id: blobID),
               let info = try store.blobInfo(id: blobID) else { return }
         let sealed = try crypto.seal(bytes)
-        let name = crypto.name(forContentHash: info.sha)
-        let key = CloudKey.blobKey(name: name)
+        let key = CloudKey.blobKey(name: crypto.name(forContentHash: info.sha))
+        try await blobStore.putBlob(key: key, body: sealed)
         let now = Int64(Date().timeIntervalSince1970)
-        let (etag, _) = try await backend.put(key: key, body: sealed,
-                                              contentType: "application/octet-stream")
-        try store.markBlobSynced(id: blobID, at: now, etag: etag)
+        try store.markBlobSynced(id: blobID, at: now)
     }
 
-    private func pushTomb(hmac: String) async throws {
-        // Implementation in task 16 (tombstones). For now: no-op stub so
-        // tests that don't enqueue tomb rows pass. Calling this with an
-        // actual hmac before task 16 will silently no-op.
-        _ = hmac
+    // Implementations in T18 / T20 / T21
+    private func pushTomb(contentHash: String) async throws {
+        // Implemented in Task 21 (excludeItem).
+        _ = contentHash
     }
 
     private func pushDevice() async throws {
-        // Out of scope for v3 — see "Out of Scope" section. devices/<id>.bin
-        // payload is defined in SyncSchema (DevicePayload) so a v3.1 task can
-        // wire this without protocol changes.
+        // Out of scope for v3 — see spec §13. DevicePayload defined so v3.1 can wire.
     }
 }
 ```
@@ -2557,24 +3074,24 @@ actor SyncEngine {
 swift test --filter ClipTests.SyncEnginePushTests
 ```
 
-Expected: 2 tests pass.
+Expected: 4 tests pass.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add Sources/Clip/Sync/SyncEngine.swift Tests/ClipTests/Sync/SyncEnginePushTests.swift
-git commit -m "sync: SyncEngine — push half (item + blob upload, backoff on failure)"
+git commit -m "sync: SyncEngine push — R2-then-D1 + hmac dedup includes deleted (fix B)"
 ```
 
 ---
 
-### Task 15: SyncEngine — pull half (items only)
-
-Adds `pullOnce()` that lists `items/` and reconciles into the local store. Tombstones come next.
+### Task 17: SyncEngine pull — composite cursor + tombstone branch + LWW skip
 
 **Files:**
-- Modify: `Sources/Clip/Sync/SyncEngine.swift` — append pull methods
+- Modify: `Sources/Clip/Sync/SyncEngine.swift` — append pullOnce + helpers
 - Create: `Tests/ClipTests/Sync/SyncEnginePullTests.swift`
+
+Bakes in **fix A** (composite cursor advance even on LWW skip).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2584,62 +3101,87 @@ import XCTest
 @testable import Clip
 
 final class SyncEnginePullTests: XCTestCase {
-    /// Two stores share one backend (LocalDirBackend writing to a temp dir).
-    /// A inserts → push → B pulls → B should see the same content_hash.
-    func testTwoStoresEndToEnd() async throws {
+    /// A and B share one DataSource + one BlobStore + one master_key.
+    /// A push → B pull → B sees the same content_hash.
+    func makePair() throws -> (HistoryStore, SyncEngine, HistoryStore, SyncEngine) {
+        let ds = try LocalSqliteDataSource()
+        let group = DispatchGroup()
+        group.enter(); Task { try? await ds.ensureSchema(); group.leave() }
+        group.wait()
         let dir = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("clip-test-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let backend = LocalDirBackend(root: dir)
+        let blobs = LocalDirBlobStore(root: dir)
         let crypto = CryptoBox(masterKey: Data(repeating: 7, count: 32))
-
         let storeA = try HistoryStore.inMemory()
-        let stateA = SyncStateStore(store: storeA)
-        let engineA = SyncEngine(store: storeA, backend: backend, crypto: crypto,
-                                 deviceID: "A", state: stateA)
-
+        let engineA = SyncEngine(store: storeA, dataSource: ds, blobStore: blobs,
+                                 crypto: crypto, deviceID: "A",
+                                 state: SyncStateStore(store: storeA))
         let storeB = try HistoryStore.inMemory()
-        let stateB = SyncStateStore(store: storeB)
-        let engineB = SyncEngine(store: storeB, backend: backend, crypto: crypto,
-                                 deviceID: "B", state: stateB)
+        let engineB = SyncEngine(store: storeB, dataSource: ds, blobStore: blobs,
+                                 crypto: crypto, deviceID: "B",
+                                 state: SyncStateStore(store: storeB))
+        return (storeA, engineA, storeB, engineB)
+    }
 
+    func testTextEndToEnd() async throws {
+        let (storeA, engineA, storeB, engineB) = try makePair()
         let id = try storeA.insert(ClipItem(
             id: nil, content: "shared!", contentHash: ClipItem.contentHash(of: "shared!"),
             sourceBundleID: nil, sourceAppName: nil, createdAt: 100,
             pinned: false, byteSize: 7, truncated: false))
-        try await engineA.enqueueItemPush(itemID: id, at: 100)
+        try await engineA.enqueueClipPush(itemID: id, at: 100)
         _ = try await engineA.pushOnce(now: 200)
 
         try await engineB.pullOnce(now: 300)
-        let items = try storeB.listRecent()
-        XCTAssertEqual(items.map(\.content), ["shared!"])
+        XCTAssertEqual(try storeB.listRecent().map(\.content), ["shared!"])
     }
 
-    func testPullSkipsAlreadySeenEtag() async throws {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("clip-test-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let backend = LocalDirBackend(root: dir)
-        let crypto = CryptoBox(masterKey: Data(repeating: 7, count: 32))
-        let storeA = try HistoryStore.inMemory()
-        let engineA = SyncEngine(store: storeA, backend: backend, crypto: crypto,
-                                 deviceID: "A", state: SyncStateStore(store: storeA))
-        let storeB = try HistoryStore.inMemory()
-        let engineB = SyncEngine(store: storeB, backend: backend, crypto: crypto,
-                                 deviceID: "B", state: SyncStateStore(store: storeB))
-
+    func testPullSkipsAlreadyKnownEtagViaLWWAdvancesCursor() async throws {
+        let (storeA, engineA, storeB, engineB) = try makePair()
         let id = try storeA.insert(ClipItem(
             id: nil, content: "x", contentHash: ClipItem.contentHash(of: "x"),
             sourceBundleID: nil, sourceAppName: nil, createdAt: 1,
             pinned: false, byteSize: 1, truncated: false))
-        try await engineA.enqueueItemPush(itemID: id, at: 1)
+        try await engineA.enqueueClipPush(itemID: id, at: 1)
         _ = try await engineA.pushOnce(now: 1)
 
         try await engineB.pullOnce(now: 2)
         XCTAssertEqual(try storeB.listRecent().count, 1)
-        // Second pull: no change → still 1, no errors.
+        // Second pull: cursor must have advanced past that row.
+        let cursor1 = try SyncStateStore(store: storeB).get("cloud_pull_cursor")
         try await engineB.pullOnce(now: 3)
+        let cursor2 = try SyncStateStore(store: storeB).get("cloud_pull_cursor")
+        XCTAssertEqual(cursor1, cursor2, "cursor stable when no new rows")
+        XCTAssertEqual(try storeB.listRecent().count, 1, "no duplicate inserts")
+    }
+
+    func testTombstonePropagatesAndDeletesLocal() async throws {
+        let (storeA, engineA, storeB, engineB) = try makePair()
+        let hash = ClipItem.contentHash(of: "doomed")
+        let id = try storeA.insert(ClipItem(
+            id: nil, content: "doomed", contentHash: hash,
+            sourceBundleID: nil, sourceAppName: nil, createdAt: 100,
+            pinned: false, byteSize: 6, truncated: false))
+        try await engineA.enqueueClipPush(itemID: id, at: 100)
+        _ = try await engineA.pushOnce(now: 100)
+        try await engineB.pullOnce(now: 200)
         XCTAssertEqual(try storeB.listRecent().count, 1)
+
+        // A deletes
+        let cloudID = try storeA.itemByID(id)!.cloudID!
+        try storeA.delete(id: id)
+        // Manually mark D1 row deleted (excludeItem path, T21, will wrap this)
+        _ = try await ds_(engineA: engineA).setClipDeleted(id: cloudID)
+
+        // B pulls → row gone + tombstone written
+        try await engineB.pullOnce(now: 300)
+        XCTAssertEqual(try storeB.listRecent().count, 0)
+        XCTAssertNotNil(try storeB.tombstoneAt(contentHash: hash))
+    }
+
+    private func ds_(engineA: SyncEngine) async -> CloudSyncDataSource {
+        await engineA.dataSourceForTesting
     }
 }
 ```
@@ -2650,99 +3192,92 @@ final class SyncEnginePullTests: XCTestCase {
 swift test --filter ClipTests.SyncEnginePullTests
 ```
 
-Expected: compile error ("no method pullOnce").
+- [ ] **Step 3: Add pullOnce + helpers to SyncEngine**
 
-- [ ] **Step 3: Add pull methods to SyncEngine**
-
-Append inside the `actor SyncEngine` body, after the push methods:
+Append inside `actor SyncEngine`:
 
 ```swift
-    // MARK: - pull tick
+    // Test escape hatch — read-only access to dataSource for assertions.
+    var dataSourceForTesting: CloudSyncDataSource { dataSource }
 
-    /// One pass: list items/ + tomb/ + devices/, reconcile each into
-    /// local store. Cursor lives in sync_state. Spec §7.3.
+    // MARK: - pull
+
+    /// One pass: query D1 for changes since cursor, reconcile each row into
+    /// local store. Spec §7.3 with fix A (composite cursor).
     func pullOnce(now: Int64) async throws {
-        // tomb/ first so a freshly-pulled item that already had a tomb
-        // is recognized as deleted in handleItemPayload.
-        for prefix in [CloudKey.tombPrefix, CloudKey.itemsPrefix, CloudKey.devicesPrefix] {
-            try await pullPrefix(prefix)
+        var cursor = CloudCursor(serialized: try state.get("cloud_pull_cursor") ?? "0:")
+        while true {
+            let rows = try await dataSource.queryClipsChangedSince(
+                cursor: cursor, limit: 100)
+            if rows.isEmpty { break }
+            for row in rows {
+                // LWW skip — but still advance cursor to avoid re-fetching
+                if let local = try store.itemByCloudID(row.id),
+                   (local.cloudUpdatedAt ?? 0) >= row.updatedAt {
+                    cursor = CloudCursor(updatedAt: row.updatedAt, id: row.id)
+                    continue
+                }
+                try await reconcile(row: row)
+                cursor = CloudCursor(updatedAt: row.updatedAt, id: row.id)
+            }
+            try state.set("cloud_pull_cursor", cursor.serialized)
+            // If the page came back full, loop for another. If short, stop.
+            if rows.count < 100 { break }
         }
-        try state.set("last_pull_at", String(now))
+        try state.set("cloud_pull_at", String(now))
     }
 
-    private func pullPrefix(_ prefix: String) async throws {
-        // Persisted per-prefix cursor (spec §5.2 / §7.3): JSON map in sync_state.
-        var cursors = (try state.get("last_pull_cursor"))
-            .flatMap { $0.data(using: .utf8) }
-            .flatMap { try? JSONDecoder().decode([String: String].self, from: $0) }
-            ?? [:]
-        var cursor: String? = cursors[prefix]
-        repeat {
-            let page = try await backend.list(prefix: prefix, after: cursor)
-            for obj in page.objects {
-                let known = try lookupLocalEtag(prefix: prefix, key: obj.key)
-                if known == obj.etag { continue }
-                guard let sealed = try await backend.get(key: obj.key) else { continue }
-                let plain = try crypto.open(sealed)
-                switch prefix {
-                case CloudKey.itemsPrefix:
-                    let payload = try JSONDecoder().decode(ItemPayload.self, from: plain)
-                    try handleItemPayload(payload, etag: obj.etag, lastModified: obj.lastModified)
-                case CloudKey.tombPrefix:
-                    let payload = try JSONDecoder().decode(TombstonePayload.self, from: plain)
-                    try handleTombstonePayload(payload, etag: obj.etag, lastModified: obj.lastModified,
-                                               key: obj.key)
-                case CloudKey.devicesPrefix:
-                    // device cache is in-memory only; v3 just decodes to ensure
-                    // payload is well-formed. Wired to UI in task 18.
-                    _ = try? JSONDecoder().decode(DevicePayload.self, from: plain)
-                default: break
+    private func reconcile(row: CloudRow) async throws {
+        // Decrypt payload
+        let plain: Data
+        do {
+            plain = try crypto.open(row.ciphertext)
+        } catch {
+            // Decryption failure — likely wrong password. Don't delete local.
+            return
+        }
+        let payload: RowPayload
+        do {
+            payload = try JSONDecoder().decode(RowPayload.self, from: plain)
+        } catch {
+            return
+        }
+
+        // Tombstone branch
+        if row.deleted {
+            try store.upsertTombstone(contentHash: payload.contentHash,
+                                      cloudID: row.id,
+                                      tombstonedAt: row.updatedAt,
+                                      cloudUpdatedAt: row.updatedAt)
+            try store.deleteItemsByContentHashOlderThan(payload.contentHash, row.updatedAt)
+            return
+        }
+
+        // Resurrection guard: if local tombstone is newer than this row's
+        // created_at, the row represents a stale resurrection — drop it.
+        if let tombAt = try store.tombstoneAt(contentHash: payload.contentHash),
+           tombAt >= row.createdAt {
+            return
+        }
+
+        // Existing local row by content_hash → update mutable fields (pin)
+        if let local = try store.itemByContentHash(payload.contentHash),
+           let localID = local.id {
+            try store.markClipSynced(id: localID, cloudID: row.id,
+                                     updatedAt: row.updatedAt,
+                                     at: Int64(Date().timeIntervalSince1970))
+            // Pin LWW: server side wins (we trust D1 as truth)
+            if local.pinned != payload.pinned {
+                try store.pool.write { db in
+                    try db.execute(
+                        sql: "UPDATE items SET pinned = ? WHERE id = ?",
+                        arguments: [payload.pinned ? 1 : 0, localID])
                 }
             }
-            cursor = page.nextCursor
-        } while cursor != nil
-        // Persist updated cursor for this prefix.
-        cursors[prefix] = cursor
-        if let data = try? JSONEncoder().encode(cursors),
-           let s = String(data: data, encoding: .utf8) {
-            try state.set("last_pull_cursor", s)
-        }
-    }
-
-    /// Spec §7.3 — incremental pull: skip GET if list ETag already matches what we
-    /// stored last time. Fixes the "always re-download" correctness gap by querying
-    /// the per-row cloud_etag column added in Migration v3 (Task 1).
-    private func lookupLocalEtag(prefix: String, key: String) throws -> String? {
-        // Cloud key shape: "<prefix><name>.bin" where name = hex(hmac).
-        let dropped = key.dropFirst(prefix.count)
-        guard dropped.hasSuffix(".bin") else { return nil }
-        let name = String(dropped.dropLast(".bin".count))
-        switch prefix {
-        case CloudKey.itemsPrefix:    return try store.cloudEtagByName(name, table: "items")
-        case CloudKey.tombPrefix:     return try store.tombstoneEtagByName(name)
-        case CloudKey.devicesPrefix:  return nil   // device cache is in-memory only
-        default:                      return nil
-        }
-    }
-
-    private func handleItemPayload(_ payload: ItemPayload, etag: String, lastModified: Int64) throws {
-        // Tombstone resurrection guard: §10.3 (tomb wins on >=).
-        let hmac = crypto.name(forContentHash: payload.contentHash)
-        if let tombAt = try store.tombstoneAt(hmac: hmac), tombAt >= payload.createdAt {
             return
         }
 
-        if let existing = try store.itemByContentHash(payload.contentHash) {
-            // LWW by R2 LastModified (§3 row 8 / §7.3).
-            let local = existing.cloudLastModified ?? 0
-            if lastModified > local {
-                try store.updateMutableFromPayload(itemID: existing.id!, payload: payload,
-                                                  etag: etag, lastModified: lastModified)
-            }
-            return
-        }
-
-        // Fresh INSERT. Image kind: blob row inserted with bytes NULL (lazy fetch).
+        // Fresh INSERT
         let now = Int64(Date().timeIntervalSince1970)
         var item = ClipItem(
             id: nil,
@@ -2750,291 +3285,53 @@ Append inside the `actor SyncEngine` body, after the push methods:
             contentHash: payload.contentHash,
             sourceBundleID: payload.sourceBundleId,
             sourceAppName: payload.sourceAppName,
-            createdAt: payload.createdAt,
+            createdAt: row.createdAt,
             pinned: payload.pinned,
-            byteSize: payload.byteSize,
+            byteSize: row.byteSize,
             truncated: payload.truncated,
-            kind: ClipKind(rawValue: payload.kind) ?? .text,
+            kind: ClipKind(rawValue: row.kind) ?? .text,
             blobID: nil,
             mimeType: payload.mimeType,
+            cloudID: row.id,
+            cloudUpdatedAt: row.updatedAt,
             cloudSyncedAt: now,
-            cloudEtag: etag,
-            cloudLastModified: lastModified,
-            deviceID: payload.deviceId)
+            cloudBlobKey: row.blobKey,
+            syncExcluded: false,
+            deviceID: row.deviceID)
 
-        if item.kind == .image, let blobHmac = payload.blobHmac, let blobSize = payload.blobSize {
-            // Insert lazy blob row (bytes empty). Real bytes filled by fetchBlob (Task 17A).
-            let blobID = try store.insertLazyBlob(blobHmac: blobHmac, byteSize: blobSize, now: now)
+        if item.kind == .image, let blobKey = row.blobKey, let blobSize = payload.blobSize {
+            // Extract hmac from "blobs/<hmac>.bin"
+            let hmac = String(blobKey.dropFirst(CloudKey.blobsPrefix.count).dropLast(".bin".count))
+            let blobID = try store.insertLazyBlob(blobHmac: hmac, byteSize: blobSize, now: now)
             item.blobID = blobID
         }
-        // Set cloud_name so the next pull can ETag-skip this row.
-        item.cloudName = hmac
         _ = try store.insert(item)
-    }
-
-    private func handleTombstonePayload(_ payload: TombstonePayload, etag: String,
-                                        lastModified: Int64, key: String) throws {
-        let hmac = String(key.dropFirst(CloudKey.tombPrefix.count).dropLast(".bin".count))
-        try store.upsertTombstone(hmac: hmac, contentHash: payload.contentHash,
-                                  tombstonedAt: payload.tombstonedAt,
-                                  etag: etag, lastModified: lastModified)
-        // Delete any local items whose created_at <= tombstonedAt.
-        try store.deleteItemsByContentHashOlderThan(
-            contentHash: payload.contentHash, tombstonedAt: payload.tombstonedAt)
-    }
-```
-
-- [ ] **Step 4: Add the supporting HistoryStore helpers**
-
-Append to `Sources/Clip/Storage/HistoryStore.swift`:
-
-```swift
-    // MARK: - Sync helpers (Task 15+)
-
-    func itemByContentHash(_ hash: String) throws -> ClipItem? {
-        try pool.read { db in
-            try Row.fetchOne(db,
-                sql: "SELECT * FROM items WHERE content_hash = ? LIMIT 1",
-                arguments: [hash]).map(Self.itemFromRow)
-        }
-    }
-
-    func tombstoneAt(hmac: String) throws -> Int64? {
-        try pool.read { db in
-            try Int64.fetchOne(db,
-                sql: "SELECT tombstoned_at FROM tombstones WHERE hmac = ? LIMIT 1",
-                arguments: [hmac])
-        }
-    }
-
-    func updateMutableFromPayload(itemID: Int64, payload: ItemPayload,
-                                  etag: String, lastModified: Int64) throws {
-        try pool.write { db in
-            try db.execute(sql: """
-                UPDATE items SET pinned = ?, device_id = ?, cloud_etag = ?,
-                                 cloud_lastmodified = ?
-                WHERE id = ?
-            """, arguments: [payload.pinned ? 1 : 0, payload.deviceId, etag, lastModified, itemID])
-        }
-    }
-
-    func upsertTombstone(hmac: String, contentHash: String, tombstonedAt: Int64,
-                         etag: String, lastModified: Int64) throws {
-        try pool.write { db in
-            try db.execute(sql: """
-                INSERT INTO tombstones
-                (hmac, content_hash, tombstoned_at, cloud_synced_at, cloud_etag, cloud_lastmodified)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(hmac) DO UPDATE SET
-                  content_hash = excluded.content_hash,
-                  tombstoned_at = excluded.tombstoned_at,
-                  cloud_synced_at = excluded.cloud_synced_at,
-                  cloud_etag = excluded.cloud_etag,
-                  cloud_lastmodified = excluded.cloud_lastmodified
-            """, arguments: [hmac, contentHash, tombstonedAt, lastModified, etag, lastModified])
-        }
-    }
-
-    func deleteItemsByContentHashOlderThan(contentHash: String, tombstonedAt: Int64) throws {
-        try pool.write { db in
-            try db.execute(sql: """
-                DELETE FROM items WHERE content_hash = ? AND created_at <= ?
-            """, arguments: [contentHash, tombstonedAt])
-        }
-    }
-
-    /// Insert a placeholder blob row whose bytes are NULL (lazy-fetched later).
-    /// Stores `lazy:<blobHmac>` in the sha256 column so the row can be uniquely
-    /// addressed; real-blob fillBlob() updates sha256 to the actual SHA when bytes arrive.
-    func insertLazyBlob(blobHmac: String, byteSize: Int, now: Int64) throws -> Int64 {
-        try pool.write { db in
-            try db.execute(sql: """
-                INSERT INTO clip_blobs (sha256, bytes, byte_size, created_at)
-                VALUES (?, ?, ?, ?)
-            """, arguments: ["lazy:" + blobHmac, Data(), byteSize, now])
-            return db.lastInsertedRowID
-        }
-    }
-```
-
-(Also `import GRDB` is already present at the top.)
-
-- [ ] **Step 5: Run test to verify it passes**
-
-```bash
-swift test --filter ClipTests.SyncEnginePullTests
-```
-
-Expected: 2 tests pass.
-
-- [ ] **Step 6: Run the full suite (regression guard)**
-
-```bash
-swift test
-```
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add Sources/Clip/Sync/SyncEngine.swift Sources/Clip/Storage/HistoryStore.swift Tests/ClipTests/Sync/SyncEnginePullTests.swift
-git commit -m "sync: SyncEngine — pull half (list/get/upsert items, lazy blob ref)"
-```
-
----
-
-### Task 16: SyncEngine — tombstones (delete + propagate)
-
-**Files:**
-- Modify: `Sources/Clip/Sync/SyncEngine.swift` — implement `pushTomb` + `enqueueTombstone`
-- Modify: `Sources/Clip/Storage/HistoryStore.swift` — add `insertTombstone`
-- Create: `Tests/ClipTests/Sync/SyncEngineTombstoneTests.swift`
-
-- [ ] **Step 1: Write the failing test**
-
-```swift
-// Tests/ClipTests/Sync/SyncEngineTombstoneTests.swift
-import XCTest
-@testable import Clip
-
-final class SyncEngineTombstoneTests: XCTestCase {
-    func testDeleteOnAPropagatesToB() async throws {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("clip-test-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let backend = LocalDirBackend(root: dir)
-        let crypto = CryptoBox(masterKey: Data(repeating: 9, count: 32))
-
-        let storeA = try HistoryStore.inMemory()
-        let engineA = SyncEngine(store: storeA, backend: backend, crypto: crypto,
-                                 deviceID: "A", state: SyncStateStore(store: storeA))
-        let storeB = try HistoryStore.inMemory()
-        let engineB = SyncEngine(store: storeB, backend: backend, crypto: crypto,
-                                 deviceID: "B", state: SyncStateStore(store: storeB))
-
-        // A inserts + pushes
-        let id = try storeA.insert(ClipItem(
-            id: nil, content: "doomed", contentHash: ClipItem.contentHash(of: "doomed"),
-            sourceBundleID: nil, sourceAppName: nil, createdAt: 100,
-            pinned: false, byteSize: 6, truncated: false))
-        try await engineA.enqueueItemPush(itemID: id, at: 100)
-        _ = try await engineA.pushOnce(now: 100)
-
-        // B pulls — sees the item
-        try await engineB.pullOnce(now: 200)
-        XCTAssertEqual(try storeB.listRecent().count, 1)
-
-        // A deletes + tombstones + pushes the tomb
-        let hash = ClipItem.contentHash(of: "doomed")
-        try storeA.delete(id: id)
-        try await engineA.enqueueTombstone(contentHash: hash, at: 300)
-        _ = try await engineA.pushOnce(now: 300)
-
-        // B pulls — should see the tomb and remove the local row
-        try await engineB.pullOnce(now: 400)
-        XCTAssertEqual(try storeB.listRecent().count, 0)
-        // tombstones table on B should have a row preventing resurrection
-        XCTAssertNotNil(try storeB.tombstoneAt(hmac: crypto.name(forContentHash: hash)))
-    }
-}
-```
-
-- [ ] **Step 2: Run test to verify it fails**
-
-```bash
-swift test --filter ClipTests.SyncEngineTombstoneTests
-```
-
-Expected: compile error ("no method enqueueTombstone").
-
-- [ ] **Step 3: Add enqueueTombstone + pushTomb impl**
-
-In `SyncEngine`, replace the placeholder `pushTomb` and add `enqueueTombstone`:
-
-```swift
-    func enqueueTombstone(contentHash: String, at: Int64) throws {
-        let hmac = crypto.name(forContentHash: contentHash)
-        try store.insertTombstone(hmac: hmac, contentHash: contentHash, tombstonedAt: at)
-        try queue.enqueue(op: .putTomb, targetKey: hmac, at: at)
-    }
-
-    private func pushTomb(hmac: String) async throws {
-        guard let row = try store.tombstoneRow(hmac: hmac) else { return }
-        let payload = TombstonePayload(v: 1, contentHash: row.contentHash,
-                                       tombstonedAt: row.tombstonedAt, deviceId: deviceID)
-        let json = try JSONEncoder().encode(payload)
-        let sealed = try crypto.seal(json)
-        let key = CloudKey.tombKey(name: hmac)
-        let now = Int64(Date().timeIntervalSince1970)
-        let (etag, lm) = try await backend.put(key: key, body: sealed,
-                                               contentType: "application/octet-stream")
-        try store.markTombstoneSynced(hmac: hmac, at: now, etag: etag, lastModified: lm)
-        // Also delete the original items/<hmac>.bin so subsequent pulls don't re-INSERT.
-        try await backend.delete(key: CloudKey.itemKey(name: hmac))
-    }
-```
-
-In `HistoryStore`, append:
-
-```swift
-    func insertTombstone(hmac: String, contentHash: String, tombstonedAt: Int64) throws {
-        try pool.write { db in
-            try db.execute(sql: """
-                INSERT INTO tombstones (hmac, content_hash, tombstoned_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(hmac) DO UPDATE SET tombstoned_at = excluded.tombstoned_at
-            """, arguments: [hmac, contentHash, tombstonedAt])
-        }
-    }
-
-    struct TombstoneRow: Sendable {
-        var hmac: String
-        var contentHash: String
-        var tombstonedAt: Int64
-    }
-
-    func tombstoneRow(hmac: String) throws -> TombstoneRow? {
-        try pool.read { db in
-            try Row.fetchOne(db,
-                sql: "SELECT hmac, content_hash, tombstoned_at FROM tombstones WHERE hmac = ?",
-                arguments: [hmac]).map { row in
-                    TombstoneRow(hmac: row["hmac"], contentHash: row["content_hash"],
-                                 tombstonedAt: row["tombstoned_at"])
-                }
-        }
-    }
-
-    func markTombstoneSynced(hmac: String, at: Int64, etag: String, lastModified: Int64) throws {
-        try pool.write { db in
-            try db.execute(sql: """
-                UPDATE tombstones SET cloud_synced_at = ?, cloud_etag = ?, cloud_lastmodified = ?
-                WHERE hmac = ?
-            """, arguments: [at, etag, lastModified, hmac])
-        }
     }
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
 ```bash
-swift test --filter ClipTests.SyncEngineTombstoneTests
+swift test --filter ClipTests.SyncEnginePullTests
 ```
 
-Expected: 1 test passes.
+Expected: 3 tests pass.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add Sources/Clip/Sync/SyncEngine.swift Sources/Clip/Storage/HistoryStore.swift Tests/ClipTests/Sync/SyncEngineTombstoneTests.swift
-git commit -m "sync: SyncEngine — tombstone push + propagation, items/<h> cleanup on tomb"
+git add Sources/Clip/Sync/SyncEngine.swift Tests/ClipTests/Sync/SyncEnginePullTests.swift
+git commit -m "sync: SyncEngine pull — composite cursor (fix A) + tomb branch + LWW skip"
 ```
 
 ---
 
-### Task 17: SyncEngine — backfill
+### Task 18: SyncEngine.enableSync — config bootstrap + KDF
+
+Implements **fix C** (idempotent INSERT OR IGNORE) and **fix E** (schema_version gatekeeping).
 
 **Files:**
-- Modify: `Sources/Clip/Sync/SyncEngine.swift` — add `enableSync()` and `backfill()`
-- Modify: `Sources/Clip/Storage/HistoryStore.swift` — add `forSyncBackfill` query helpers
+- Modify: `Sources/Clip/Sync/SyncEngine.swift` — add static `enableSync` + `BootstrapResult` + `SyncError`
 - Create: `Tests/ClipTests/Sync/SyncEngineEnableTests.swift`
 
 - [ ] **Step 1: Write the failing test**
@@ -3045,288 +3342,74 @@ import XCTest
 @testable import Clip
 
 final class SyncEngineEnableTests: XCTestCase {
-    func testEnableQueuesExistingItemsNewestFirst() async throws {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("clip-test-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let backend = LocalDirBackend(root: dir)
-        let crypto = CryptoBox(masterKey: Data(repeating: 0xAA, count: 32))
+    func makeDS() throws -> LocalSqliteDataSource {
+        let ds = try LocalSqliteDataSource()
+        let group = DispatchGroup()
+        group.enter(); Task { try? await ds.ensureSchema(); group.leave() }
+        group.wait()
+        return ds
+    }
+
+    func testFirstDeviceWritesSaltAndDerivesKey() async throws {
+        let ds = try makeDS()
         let store = try HistoryStore.inMemory()
-        let state = SyncStateStore(store: store)
-        let engine = SyncEngine(store: store, backend: backend, crypto: crypto,
-                                deviceID: "DEV", state: state)
-
-        // Three pre-existing items, oldest first by createdAt
-        for (i, c) in ["old", "mid", "new"].enumerated() {
-            try store.insert(ClipItem(
-                id: nil, content: c, contentHash: ClipItem.contentHash(of: c),
-                sourceBundleID: nil, sourceAppName: nil, createdAt: Int64(100 + i),
-                pinned: false, byteSize: c.utf8.count, truncated: false))
-        }
-
-        try await engine.backfill(now: 1000)
-
-        // sync_queue should have 3 put_item rows; first dequeued = newest
-        let q = SyncQueue(store: store)
-        let r1 = try XCTUnwrap(try q.dequeueDueAt(now: 2000))
-        XCTAssertEqual(r1.op, .putItem)
-        let item1 = try XCTUnwrap(try store.itemByID(Int64(r1.targetKey)!))
-        XCTAssertEqual(item1.content, "new")
-    }
-
-    func testEnableSkipsExcludedItems() async throws {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("clip-test-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let backend = LocalDirBackend(root: dir)
-        let crypto = CryptoBox(masterKey: Data(repeating: 0xAA, count: 32))
-        let store = try HistoryStore.inMemory()
-        let engine = SyncEngine(store: store, backend: backend, crypto: crypto,
-                                deviceID: "DEV", state: SyncStateStore(store: store))
-
-        let id = try store.insert(ClipItem(
-            id: nil, content: "secret", contentHash: ClipItem.contentHash(of: "secret"),
-            sourceBundleID: nil, sourceAppName: nil, createdAt: 1,
-            pinned: false, byteSize: 6, truncated: false))
-        try store.setSyncExcluded(id: id, excluded: true)
-
-        try await engine.backfill(now: 1000)
-
-        XCTAssertEqual(try SyncQueue(store: store).peekAll().count, 0)
-    }
-}
-```
-
-- [ ] **Step 2: Run test to verify it fails**
-
-```bash
-swift test --filter ClipTests.SyncEngineEnableTests
-```
-
-Expected: compile error.
-
-- [ ] **Step 3: Add backfill to SyncEngine**
-
-```swift
-    /// Spec §7.6: enqueue every existing non-excluded item (and its blob if
-    /// ≤ 2MB) into sync_queue. Run once **after** `enableSync` (Task 17A) finishes
-    /// the bootstrap. Independent transaction; not part of Migrator.
-    func backfill(now: Int64) async throws {
-        try store.pool.write { db in
-            try db.execute(sql: """
-                INSERT INTO sync_queue (op, target_key, attempts, next_try_at, enqueued_at)
-                SELECT 'put_item', CAST(items.id AS TEXT), 0, ?, ?
-                FROM items
-                LEFT JOIN clip_blobs ON items.blob_id = clip_blobs.id
-                WHERE items.sync_excluded = 0
-                  AND (items.kind = 'text' OR clip_blobs.byte_size <= 2097152)
-                ORDER BY items.created_at DESC
-            """, arguments: [now, now])
-            try db.execute(sql: """
-                INSERT INTO sync_queue (op, target_key, attempts, next_try_at, enqueued_at)
-                SELECT 'put_blob', CAST(clip_blobs.id AS TEXT), 0, ?, ?
-                FROM clip_blobs
-                JOIN items ON items.blob_id = clip_blobs.id
-                WHERE items.sync_excluded = 0 AND clip_blobs.byte_size <= 2097152
-                ORDER BY items.created_at DESC
-            """, arguments: [now, now])
-        }
-    }
-```
-
-- [ ] **Step 4: Run test to verify it passes**
-
-```bash
-swift test --filter ClipTests.SyncEngineEnableTests
-```
-
-Expected: 2 tests pass.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add Sources/Clip/Sync/SyncEngine.swift Tests/ClipTests/Sync/SyncEngineEnableTests.swift
-git commit -m "sync: SyncEngine — backfill enqueues existing items newest-first"
-```
-
----
-
-### Task 18: SyncEngine — exclude propagation
-
-**Files:**
-- Modify: `Sources/Clip/Sync/SyncEngine.swift` — `excludeItem(id:)` method
-- Create: `Tests/ClipTests/Sync/SyncEngineExcludeTests.swift`
-
-- [ ] **Step 1: Write the failing test**
-
-```swift
-// Tests/ClipTests/Sync/SyncEngineExcludeTests.swift
-import XCTest
-@testable import Clip
-
-final class SyncEngineExcludeTests: XCTestCase {
-    func testExcludingSyncedItemEnqueuesTombAndDeletesPendingPushes() async throws {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("clip-test-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let backend = LocalDirBackend(root: dir)
-        let crypto = CryptoBox(masterKey: Data(repeating: 0xCC, count: 32))
-        let store = try HistoryStore.inMemory()
-        let engine = SyncEngine(store: store, backend: backend, crypto: crypto,
-                                deviceID: "DEV", state: SyncStateStore(store: store))
-
-        let id = try store.insert(ClipItem(
-            id: nil, content: "x", contentHash: ClipItem.contentHash(of: "x"),
-            sourceBundleID: nil, sourceAppName: nil, createdAt: 100,
-            pinned: false, byteSize: 1, truncated: false))
-        try await engine.enqueueItemPush(itemID: id, at: 100)
-        _ = try await engine.pushOnce(now: 100)  // it's now synced
-
-        try await engine.excludeItem(id: id, at: 200)
-
-        // sync_queue: a tomb row, no put_item row
-        let q = try SyncQueue(store: store).peekAll()
-        XCTAssertEqual(q.filter { $0.op == .putTomb }.count, 1)
-        XCTAssertEqual(q.filter { $0.op == .putItem }.count, 0)
-
-        // item flagged
-        XCTAssertEqual(try store.itemByID(id)?.syncExcluded, true)
-    }
-}
-```
-
-- [ ] **Step 2: Run test to verify it fails**
-
-```bash
-swift test --filter ClipTests.SyncEngineExcludeTests
-```
-
-Expected: compile error.
-
-- [ ] **Step 3: Add excludeItem method**
-
-```swift
-    /// User toggles "do not sync this" on a panel row.
-    /// Spec §7.5: synced item → tomb push + delete pending; unsynced → just delete pending.
-    func excludeItem(id: Int64, at: Int64) async throws {
-        guard let item = try store.itemByID(id) else { return }
-        try store.setSyncExcluded(id: id, excluded: true)
-        try queue.deleteAllForItem(itemID: id)
-        if item.cloudSyncedAt != nil {
-            try enqueueTombstone(contentHash: item.contentHash, at: at)
-        }
-    }
-```
-
-- [ ] **Step 4: Run test to verify it passes**
-
-```bash
-swift test --filter ClipTests.SyncEngineExcludeTests
-```
-
-Expected: 1 test passes.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add Sources/Clip/Sync/SyncEngine.swift Tests/ClipTests/Sync/SyncEngineExcludeTests.swift
-git commit -m "sync: SyncEngine — excludeItem (tomb + drop pending pushes)"
-```
-
----
-
-### Task 17A: SyncEngine — enableSync (config.json bootstrap + master-key derivation)
-
-This task closes the most load-bearing gap surfaced by plan-review pass 1: without it, no device can ever produce a valid `master_key` in Keychain, so `AppDelegate.startCloudSyncIfEnabled` (Task 22) silently no-ops and nothing ever syncs.
-
-**Files:**
-- Modify: `Sources/Clip/Sync/SyncEngine.swift` — add `enableSync(password:)` actor method
-- Modify: `Sources/Clip/Storage/HistoryStore.swift` — no change (uses `SyncStateStore`)
-- Create: `Tests/ClipTests/Sync/SyncEngineEnableBootstrapTests.swift`
-
-- [ ] **Step 1: Write the failing test**
-
-```swift
-// Tests/ClipTests/Sync/SyncEngineEnableBootstrapTests.swift
-import XCTest
-@testable import Clip
-
-final class SyncEngineEnableBootstrapTests: XCTestCase {
-    func makeBackend() -> LocalDirBackend {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("clip-test-\(UUID().uuidString)")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return LocalDirBackend(root: dir)
-    }
-
-    func testFirstDeviceWritesConfigAndDerivesMasterKey() async throws {
-        let backend = makeBackend()
-        let store = try HistoryStore.inMemory()
-        let state = SyncStateStore(store: store)
         let kc = KeychainStore(service: "com.zyw.clip.test.\(UUID().uuidString)")
+        defer { try? kc.delete(account: "master") }
 
         let result = try await SyncEngine.enableSync(
             password: "correct-horse-battery-staple",
-            backend: backend, state: state, keychain: kc, account: "master")
+            dataSource: ds,
+            state: SyncStateStore(store: store),
+            keychain: kc, account: "master")
 
         XCTAssertEqual(result, .firstDevice)
-        // config.json now exists in cloud
-        XCTAssertNotNil(try await backend.get(key: CloudKey.configKey))
-        // master key in Keychain
+        XCTAssertNotNil(try await ds.getConfig(key: "kdf_salt_b64"))
+        XCTAssertEqual(try await ds.getConfig(key: "kdf_iters"), "200000")
+        XCTAssertEqual(try await ds.getConfig(key: "schema_version"), "3")
         XCTAssertNotNil(try kc.read(account: "master"))
-        // sync_state populated
-        XCTAssertNotNil(try state.get("kdf_salt_b64"))
-        XCTAssertEqual(try state.get("kdf_iters"), "200000")
     }
 
-    func testJoiningDeviceRestoresMasterKeyFromExistingConfig() async throws {
-        let backend = makeBackend()
-
-        // Device A: bootstrap
-        let storeA = try HistoryStore.inMemory()
-        let stateA = SyncStateStore(store: storeA)
+    func testSecondDeviceJoinsAndDerivesSameKey() async throws {
+        let ds = try makeDS()
         let kcA = KeychainStore(service: "com.zyw.clip.test.\(UUID().uuidString)")
+        let kcB = KeychainStore(service: "com.zyw.clip.test.\(UUID().uuidString)")
+        defer { try? kcA.delete(account: "master"); try? kcB.delete(account: "master") }
+
         _ = try await SyncEngine.enableSync(
             password: "correct-horse-battery-staple",
-            backend: backend, state: stateA, keychain: kcA, account: "master")
+            dataSource: ds,
+            state: SyncStateStore(store: try HistoryStore.inMemory()),
+            keychain: kcA, account: "master")
         let masterA = try kcA.read(account: "master")
 
-        // Device B: joins with same password
-        let storeB = try HistoryStore.inMemory()
-        let stateB = SyncStateStore(store: storeB)
-        let kcB = KeychainStore(service: "com.zyw.clip.test.\(UUID().uuidString)")
         let result = try await SyncEngine.enableSync(
             password: "correct-horse-battery-staple",
-            backend: backend, state: stateB, keychain: kcB, account: "master")
+            dataSource: ds,
+            state: SyncStateStore(store: try HistoryStore.inMemory()),
+            keychain: kcB, account: "master")
 
         XCTAssertEqual(result, .joinedExisting)
-        XCTAssertEqual(try kcB.read(account: "master"), masterA, "same password+salt → same key")
+        XCTAssertEqual(try kcB.read(account: "master"), masterA,
+                       "same password+salt → same key")
     }
 
-    func testJoiningWithWrongPasswordStillDerivesKeyButCallerCanReject() async throws {
-        // The bootstrap function does not itself verify the password against
-        // an existing payload — that's the engine's pull job to surface
-        // (decryption fails on first item GET). This test pins the design.
-        let backend = makeBackend()
+    func testSchemaVersionGuardThrowsWhenRemoteNewer() async throws {
+        let ds = try makeDS()
+        // Manually bump remote schema_version
+        _ = try await ds.putConfigIfAbsent(key: "schema_version", value: "999")
+        let kc = KeychainStore(service: "com.zyw.clip.test.\(UUID().uuidString)")
+        defer { try? kc.delete(account: "master") }
 
-        let storeA = try HistoryStore.inMemory()
-        let kcA = KeychainStore(service: "com.zyw.clip.test.\(UUID().uuidString)")
-        _ = try await SyncEngine.enableSync(
-            password: "correct-pass",
-            backend: backend, state: SyncStateStore(store: storeA),
-            keychain: kcA, account: "master")
-
-        let storeB = try HistoryStore.inMemory()
-        let kcB = KeychainStore(service: "com.zyw.clip.test.\(UUID().uuidString)")
-        // Different password: still completes bootstrap (different master_key
-        // gets written). Caller verifies via test-decryption afterward.
-        let result = try await SyncEngine.enableSync(
-            password: "wrong-pass",
-            backend: backend, state: SyncStateStore(store: storeB),
-            keychain: kcB, account: "master")
-        XCTAssertEqual(result, .joinedExisting)
-        XCTAssertNotEqual(try kcA.read(account: "master"),
-                          try kcB.read(account: "master"))
+        do {
+            _ = try await SyncEngine.enableSync(
+                password: "x", dataSource: ds,
+                state: SyncStateStore(store: try HistoryStore.inMemory()),
+                keychain: kc, account: "master")
+            XCTFail("expected throw")
+        } catch SyncError.remoteSchemaNewer(let r, let l) {
+            XCTAssertEqual(r, "999")
+            XCTAssertEqual(l, "3")
+        }
     }
 }
 ```
@@ -3334,81 +3417,87 @@ final class SyncEngineEnableBootstrapTests: XCTestCase {
 - [ ] **Step 2: Run test to verify it fails**
 
 ```bash
-swift test --filter ClipTests.SyncEngineEnableBootstrapTests
+swift test --filter ClipTests.SyncEngineEnableTests
 ```
 
-Expected: compile error.
+- [ ] **Step 3: Add enableSync (static) + SyncError + BootstrapResult**
 
-- [ ] **Step 3: Add enableSync to SyncEngine**
+Add at the top of `SyncEngine.swift` (outside the actor):
 
-Append (as a `static` method on `SyncEngine` because it runs before the engine instance is constructed):
+```swift
+enum SyncError: Error, Equatable {
+    case remoteSchemaNewer(remote: String, local: String)
+    case decryptionFailed
+    case d1(String)
+    case r2(String)
+}
+```
+
+Append to `SyncEngine.swift` as an extension:
 
 ```swift
 extension SyncEngine {
     enum BootstrapResult: Equatable {
-        case firstDevice         // wrote config.json + new salt
-        case joinedExisting      // read config.json, derived from existing salt
+        case firstDevice
+        case joinedExisting
     }
 
-    /// Spec §7.1 first-time enable flow. Runs before SyncEngine is instantiated;
-    /// once successful, AppDelegate can construct the engine with the freshly
-    /// written master_key and run pull/push as normal.
+    /// Spec §7.1 first-time enable. Static because it runs before SyncEngine
+    /// is instantiated. Bakes in fix C (INSERT OR IGNORE) + fix E (schema_version).
     ///
     /// Side effects:
-    ///   - config.json present in `backend` (created if missing)
-    ///   - kdf_salt_b64 / kdf_iters / kdf_version persisted to sync_state
-    ///   - master_key written to Keychain under `(service:account)`
-    ///   - device_id allocated to sync_state if not already there
+    ///   - D1 schema present (CREATE IF NOT EXISTS)
+    ///   - config { schema_version='3', kdf_iters='200000', kdf_salt_b64=<...> }
+    ///   - master_key written to (keychain.service, account)
+    ///   - device_id allocated locally if missing
     static func enableSync(
         password: String,
-        backend: CloudSyncBackend,
+        dataSource: CloudSyncDataSource,
         state: SyncStateStore,
         keychain: KeychainStore,
         account: String
     ) async throws -> BootstrapResult {
+        let localSchemaVersion = "3"
         let iters = 200_000
-        let configBytes = try await backend.get(key: CloudKey.configKey)
-        let result: BootstrapResult
-        let salt: Data
 
-        if let configBytes {
-            let config = try JSONDecoder().decode(CloudConfigPayload.self, from: configBytes)
-            guard let s = Data(base64Encoded: config.kdfSaltB64) else {
-                throw NSError(domain: "SyncEngine", code: 1,
-                              userInfo: [NSLocalizedDescriptionKey: "config salt malformed"])
-            }
-            salt = s
-            try state.set("kdf_iters", String(config.kdfIters))
-            result = .joinedExisting
-        } else {
-            // First device — generate salt + write config.
-            var fresh = Data(count: 16)
-            _ = fresh.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!) }
-            salt = fresh
-            let payload = CloudConfigPayload(
-                v: 1, kdf: "pbkdf2-hmac-sha256",
-                kdfIters: iters, kdfSaltB64: salt.base64EncodedString(),
-                format: "chacha20-poly1305-ietf-12-16")
-            let json = try JSONEncoder().encode(payload)
-            _ = try await backend.put(key: CloudKey.configKey, body: json,
-                                      contentType: "application/json")
-            try state.set("kdf_iters", String(iters))
-            result = .firstDevice
+        try await dataSource.ensureSchema()
+
+        // Fix E — schema_version gatekeeping
+        let remote = try await dataSource.getConfig(key: "schema_version") ?? localSchemaVersion
+        if (Int(remote) ?? 0) > (Int(localSchemaVersion) ?? 0) {
+            throw SyncError.remoteSchemaNewer(remote: remote, local: localSchemaVersion)
+        }
+        // Stamp our version (idempotent)
+        _ = try await dataSource.putConfigIfAbsent(key: "schema_version", value: localSchemaVersion)
+
+        // Fix C — idempotent salt + iters bootstrap
+        var saltBytes = Data(count: 16)
+        _ = saltBytes.withUnsafeMutableBytes {
+            SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!)
+        }
+        let saltB64 = saltBytes.base64EncodedString()
+        let iWonSalt = try await dataSource.putConfigIfAbsent(
+            key: "kdf_salt_b64", value: saltB64)
+        _ = try await dataSource.putConfigIfAbsent(
+            key: "kdf_iters", value: String(iters))
+
+        // Read authoritative salt (mine if iWon, theirs otherwise)
+        guard let authSaltB64 = try await dataSource.getConfig(key: "kdf_salt_b64"),
+              let authSalt = Data(base64Encoded: authSaltB64) else {
+            throw SyncError.d1("kdf_salt_b64 missing after bootstrap")
         }
 
-        try state.set("kdf_salt_b64", salt.base64EncodedString())
-        try state.set("kdf_version", "1")
-
         let masterKey = KeyDerivation.pbkdf2_sha256(
-            password: password, salt: salt,
+            password: password, salt: authSalt,
             iterations: iters, keyLength: 32)
         try keychain.write(account: account, data: masterKey)
 
+        // Allocate local device_id if missing
         if try state.get("device_id") == nil {
-            try state.set("device_id", UUID().uuidString)
+            try state.set("device_id", UUID().uuidString.lowercased())
         }
 
-        return result
+        return iWonSalt ? .firstDevice : .joinedExisting
     }
 }
 ```
@@ -3416,7 +3505,7 @@ extension SyncEngine {
 - [ ] **Step 4: Run test to verify it passes**
 
 ```bash
-swift test --filter ClipTests.SyncEngineEnableBootstrapTests
+swift test --filter ClipTests.SyncEngineEnableTests
 ```
 
 Expected: 3 tests pass.
@@ -3424,19 +3513,16 @@ Expected: 3 tests pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add Sources/Clip/Sync/SyncEngine.swift Tests/ClipTests/Sync/SyncEngineEnableBootstrapTests.swift
-git commit -m "sync: SyncEngine.enableSync — config.json bootstrap + master-key derivation"
+git add Sources/Clip/Sync/SyncEngine.swift Tests/ClipTests/Sync/SyncEngineEnableTests.swift
+git commit -m "sync: SyncEngine.enableSync — idempotent bootstrap + schema-version guard (fix C+E)"
 ```
 
 ---
 
-### Task 17B: SyncEngine + HistoryStore — lazy blob fetch
-
-Closes the second load-bearing gap from plan-review: insert side of lazy blobs is in T15, but no read side; image rows on B device would have `bytes` empty forever.
+### Task 19: SyncEngine.fetchBlob — lazy image download
 
 **Files:**
-- Modify: `Sources/Clip/Sync/SyncEngine.swift` — add `fetchBlob(blobHmac:) async throws -> Data`
-- Modify: `Sources/Clip/Storage/HistoryStore.swift` — add `fillBlob`, `lazyBlobHmac` helpers; refactor `blob(id:)` is unchanged (it stays sync; lazy resolution happens in caller)
+- Modify: `Sources/Clip/Sync/SyncEngine.swift` — add `fetchBlob(blobID:)`
 - Create: `Tests/ClipTests/Sync/SyncEngineLazyBlobTests.swift`
 
 - [ ] **Step 1: Write the failing test**
@@ -3448,42 +3534,45 @@ import XCTest
 
 final class SyncEngineLazyBlobTests: XCTestCase {
     func testFetchBlobDecryptsAndFillsLocalRow() async throws {
+        let ds = try LocalSqliteDataSource()
+        let group = DispatchGroup()
+        group.enter(); Task { try? await ds.ensureSchema(); group.leave() }
+        group.wait()
         let dir = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("clip-test-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let backend = LocalDirBackend(root: dir)
+        let blobs = LocalDirBlobStore(root: dir)
         let crypto = CryptoBox(masterKey: Data(repeating: 0xEE, count: 32))
-
         let storeA = try HistoryStore.inMemory()
-        let engineA = SyncEngine(store: storeA, backend: backend, crypto: crypto,
-                                 deviceID: "A", state: SyncStateStore(store: storeA))
+        let engineA = SyncEngine(store: storeA, dataSource: ds, blobStore: blobs,
+                                 crypto: crypto, deviceID: "A",
+                                 state: SyncStateStore(store: storeA))
         let storeB = try HistoryStore.inMemory()
-        let engineB = SyncEngine(store: storeB, backend: backend, crypto: crypto,
-                                 deviceID: "B", state: SyncStateStore(store: storeB))
+        let engineB = SyncEngine(store: storeB, dataSource: ds, blobStore: blobs,
+                                 crypto: crypto, deviceID: "B",
+                                 state: SyncStateStore(store: storeB))
 
-        // A inserts an image
+        // A inserts and pushes
         let bytes = Data(repeating: 0x42, count: 1024)
         let aID = try storeA.insertImage(
             bytes: bytes, mimeType: "image/png",
             sourceBundleID: nil, sourceAppName: nil, now: 100)
         let aBlobID = try XCTUnwrap(try storeA.itemByID(aID)?.blobID)
-        try await engineA.enqueueItemPush(itemID: aID, at: 100)
+        try await engineA.enqueueClipPush(itemID: aID, at: 100)
         try await engineA.enqueueBlobPush(blobID: aBlobID, at: 100)
         _ = try await engineA.pushOnce(now: 100)
         _ = try await engineA.pushOnce(now: 101)
 
-        // B pulls — has lazy blob row but no bytes
+        // B pulls — has lazy ref
         try await engineB.pullOnce(now: 200)
         let bItem = try XCTUnwrap(try storeB.listRecent().first)
         let bBlobID = try XCTUnwrap(bItem.blobID)
-        let beforeBytes = try storeB.blob(id: bBlobID) ?? Data()
-        XCTAssertTrue(beforeBytes.isEmpty, "lazy row starts empty")
+        XCTAssertTrue((try storeB.blob(id: bBlobID) ?? Data()).isEmpty)
 
-        // B fetches: should hit backend, decrypt, fill local
+        // B fetches: hits backend, decrypts, fills local
         let got = try await engineB.fetchBlob(blobID: bBlobID)
         XCTAssertEqual(got, bytes)
-        let after = try XCTUnwrap(try storeB.blob(id: bBlobID))
-        XCTAssertEqual(after, bytes, "row now filled")
+        XCTAssertEqual(try storeB.blob(id: bBlobID), bytes)
     }
 }
 ```
@@ -3494,59 +3583,28 @@ final class SyncEngineLazyBlobTests: XCTestCase {
 swift test --filter ClipTests.SyncEngineLazyBlobTests
 ```
 
-Expected: compile error.
+- [ ] **Step 3: Implement fetchBlob**
 
-- [ ] **Step 3: Implement fetchBlob + HistoryStore helpers**
-
-Append to `Sources/Clip/Sync/SyncEngine.swift` inside the actor:
+Append inside `actor SyncEngine`:
 
 ```swift
-    /// Spec §7.4 — lazy image download. Caller holds a clip_blobs.id whose
+    /// Spec §7.4 lazy image download. Caller holds a clip_blobs.id whose
     /// `bytes` is empty (sha256 prefixed `lazy:`). Resolves the blob_hmac,
-    /// GETs blobs/<hmac>.bin, decrypts, fills the local row, returns bytes.
+    /// GETs blobs/<hmac>.bin, decrypts, fills local row, returns bytes.
     func fetchBlob(blobID: Int64) async throws -> Data {
         guard let info = try store.lazyBlobHmac(id: blobID) else {
-            throw NSError(domain: "SyncEngine", code: 2,
-                          userInfo: [NSLocalizedDescriptionKey: "blob \(blobID) is not lazy"])
+            // Already filled — caller should re-read.
+            return (try store.blob(id: blobID)) ?? Data()
         }
         let key = CloudKey.blobKey(name: info.hmac)
-        guard let sealed = try await backend.get(key: key) else {
-            throw NSError(domain: "SyncEngine", code: 3,
-                          userInfo: [NSLocalizedDescriptionKey: "blob \(info.hmac) missing in cloud"])
+        guard let sealed = try await blobStore.getBlob(key: key) else {
+            throw SyncError.r2("blob \(info.hmac) not found in cloud")
         }
         let bytes = try crypto.open(sealed)
         let realSha = ClipItem.contentHash(of: bytes)
         try store.fillBlob(id: blobID, bytes: bytes, sha256: realSha,
-                          at: Int64(Date().timeIntervalSince1970))
+                           at: Int64(Date().timeIntervalSince1970))
         return bytes
-    }
-```
-
-Append to `Sources/Clip/Storage/HistoryStore.swift`:
-
-```swift
-    /// If `clip_blobs.sha256` starts with "lazy:", return the hmac suffix
-    /// and current byte_size. Otherwise nil (already filled).
-    func lazyBlobHmac(id: Int64) throws -> (hmac: String, byteSize: Int)? {
-        try pool.read { db in
-            guard let row = try Row.fetchOne(db,
-                sql: "SELECT sha256, byte_size FROM clip_blobs WHERE id = ?",
-                arguments: [id]) else { return nil }
-            let sha: String = row["sha256"]
-            guard sha.hasPrefix("lazy:") else { return nil }
-            return (String(sha.dropFirst("lazy:".count)), row["byte_size"])
-        }
-    }
-
-    /// Replace the lazy placeholder with real bytes + real sha256.
-    /// `cloud_synced_at` is set so subsequent prune knows it's "live".
-    func fillBlob(id: Int64, bytes: Data, sha256: String, at: Int64) throws {
-        try pool.write { db in
-            try db.execute(sql: """
-                UPDATE clip_blobs SET bytes = ?, sha256 = ?, cloud_synced_at = ?
-                WHERE id = ?
-            """, arguments: [bytes, sha256, at, id])
-        }
     }
 ```
 
@@ -3556,20 +3614,283 @@ Append to `Sources/Clip/Storage/HistoryStore.swift`:
 swift test --filter ClipTests.SyncEngineLazyBlobTests
 ```
 
-Expected: 1 test passes.
+- [ ] **Step 5: Commit**
+
+```bash
+git add Sources/Clip/Sync/SyncEngine.swift Tests/ClipTests/Sync/SyncEngineLazyBlobTests.swift
+git commit -m "sync: SyncEngine.fetchBlob — R2 GET + decrypt + fill local row"
+```
+
+---
+
+### Task 20: SyncEngine.backfill — enqueue existing items on enable
+
+**Files:**
+- Modify: `Sources/Clip/Sync/SyncEngine.swift` — add `backfill(now:)`
+- Create: `Tests/ClipTests/Sync/SyncEngineBackfillTests.swift`
+
+- [ ] **Step 1: Write the failing test**
+
+```swift
+// Tests/ClipTests/Sync/SyncEngineBackfillTests.swift
+import XCTest
+@testable import Clip
+
+final class SyncEngineBackfillTests: XCTestCase {
+    func makeEngine(_ store: HistoryStore) async throws -> SyncEngine {
+        let ds = try LocalSqliteDataSource()
+        try await ds.ensureSchema()
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("clip-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return SyncEngine(store: store, dataSource: ds,
+                          blobStore: LocalDirBlobStore(root: dir),
+                          crypto: CryptoBox(masterKey: Data(repeating: 1, count: 32)),
+                          deviceID: "DEV",
+                          state: SyncStateStore(store: store))
+    }
+
+    func testBackfillEnqueuesNewestFirst() async throws {
+        let store = try HistoryStore.inMemory()
+        let engine = try await makeEngine(store)
+        for (i, c) in ["old", "mid", "new"].enumerated() {
+            try store.insert(ClipItem(
+                id: nil, content: c, contentHash: ClipItem.contentHash(of: c),
+                sourceBundleID: nil, sourceAppName: nil, createdAt: Int64(100 + i),
+                pinned: false, byteSize: c.utf8.count, truncated: false))
+        }
+        try await engine.backfill(now: 1000)
+        let q = SyncQueue(store: store)
+        let r = try XCTUnwrap(try q.dequeueDueAt(now: 2000))
+        let item = try XCTUnwrap(try store.itemByID(Int64(r.targetKey)!))
+        XCTAssertEqual(item.content, "new", "newest first")
+    }
+
+    func testBackfillSkipsExcluded() async throws {
+        let store = try HistoryStore.inMemory()
+        let engine = try await makeEngine(store)
+        let id = try store.insert(ClipItem(
+            id: nil, content: "secret", contentHash: ClipItem.contentHash(of: "secret"),
+            sourceBundleID: nil, sourceAppName: nil, createdAt: 1,
+            pinned: false, byteSize: 6, truncated: false))
+        try store.setSyncExcluded(id: id, excluded: true)
+        try await engine.backfill(now: 1000)
+        XCTAssertEqual(try SyncQueue(store: store).peekAll().count, 0)
+    }
+
+    func testBackfillSkipsAlreadySyncedItems() async throws {
+        let store = try HistoryStore.inMemory()
+        let engine = try await makeEngine(store)
+        let id = try store.insert(ClipItem(
+            id: nil, content: "x", contentHash: ClipItem.contentHash(of: "x"),
+            sourceBundleID: nil, sourceAppName: nil, createdAt: 1,
+            pinned: false, byteSize: 1, truncated: false))
+        try store.markClipSynced(id: id, cloudID: "c", updatedAt: 1, at: 1)
+        try await engine.backfill(now: 1000)
+        XCTAssertEqual(try SyncQueue(store: store).peekAll().count, 0,
+                       "synced items not re-enqueued")
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+```bash
+swift test --filter ClipTests.SyncEngineBackfillTests
+```
+
+- [ ] **Step 3: Implement backfill**
+
+Append inside `actor SyncEngine`:
+
+```swift
+    /// Spec §7.6 — enqueue every existing non-excluded, non-yet-synced item
+    /// (and its blob if image and ≤2MB). Run once after `enableSync` finishes
+    /// AND only on the first device (BootstrapResult.firstDevice).
+    func backfill(now: Int64) async throws {
+        try store.pool.write { db in
+            try db.execute(sql: """
+                INSERT INTO sync_queue (op, target_key, attempts, next_try_at, enqueued_at)
+                SELECT 'put_clip', CAST(items.id AS TEXT), 0, ?, ?
+                FROM items
+                LEFT JOIN clip_blobs ON items.blob_id = clip_blobs.id
+                WHERE items.sync_excluded = 0
+                  AND items.cloud_id IS NULL
+                  AND (items.kind = 'text' OR clip_blobs.byte_size <= 2097152)
+                ORDER BY items.created_at DESC
+            """, arguments: [now, now])
+            try db.execute(sql: """
+                INSERT INTO sync_queue (op, target_key, attempts, next_try_at, enqueued_at)
+                SELECT 'put_blob', CAST(clip_blobs.id AS TEXT), 0, ?, ?
+                FROM clip_blobs
+                JOIN items ON items.blob_id = clip_blobs.id
+                WHERE items.sync_excluded = 0
+                  AND items.cloud_id IS NULL
+                  AND clip_blobs.byte_size <= 2097152
+                ORDER BY items.created_at DESC
+            """, arguments: [now, now])
+        }
+    }
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+```bash
+swift test --filter ClipTests.SyncEngineBackfillTests
+```
+
+Expected: 3 tests pass.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add Sources/Clip/Sync/SyncEngine.swift Sources/Clip/Storage/HistoryStore.swift Tests/ClipTests/Sync/SyncEngineLazyBlobTests.swift
-git commit -m "sync: SyncEngine.fetchBlob — lazy image download + decrypt + local fill"
+git add Sources/Clip/Sync/SyncEngine.swift Tests/ClipTests/Sync/SyncEngineBackfillTests.swift
+git commit -m "sync: SyncEngine.backfill — enqueue existing items newest-first"
+```
+
+---
+
+### Task 21: SyncEngine.excludeItem + tomb push
+
+**Files:**
+- Modify: `Sources/Clip/Sync/SyncEngine.swift` — implement `excludeItem` + `pushTomb`
+- Create: `Tests/ClipTests/Sync/SyncEngineExcludeTests.swift`
+
+- [ ] **Step 1: Write the failing test**
+
+```swift
+// Tests/ClipTests/Sync/SyncEngineExcludeTests.swift
+import XCTest
+@testable import Clip
+
+final class SyncEngineExcludeTests: XCTestCase {
+    func makePair() throws -> (HistoryStore, SyncEngine, LocalSqliteDataSource) {
+        let ds = try LocalSqliteDataSource()
+        let group = DispatchGroup()
+        group.enter(); Task { try? await ds.ensureSchema(); group.leave() }
+        group.wait()
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("clip-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let store = try HistoryStore.inMemory()
+        let engine = SyncEngine(
+            store: store, dataSource: ds,
+            blobStore: LocalDirBlobStore(root: dir),
+            crypto: CryptoBox(masterKey: Data(repeating: 0xCC, count: 32)),
+            deviceID: "DEV", state: SyncStateStore(store: store))
+        return (store, engine, ds)
+    }
+
+    func testExcludeSyncedItemDeletesQueueAndMarksRemote() async throws {
+        let (store, engine, ds) = try makePair()
+        let id = try store.insert(ClipItem(
+            id: nil, content: "x", contentHash: ClipItem.contentHash(of: "x"),
+            sourceBundleID: nil, sourceAppName: nil, createdAt: 100,
+            pinned: false, byteSize: 1, truncated: false))
+        try await engine.enqueueClipPush(itemID: id, at: 100)
+        _ = try await engine.pushOnce(now: 100)
+
+        // Verify D1 has it (deleted=0)
+        let crypto = CryptoBox(masterKey: Data(repeating: 0xCC, count: 32))
+        let hmac = crypto.name(forContentHash: ClipItem.contentHash(of: "x"))
+        XCTAssertEqual(try await ds.queryClipByHmac(hmac)?.deleted, false)
+
+        try await engine.excludeItem(id: id, at: 200)
+
+        // Local: sync_excluded set + tombstone written
+        XCTAssertEqual(try store.itemByID(id)?.syncExcluded, true)
+        XCTAssertNotNil(try store.tombstoneAt(contentHash: ClipItem.contentHash(of: "x")))
+        // Local sync_queue: no put_clip; one put_tomb (drained next pushOnce)
+        let q = try SyncQueue(store: store).peekAll()
+        XCTAssertEqual(q.filter { $0.op == .putClip }.count, 0)
+        XCTAssertEqual(q.filter { $0.op == .putTomb }.count, 1)
+
+        // Drain the tomb push → D1 row.deleted = 1
+        _ = try await engine.pushOnce(now: 300)
+        XCTAssertEqual(try await ds.queryClipByHmac(hmac)?.deleted, true)
+    }
+
+    func testExcludeUnsyncedItemOnlyClearsQueue() async throws {
+        let (store, engine, _) = try makePair()
+        let id = try store.insert(ClipItem(
+            id: nil, content: "y", contentHash: ClipItem.contentHash(of: "y"),
+            sourceBundleID: nil, sourceAppName: nil, createdAt: 100,
+            pinned: false, byteSize: 1, truncated: false))
+        try await engine.enqueueClipPush(itemID: id, at: 100)
+
+        try await engine.excludeItem(id: id, at: 200)
+
+        XCTAssertEqual(try store.itemByID(id)?.syncExcluded, true)
+        XCTAssertEqual(try SyncQueue(store: store).peekAll().count, 0,
+                       "no put_tomb (never reached cloud) + put_clip cleared")
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+```bash
+swift test --filter ClipTests.SyncEngineExcludeTests
+```
+
+- [ ] **Step 3: Implement excludeItem + pushTomb**
+
+Replace the placeholder `pushTomb` and add `excludeItem`:
+
+```swift
+    /// User toggles "do not sync this" on a panel row. Spec §7.5.
+    func excludeItem(id: Int64, at: Int64) async throws {
+        guard let item = try store.itemByID(id) else { return }
+        try store.setSyncExcluded(id: id, excluded: true)
+        try queue.deleteAllForItem(itemID: id)
+        if let cloudID = item.cloudID {
+            // Already on cloud → write local tombstone + enqueue tomb push
+            try store.upsertTombstone(contentHash: item.contentHash,
+                                      cloudID: cloudID,
+                                      tombstonedAt: at,
+                                      cloudUpdatedAt: at)
+            try queue.enqueue(op: .putTomb, targetKey: item.contentHash, at: at)
+        }
+        // Else: never reached cloud, no remote action needed.
+    }
+
+    private func pushTomb(contentHash: String) async throws {
+        // Fetch local tomb to find cloud_id
+        let cloudID = try store.pool.read { db in
+            try String.fetchOne(db,
+                sql: "SELECT cloud_id FROM tombstones WHERE content_hash = ?",
+                arguments: [contentHash])
+        }
+        guard let cloudID else { return }
+        let serverUpdatedAt = try await dataSource.setClipDeleted(id: cloudID)
+        // Re-stamp local tombstone with server-authoritative updated_at
+        try store.upsertTombstone(contentHash: contentHash,
+                                  cloudID: cloudID,
+                                  tombstonedAt: serverUpdatedAt,
+                                  cloudUpdatedAt: serverUpdatedAt)
+    }
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+```bash
+swift test --filter ClipTests.SyncEngineExcludeTests
+```
+
+Expected: 2 tests pass.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add Sources/Clip/Sync/SyncEngine.swift Tests/ClipTests/Sync/SyncEngineExcludeTests.swift
+git commit -m "sync: SyncEngine.excludeItem + pushTomb (tomb writes UPDATE deleted=1)"
 ```
 
 ---
 
 ## Phase P4 — UI + wire-in
 
-### Task 19: SyncSettings — UserDefaults config wrapper
+### Task 22: SyncSettings — UserDefaults config wrapper
 
 **Files:**
 - Create: `Sources/Clip/Sync/SyncSettings.swift`
@@ -3594,21 +3915,27 @@ final class SyncSettingsTests: XCTestCase {
 
     func testDefaultsAreEmpty() {
         XCTAssertFalse(s.enabled)
-        XCTAssertNil(s.endpoint)
-        XCTAssertNil(s.bucket)
-        XCTAssertNil(s.accessKeyID)
+        XCTAssertNil(s.r2Endpoint)
+        XCTAssertNil(s.r2Bucket)
+        XCTAssertNil(s.r2AccessKeyID)
+        XCTAssertNil(s.d1AccountID)
+        XCTAssertNil(s.d1DatabaseID)
     }
 
     func testRoundTrip() {
         s.enabled = true
-        s.endpoint = "https://x.r2.cloudflarestorage.com"
-        s.bucket = "clip-sync"
-        s.accessKeyID = "AK"
+        s.r2Endpoint = "https://x.r2.cloudflarestorage.com"
+        s.r2Bucket = "clip-sync"
+        s.r2AccessKeyID = "AK"
+        s.d1AccountID = "ACCT"
+        s.d1DatabaseID = "DB-UUID"
         let s2 = SyncSettings(defaults: defaults)
         XCTAssertTrue(s2.enabled)
-        XCTAssertEqual(s2.endpoint, "https://x.r2.cloudflarestorage.com")
-        XCTAssertEqual(s2.bucket, "clip-sync")
-        XCTAssertEqual(s2.accessKeyID, "AK")
+        XCTAssertEqual(s2.r2Endpoint, "https://x.r2.cloudflarestorage.com")
+        XCTAssertEqual(s2.r2Bucket, "clip-sync")
+        XCTAssertEqual(s2.r2AccessKeyID, "AK")
+        XCTAssertEqual(s2.d1AccountID, "ACCT")
+        XCTAssertEqual(s2.d1DatabaseID, "DB-UUID")
     }
 }
 ```
@@ -3619,48 +3946,53 @@ final class SyncSettingsTests: XCTestCase {
 swift test --filter ClipTests.SyncSettingsTests
 ```
 
-Expected: compile error.
-
 - [ ] **Step 3: Implement SyncSettings**
 
 ```swift
 // Sources/Clip/Sync/SyncSettings.swift
 import Foundation
 
-/// User-facing sync configuration. Non-secret values live in UserDefaults;
-/// the secret access key + master key live in Keychain. Spec §8.1.
+/// User-facing sync configuration. Non-secrets in UserDefaults; secret R2
+/// access key + D1 API token + master key in Keychain (separate stores).
 final class SyncSettings: Sendable {
     private let defaults: UserDefaults
-
     init(defaults: UserDefaults = .standard) { self.defaults = defaults }
 
     private enum Key {
-        static let enabled     = "clip.cloud.enabled"
-        static let endpoint    = "clip.cloud.endpoint"
-        static let bucket      = "clip.cloud.bucket"
-        static let accessKeyID = "clip.cloud.access_key_id"
+        static let enabled       = "clip.cloud.enabled"
+        static let r2Endpoint    = "clip.cloud.r2.endpoint"
+        static let r2Bucket      = "clip.cloud.r2.bucket"
+        static let r2AccessKeyID = "clip.cloud.r2.access_key_id"
+        static let d1AccountID   = "clip.cloud.d1.account_id"
+        static let d1DatabaseID  = "clip.cloud.d1.database_id"
     }
 
     var enabled: Bool {
         get { defaults.bool(forKey: Key.enabled) }
         set { defaults.set(newValue, forKey: Key.enabled) }
     }
-    var endpoint: String? {
-        get { defaults.string(forKey: Key.endpoint) }
-        set { defaults.set(newValue, forKey: Key.endpoint) }
+    var r2Endpoint: String? {
+        get { defaults.string(forKey: Key.r2Endpoint) }
+        set { defaults.set(newValue, forKey: Key.r2Endpoint) }
     }
-    var bucket: String? {
-        get { defaults.string(forKey: Key.bucket) }
-        set { defaults.set(newValue, forKey: Key.bucket) }
+    var r2Bucket: String? {
+        get { defaults.string(forKey: Key.r2Bucket) }
+        set { defaults.set(newValue, forKey: Key.r2Bucket) }
     }
-    var accessKeyID: String? {
-        get { defaults.string(forKey: Key.accessKeyID) }
-        set { defaults.set(newValue, forKey: Key.accessKeyID) }
+    var r2AccessKeyID: String? {
+        get { defaults.string(forKey: Key.r2AccessKeyID) }
+        set { defaults.set(newValue, forKey: Key.r2AccessKeyID) }
+    }
+    var d1AccountID: String? {
+        get { defaults.string(forKey: Key.d1AccountID) }
+        set { defaults.set(newValue, forKey: Key.d1AccountID) }
+    }
+    var d1DatabaseID: String? {
+        get { defaults.string(forKey: Key.d1DatabaseID) }
+        set { defaults.set(newValue, forKey: Key.d1DatabaseID) }
     }
 }
 ```
-
-> Note: `Sendable` final class with mutable storage is technically unsafe, but `UserDefaults` itself is documented thread-safe. For test simplicity we accept this; in production usage the Settings instance lives behind `@MainActor PreferencesContainer`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -3668,34 +4000,33 @@ final class SyncSettings: Sendable {
 swift test --filter ClipTests.SyncSettingsTests
 ```
 
-Expected: 2 tests pass.
-
 - [ ] **Step 5: Commit**
 
 ```bash
 git add Sources/Clip/Sync/SyncSettings.swift Tests/ClipTests/Sync/SyncSettingsTests.swift
-git commit -m "sync: SyncSettings — UserDefaults wrapper for non-secret cloud config"
+git commit -m "sync: SyncSettings — UserDefaults wrapper for R2+D1 non-secret config"
 ```
 
 ---
 
-### Task 20: PanelView — sync icon + ⌘N exclude shortcut
+### Task 23: PanelView — sync icon + ⌘N exclude shortcut
 
 **Files:**
-- Modify: `Sources/Clip/Panel/PanelView.swift` — show icon column
-- Modify: `Sources/Clip/Panel/PanelModel.swift` — `toggleExcludeSelected()` action
-- Modify: `Sources/Clip/Panel/PanelWindow.swift` — wire ⌘N to model
+- Modify: `Sources/Clip/Panel/PanelView.swift` — add icon column
+- Modify: `Sources/Clip/Panel/PanelModel.swift` — `toggleExcludeSelected()` action + `onExclude` callback
+- Modify: `Sources/Clip/Panel/PanelWindow.swift` — wire ⌘N
 
-> No automated test (UI). Manually verifiable via `docs/MANUAL_TEST.md` checklist updated in Task 24.
+(No automated test; AppKit / SwiftUI integration. Manually verifiable via T26 checklist.)
 
 - [ ] **Step 1: Add `toggleExcludeSelected` to PanelModel**
 
-In `Sources/Clip/Panel/PanelModel.swift`, append a method (this method dispatches to `AppDelegate` via the existing wired-up callback pattern; for now just emit through the same paste callback infrastructure).
+In `Sources/Clip/Panel/PanelModel.swift`, append:
 
 ```swift
     /// User pressed ⌘N to mark the selected item as not-syncing.
     /// AppDelegate wires this to engine.excludeItem(id:at:).
     var onExclude: ((Int64) -> Void)?
+
     func toggleExcludeSelected() {
         guard let id = selectedItem()?.id else { return }
         onExclude?(id)
@@ -3704,13 +4035,13 @@ In `Sources/Clip/Panel/PanelModel.swift`, append a method (this method dispatche
 
 - [ ] **Step 2: Wire ⌘N in PanelWindow**
 
-In `Sources/Clip/Panel/PanelWindow.swift`, find the `KeyHandlers` struct and add:
+In `Sources/Clip/Panel/PanelWindow.swift`, add to `KeyHandlers`:
 
 ```swift
     var onExclude: () -> Void = {}
 ```
 
-In the key-handling switch in the same file, add a case for `n` with `.command` modifier:
+In the key-handling switch (near the existing ⌘P / ⌘D handling), add:
 
 ```swift
         if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "n" {
@@ -3719,11 +4050,9 @@ In the key-handling switch in the same file, add a case for `n` with `.command` 
         }
 ```
 
-(The exact location of the switch is just before/after the existing ⌘P / ⌘D handling — follow that pattern.)
+- [ ] **Step 3: Add sync icon column to PanelView row**
 
-- [ ] **Step 3: Add sync status icon column to PanelView**
-
-In `Sources/Clip/Panel/PanelView.swift`, in the row-rendering view (search for "📌" or where rows are rendered), append after the existing trailing metadata:
+In `Sources/Clip/Panel/PanelView.swift`, in the row-rendering view (search for "📌"), append after existing trailing metadata:
 
 ```swift
             if let icon = syncIcon(for: item) {
@@ -3733,13 +4062,13 @@ In `Sources/Clip/Panel/PanelView.swift`, in the row-rendering view (search for "
             }
 ```
 
-And add this helper at the bottom of the file (outside any existing struct/class but in the same file):
+Add helpers at file scope:
 
 ```swift
 private func syncIcon(for item: ClipItem) -> String? {
     if item.syncExcluded { return "🚫" }
     if item.cloudSyncedAt != nil { return "☁️" }
-    // Note: ⏳ for pending and 📤/⚠️ are added when wired to SyncEngine state.
+    // ⏳ / ⚠️ / 📤 deferred to v3.x (spec §13)
     return nil
 }
 
@@ -3756,25 +4085,25 @@ private func syncTooltip(for item: ClipItem) -> String {
 swift build
 ```
 
-Expected: success.
-
 - [ ] **Step 5: Commit**
 
 ```bash
 git add Sources/Clip/Panel/PanelView.swift Sources/Clip/Panel/PanelModel.swift Sources/Clip/Panel/PanelWindow.swift
-git commit -m "sync: PanelView ⌘N exclude + sync status icon column"
+git commit -m "sync: PanelView — ⌘N exclude + ☁️/🚫 sync status icon"
 ```
 
 ---
 
-### Task 21: CloudSyncView — Preferences "云同步" tab
+### Task 24: CloudSyncView — Preferences "云同步" tab (parallel test-connection)
 
 **Files:**
 - Create: `Sources/Clip/Preferences/CloudSyncView.swift`
 - Modify: `Sources/Clip/Preferences/PreferencesWindow.swift` — add tab
-- Modify: `Sources/Clip/Preferences/PreferencesContainer` — wire `SyncSettings` + (optional) `SyncEngine` reference
+- Modify: `PreferencesContainer` — add `syncSettings`
 
-> No automated test (SwiftUI). Manually verified via Manual Test checklist.
+This is **fix F** — parallel ping with three checkmarks.
+
+(No automated test; SwiftUI. Manually verified via T26.)
 
 - [ ] **Step 1: Create CloudSyncView**
 
@@ -3784,15 +4113,25 @@ import SwiftUI
 
 @MainActor
 struct CloudSyncView: View {
-    @State private var enabled: Bool = false
-    @State private var endpoint: String = ""
-    @State private var bucket: String = "clip-sync"
-    @State private var accessKeyID: String = ""
-    @State private var secretAccessKey: String = ""
-    @State private var syncPassword: String = ""
-    @State private var statusMessage: String = ""
-    @State private var testing = false
+    @State private var enabled = false
+    @State private var r2Endpoint = ""
+    @State private var r2Bucket = "clip-sync"
+    @State private var r2AccessKeyID = ""
+    @State private var r2Secret = ""
+    @State private var d1AccountID = ""
+    @State private var d1DatabaseID = ""
+    @State private var apiToken = ""
+    @State private var syncPassword = ""
+
+    @State private var r2Status: TestStatus = .idle
+    @State private var d1Status: TestStatus = .idle
+    @State private var tokenStatus: TestStatus = .idle
     @State private var bootstrapping = false
+    @State private var statusMessage = ""
+
+    enum TestStatus: Equatable {
+        case idle, pending, ok, fail(String)
+    }
 
     private var settings: SyncSettings { PreferencesContainer.shared.syncSettings }
 
@@ -3802,123 +4141,180 @@ struct CloudSyncView: View {
                 .onChange(of: enabled) { _, new in settings.enabled = new }
 
             if enabled {
-                Section("R2 配置") {
-                    TextField("Endpoint",  text: $endpoint)
+                Section("R2（图片字节）") {
+                    TextField("Endpoint", text: $r2Endpoint)
                         .help("形如 https://<account>.r2.cloudflarestorage.com")
-                    TextField("Bucket",    text: $bucket)
-                    TextField("Access Key ID", text: $accessKeyID)
-                    SecureField("Secret Access Key", text: $secretAccessKey)
-                    HStack {
-                        Button(testing ? "测试中…" : "测试连接") { testConnection() }
-                            .disabled(testing || endpoint.isEmpty || bucket.isEmpty
-                                      || accessKeyID.isEmpty || secretAccessKey.isEmpty)
-                        Spacer()
-                        Text(statusMessage).font(.caption).foregroundColor(.secondary)
-                    }
+                    TextField("Bucket", text: $r2Bucket)
+                    TextField("Access Key ID", text: $r2AccessKeyID)
+                    SecureField("Secret Access Key", text: $r2Secret)
+                }
+
+                Section("D1（条目元数据）") {
+                    TextField("Account ID", text: $d1AccountID)
+                    TextField("Database ID", text: $d1DatabaseID)
+                    SecureField("API Token", text: $apiToken)
+                        .help("Account → R2:Edit + D1:Edit")
+                }
+
+                Section("测试连接") {
+                    HStack { statusIcon(r2Status); Text("R2 (blob 上下传)") }
+                    HStack { statusIcon(d1Status); Text("D1 (条目同步)") }
+                    HStack { statusIcon(tokenStatus); Text("API Token (有效性)") }
+                    Button("并行测试") { testConnection() }
+                        .disabled(testButtonDisabled)
                 }
 
                 Section("同步密码 (E2E)") {
                     SecureField("同步密码 (≥12 字符)", text: $syncPassword)
-                    Button(bootstrapping ? "正在初始化…" : "初始化 / 加入云端") {
-                        bootstrap()
-                    }
-                    .disabled(bootstrapping || syncPassword.count < 12 ||
-                              endpoint.isEmpty || bucket.isEmpty
-                              || accessKeyID.isEmpty || secretAccessKey.isEmpty)
+                    Button(bootstrapping ? "正在初始化…" : "初始化 / 加入云端") { bootstrap() }
+                        .disabled(bootstrapButtonDisabled)
                     Text("剪贴板内容在上传前用你的同步密码做端到端加密 (ChaCha20-Poly1305)，云端永远拿不到明文。\n\n⚠️ 密码丢失 = 云端数据全部不可恢复，请使用密码管理器保存。")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                        .font(.caption).foregroundColor(.secondary)
+                }
+
+                if !statusMessage.isEmpty {
+                    Text(statusMessage).foregroundColor(.secondary)
                 }
             }
         }
         .padding(20)
-        .onAppear {
-            enabled = settings.enabled
-            endpoint = settings.endpoint ?? ""
-            bucket = settings.bucket ?? "clip-sync"
-            accessKeyID = settings.accessKeyID ?? ""
+        .onAppear(perform: load)
+    }
+
+    @ViewBuilder
+    private func statusIcon(_ s: TestStatus) -> some View {
+        switch s {
+        case .idle:    Text("·").frame(width: 14)
+        case .pending: ProgressView().controlSize(.small).frame(width: 14)
+        case .ok:      Text("✓").foregroundColor(.green).frame(width: 14)
+        case .fail(let msg):
+            Text("✗").foregroundColor(.red).frame(width: 14)
+                .help(msg)
         }
     }
 
+    private var testButtonDisabled: Bool {
+        r2Endpoint.isEmpty || r2Bucket.isEmpty || r2AccessKeyID.isEmpty
+        || r2Secret.isEmpty || d1AccountID.isEmpty || d1DatabaseID.isEmpty
+        || apiToken.isEmpty
+        || r2Status == .pending || d1Status == .pending || tokenStatus == .pending
+    }
+
+    private var bootstrapButtonDisabled: Bool {
+        bootstrapping || syncPassword.count < 12 || testButtonDisabled
+    }
+
+    private func load() {
+        enabled = settings.enabled
+        r2Endpoint = settings.r2Endpoint ?? ""
+        r2Bucket = settings.r2Bucket ?? "clip-sync"
+        r2AccessKeyID = settings.r2AccessKeyID ?? ""
+        d1AccountID = settings.d1AccountID ?? ""
+        d1DatabaseID = settings.d1DatabaseID ?? ""
+    }
+
+    /// Fix F — three pings in parallel; status updates as each completes.
     private func testConnection() {
-        testing = true
-        let endpoint = self.endpoint
-        let bucket = self.bucket
-        let ak = self.accessKeyID
-        let sk = self.secretAccessKey
+        r2Status = .pending; d1Status = .pending; tokenStatus = .pending
+        let r2 = makeR2()
+        let d1 = makeD1()
+        let token = apiToken
         Task {
-            defer { Task { @MainActor in testing = false } }
-            guard let url = URL(string: endpoint) else {
-                await setStatus("Endpoint URL 无效")
-                return
+            async let rR: TestStatus = pingR2(r2)
+            async let rD: TestStatus = pingD1(d1)
+            async let rT: TestStatus = pingToken(token: token, account: d1AccountID)
+            let (a, b, c) = await (rR, rD, rT)
+            await MainActor.run {
+                r2Status = a; d1Status = b; tokenStatus = c
+                if a == .ok && b == .ok && c == .ok { persistOnSuccess() }
             }
-            let backend = R2Backend(endpoint: url, bucket: bucket,
-                                    accessKeyID: ak, secretAccessKey: sk)
-            do {
-                _ = try await backend.head(key: CloudKey.configKey)
-                await setStatus("✓ 连接成功")
-                await persistOnSuccess()
-            } catch {
-                await setStatus("✗ 失败: \(error)")
+        }
+    }
+
+    private func makeR2() -> R2BlobBackend? {
+        guard let url = URL(string: r2Endpoint) else { return nil }
+        return R2BlobBackend(endpoint: url, bucket: r2Bucket,
+                             accessKeyID: r2AccessKeyID, secretAccessKey: r2Secret)
+    }
+
+    private func makeD1() -> D1Backend {
+        D1Backend(accountID: d1AccountID, databaseID: d1DatabaseID,
+                  apiToken: apiToken)
+    }
+
+    private func pingR2(_ b: R2BlobBackend?) async -> TestStatus {
+        guard let b else { return .fail("R2 endpoint URL 无效") }
+        do {
+            // GET a key that's almost certainly absent → 404 is success
+            _ = try await b.getBlob(key: "_probe/handshake.bin")
+            return .ok
+        } catch {
+            return .fail("\(error)")
+        }
+    }
+
+    private func pingD1(_ d: D1Backend) async -> TestStatus {
+        do {
+            _ = try await d.getConfig(key: "schema_version")  // SELECT works → token + DB OK
+            return .ok
+        } catch {
+            return .fail("\(error)")
+        }
+    }
+
+    private func pingToken(token: String, account: String) async -> TestStatus {
+        var req = URLRequest(url: URL(string: "https://api.cloudflare.com/client/v4/user/tokens/verify")!)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            let http = resp as! HTTPURLResponse
+            guard http.statusCode == 200 else { return .fail("\(http.statusCode)") }
+            // Body must contain "active"
+            if let s = String(data: data, encoding: .utf8), s.contains("active") {
+                return .ok
             }
+            return .fail("token not active")
+        } catch {
+            return .fail("\(error)")
         }
     }
 
     @MainActor
     private func persistOnSuccess() {
-        settings.endpoint = endpoint
-        settings.bucket = bucket
-        settings.accessKeyID = accessKeyID
-        // Secret goes to Keychain (Task 22 wires the engine to read it).
+        settings.r2Endpoint = r2Endpoint
+        settings.r2Bucket = r2Bucket
+        settings.r2AccessKeyID = r2AccessKeyID
+        settings.d1AccountID = d1AccountID
+        settings.d1DatabaseID = d1DatabaseID
         try? KeychainStore(service: "com.zyw.clip.cloud-r2-secret-v1")
-            .write(account: "current", data: Data(secretAccessKey.utf8))
+            .write(account: "current", data: Data(r2Secret.utf8))
+        try? KeychainStore(service: "com.zyw.clip.cloud-d1-token-v1")
+            .write(account: "current", data: Data(apiToken.utf8))
     }
 
-    @MainActor
-    private func setStatus(_ s: String) { statusMessage = s }
-
-    /// Spec §7.1 — call SyncEngine.enableSync(...) to either bootstrap a fresh
-    /// cloud profile (first device) or derive the master key from the existing
-    /// config.json (joining device). Persists settings on success and asks
-    /// AppDelegate to spin up the engine.
+    /// Spec §7.1 — call SyncEngine.enableSync.
     private func bootstrap() {
         bootstrapping = true
         let pwd = syncPassword
-        let endpoint = self.endpoint
-        let bucket = self.bucket
-        let ak = self.accessKeyID
-        let sk = self.secretAccessKey
+        let d1 = makeD1()
         Task {
             defer { Task { @MainActor in bootstrapping = false } }
-            guard let url = URL(string: endpoint) else {
-                await setStatus("Endpoint URL 无效"); return
-            }
-            let backend = R2Backend(endpoint: url, bucket: bucket,
-                                    accessKeyID: ak, secretAccessKey: sk)
-            // Persist secret first so the engine can pick it up.
-            try? KeychainStore(service: "com.zyw.clip.cloud-r2-secret-v1")
-                .write(account: "current", data: Data(sk.utf8))
-            let store = PreferencesContainer.shared.store!  // wired in AppDelegate
+            let store = PreferencesContainer.shared.store!
             let state = SyncStateStore(store: store)
             let masterKC = KeychainStore(service: "com.zyw.clip.cloud-master-v1")
             do {
                 let result = try await SyncEngine.enableSync(
-                    password: pwd, backend: backend, state: state,
+                    password: pwd, dataSource: d1, state: state,
                     keychain: masterKC, account: "current")
                 await MainActor.run {
-                    settings.endpoint = endpoint
-                    settings.bucket = bucket
-                    settings.accessKeyID = ak
                     settings.enabled = true
+                    statusMessage = result == .firstDevice
+                        ? "✓ 已初始化新云端 profile"
+                        : "✓ 已加入现有云端"
                 }
-                await setStatus(result == .firstDevice
-                                ? "✓ 已初始化新云端 profile"
-                                : "✓ 已加入现有云端")
-                // Tell AppDelegate to spin up the engine + (if first device) backfill.
-                await NotificationCenter.default.post(
-                    name: .clipCloudSyncDidEnable, object: nil)
+                NotificationCenter.default.post(name: .clipCloudSyncDidEnable, object: nil)
             } catch {
-                await setStatus("✗ 初始化失败: \(error)")
+                await MainActor.run { statusMessage = "✗ 初始化失败: \(error)" }
             }
         }
     }
@@ -3929,9 +4325,9 @@ extension Notification.Name {
 }
 ```
 
-- [ ] **Step 2: Add the tab to PreferencesWindow**
+- [ ] **Step 2: Add tab + container field**
 
-In `Sources/Clip/Preferences/PreferencesWindow.swift`, find the existing `TabView { ... }` and add:
+In `Sources/Clip/Preferences/PreferencesWindow.swift`, find the `TabView { ... }` and append:
 
 ```swift
             CloudSyncView()
@@ -3939,48 +4335,52 @@ In `Sources/Clip/Preferences/PreferencesWindow.swift`, find the existing `TabVie
                 .tag("cloud")
 ```
 
-- [ ] **Step 3: Add `syncSettings` to PreferencesContainer**
-
 In whichever file declares `PreferencesContainer.shared`, add:
 
 ```swift
     var syncSettings: SyncSettings = SyncSettings()
 ```
 
-(Wire it in `AppDelegate.applicationDidFinishLaunching` between `PreferencesContainer.shared.store = store` and the observer setup, but as default it just uses standard UserDefaults so no work needed if you don't override.)
-
-- [ ] **Step 4: Build to verify it compiles**
+- [ ] **Step 3: Build to verify it compiles**
 
 ```bash
 swift build
 ```
 
-Expected: success.
-
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add Sources/Clip/Preferences/CloudSyncView.swift Sources/Clip/Preferences/PreferencesWindow.swift
-git commit -m "sync: CloudSyncView — Preferences \"云同步\" tab + R2 connection test"
+git commit -m "sync: CloudSyncView — Preferences tab w/ parallel test-connection (fix F)"
 ```
 
 ---
 
-### Task 22: AppDelegate wire-in — instantiate SyncEngine when enabled
+### Task 25: AppDelegate wire-in — instantiate SyncEngine when enabled
 
 **Files:**
-- Modify: `Sources/Clip/ClipApp.swift` — instantiate engine + start two background loops + wire panel exclude
+- Modify: `Sources/Clip/ClipApp.swift` — instantiate engine + start background loops + wire panel exclude + handle bootstrap notification + lazy blob wire-up
 
-- [ ] **Step 1: Add engine + background tasks to AppDelegate**
+- [ ] **Step 1: Add engine fields + startup hook**
 
-In `AppDelegate`, after the existing `observer.start()` line in `applicationDidFinishLaunching`, append:
+In `AppDelegate`, after `observer.start()`:
 
 ```swift
-        // 7.5 Cloud sync (v3). Spec §4.2: actor + two background Tasks.
+        // 7.5 Cloud sync (v3, D1+R2). Spec §4.1.
         startCloudSyncIfEnabled()
+        NotificationCenter.default.addObserver(
+            forName: .clipCloudSyncDidEnable, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.startCloudSyncIfEnabled()
+            // First-device backfill on cold-start of engine
+            if let engine = self.syncEngine {
+                Task { try? await engine.backfill(now: Int64(Date().timeIntervalSince1970)) }
+            }
+        }
 ```
 
-And add this method at the bottom of `AppDelegate`:
+Add at bottom of `AppDelegate`:
 
 ```swift
     var syncEngine: SyncEngine?
@@ -3990,25 +4390,30 @@ And add this method at the bottom of `AppDelegate`:
     func startCloudSyncIfEnabled() {
         let settings = PreferencesContainer.shared.syncSettings
         guard settings.enabled,
-              let endpoint = settings.endpoint.flatMap(URL.init),
-              let bucket = settings.bucket,
-              let accessKeyID = settings.accessKeyID,
-              let secretData = try? KeychainStore(service: "com.zyw.clip.cloud-r2-secret-v1")
-                                        .read(account: "current"),
-              let secret = String(data: secretData, encoding: .utf8),
-              let masterData = try? KeychainStore(service: "com.zyw.clip.cloud-master-v1")
-                                       .read(account: "current")
+              let endpoint = settings.r2Endpoint.flatMap(URL.init),
+              let bucket = settings.r2Bucket,
+              let r2AK = settings.r2AccessKeyID,
+              let r2Secret = (try? KeychainStore(service: "com.zyw.clip.cloud-r2-secret-v1")
+                              .read(account: "current")).flatMap({ String(data: $0, encoding: .utf8) }),
+              let d1AccountID = settings.d1AccountID,
+              let d1DatabaseID = settings.d1DatabaseID,
+              let d1Token = (try? KeychainStore(service: "com.zyw.clip.cloud-d1-token-v1")
+                             .read(account: "current")).flatMap({ String(data: $0, encoding: .utf8) }),
+              let masterKey = try? KeychainStore(service: "com.zyw.clip.cloud-master-v1")
+                                  .read(account: "current")
         else { return }
 
-        let backend = R2Backend(endpoint: endpoint, bucket: bucket,
-                                accessKeyID: accessKeyID, secretAccessKey: secret)
-        let crypto = CryptoBox(masterKey: masterData)
+        let crypto = CryptoBox(masterKey: masterKey)
+        let blobs = R2BlobBackend(endpoint: endpoint, bucket: bucket,
+                                  accessKeyID: r2AK, secretAccessKey: r2Secret)
+        let ds = D1Backend(accountID: d1AccountID, databaseID: d1DatabaseID,
+                           apiToken: d1Token)
         let state = SyncStateStore(store: store)
-        let deviceID = (try? state.get("device_id")) ?? UUID().uuidString
+        let deviceID = (try? state.get("device_id")) ?? UUID().uuidString.lowercased()
         try? state.set("device_id", deviceID)
 
-        let engine = SyncEngine(store: store, backend: backend, crypto: crypto,
-                                deviceID: deviceID, state: state)
+        let engine = SyncEngine(store: store, dataSource: ds, blobStore: blobs,
+                                crypto: crypto, deviceID: deviceID, state: state)
         self.syncEngine = engine
 
         // Wire HistoryStore.onChange → engine.enqueue
@@ -4018,13 +4423,18 @@ And add this method at the bottom of `AppDelegate`:
             Task {
                 switch change {
                 case .inserted(let id):
-                    try? await engine.enqueueItemPush(itemID: id, at: now)
+                    try? await engine.enqueueClipPush(itemID: id, at: now)
+                    // Image case: also enqueue blob push
+                    if let item = try? engine.store.itemByID(id),
+                       let blobID = item.blobID {
+                        try? await engine.enqueueBlobPush(blobID: blobID, at: now)
+                    }
                 case .deleted(_, let hash):
-                    try? await engine.enqueueTombstone(contentHash: hash, at: now)
+                    try? await engine.excludeItemByHash(contentHash: hash, at: now)
                 case .pinToggled(let id):
-                    try? await engine.enqueueItemPush(itemID: id, at: now)
+                    try? await engine.enqueueClipPush(itemID: id, at: now)
                 case .excludedToggled:
-                    break  // SyncEngine.excludeItem already handles
+                    break  // handled by engine.excludeItem directly
                 }
             }
         }
@@ -4036,14 +4446,40 @@ And add this method at the bottom of `AppDelegate`:
             Task { try? await engine.excludeItem(id: id, at: now) }
         }
 
-        // Push drainer loop: drain whenever there's work, sleep 1s when empty.
+        // Lazy blob fetch wire-up: replace panelModel paste closure for
+        // image kind so empty bytes trigger engine.fetchBlob first.
+        let originalPaste = panelModel.pasteCallback
+        panelModel.pasteCallback = { [weak self] item in
+            guard let self else { return }
+            if item.kind == .image, let blobID = item.blobID {
+                Task {
+                    var bytes = (try? self.store.blob(id: blobID)) ?? Data()
+                    if bytes.isEmpty, let engine = self.syncEngine {
+                        bytes = (try? await engine.fetchBlob(blobID: blobID)) ?? Data()
+                    }
+                    if !bytes.isEmpty {
+                        await MainActor.run {
+                            self.injector.pasteImage(
+                                bytes: bytes,
+                                mimeType: item.mimeType ?? "image/png"
+                            ) { self.panel.close() }
+                        }
+                    } else {
+                        await MainActor.run { self.panel.close() }
+                    }
+                }
+            } else {
+                originalPaste?(item)
+            }
+        }
+
+        // Background push drainer + 30s pull tick
         pushLoopTask = Task { [weak engine] in
             while !Task.isCancelled, let engine {
                 let did = (try? await engine.pushOnce(now: Int64(Date().timeIntervalSince1970))) ?? false
                 if !did { try? await Task.sleep(nanoseconds: 1_000_000_000) }
             }
         }
-        // Pull tick loop: 30s.
         pullLoopTask = Task { [weak engine] in
             while !Task.isCancelled, let engine {
                 _ = try? await engine.pullOnce(now: Int64(Date().timeIntervalSince1970))
@@ -4053,41 +4489,21 @@ And add this method at the bottom of `AppDelegate`:
     }
 ```
 
-**Lazy blob fetch wire-up** — replace the `case .image:` branch in the existing `panelModel = PanelModel(store: store) { [weak self] item in ... }` setup so that an image row whose `bytes` are empty (the lazy placeholder from a pull) triggers `engine.fetchBlob` before paste:
+> **Note**: this assumes `PanelModel` exposes a settable `pasteCallback`. If it doesn't, refactor to expose it as part of T23, or rebuild `panelModel` here with the lazy-aware closure.
 
-```swift
-            case .image:
-                guard let blobID = item.blobID else { self.panel.close(); return }
-                Task {
-                    var bytes = (try? self.store.blob(id: blobID)) ?? Data()
-                    if bytes.isEmpty, let engine = self.syncEngine {
-                        bytes = (try? await engine.fetchBlob(blobID: blobID)) ?? Data()
-                    }
-                    guard !bytes.isEmpty else { await MainActor.run { self.panel.close() }; return }
-                    await MainActor.run {
-                        self.injector.pasteImage(bytes: bytes,
-                            mimeType: item.mimeType ?? "image/png") { self.panel.close() }
-                    }
-                }
-```
-
-Same pattern in `PreviewWindow.shared.show(...)` callsite when the preview wants to render a lazy image — fetch first via Task, then call back into `PreviewWindow.refresh(image:)`.
-
-**Bootstrap notification wiring** — also subscribe to the notification CloudSyncView posts after enableSync returns, so the engine spins up immediately (without requiring an app restart) and the first device's backfill kicks off:
-
-```swift
-        NotificationCenter.default.addObserver(
-            forName: .clipCloudSyncDidEnable, object: nil, queue: .main
-        ) { [weak self] _ in
-            guard let self else { return }
-            self.startCloudSyncIfEnabled()
-            // First-device profile: kick backfill exactly once.
-            // (joinedExisting case: no-op because backfill rows would just dup
-            // existing cloud objects — which is harmless but wasteful.)
-            if let engine = self.syncEngine {
-                Task { try? await engine.backfill(now: Int64(Date().timeIntervalSince1970)) }
-            }
-        }
+> **Note**: `engine.excludeItemByHash` is a small helper — add to SyncEngine if not present:
+> ```swift
+> func excludeItemByHash(contentHash: String, at: Int64) async throws {
+>     if let item = try store.itemByContentHash(contentHash), let id = item.id {
+>         try await excludeItem(id: id, at: at)
+>     } else {
+>         // Local row already deleted — write tombstone directly + push tomb
+>         try store.upsertTombstone(contentHash: contentHash, cloudID: "",
+>                                   tombstonedAt: at, cloudUpdatedAt: at)
+>         try queue.enqueue(op: .putTomb, targetKey: contentHash, at: at)
+>     }
+> }
+> ```
 
 - [ ] **Step 2: Build to verify it compiles**
 
@@ -4095,26 +4511,22 @@ Same pattern in `PreviewWindow.shared.show(...)` callsite when the preview wants
 swift build
 ```
 
-Expected: success.
-
-- [ ] **Step 3: Run full test suite**
+- [ ] **Step 3: Run full test suite (regression guard)**
 
 ```bash
 swift test
 ```
 
-Expected: all tests still pass.
-
 - [ ] **Step 4: Commit**
 
 ```bash
-git add Sources/Clip/ClipApp.swift
-git commit -m "sync: AppDelegate wire-in — engine + push/pull background tasks + onChange hooks"
+git add Sources/Clip/ClipApp.swift Sources/Clip/Sync/SyncEngine.swift
+git commit -m "sync: AppDelegate wire-in — engine + onChange + ⌘N + lazy blob + 30s pull"
 ```
 
 ---
 
-### Task 23: Manual test checklist update
+### Task 26: Manual smoke checklist
 
 **Files:**
 - Modify: `docs/MANUAL_TEST.md` — add cloud-sync section
@@ -4122,74 +4534,107 @@ git commit -m "sync: AppDelegate wire-in — engine + push/pull background tasks
 - [ ] **Step 1: Append to docs/MANUAL_TEST.md**
 
 ```markdown
-## 云同步 (v3)
+## 云同步 (v3, D1+R2)
 
-需要两台 Mac (A, B) + 都装了同 build + 都登录到同一 Cloudflare 账号的 R2 凭据。
+需要两台 Mac (A, B) + 都装了同 build + 一个 Cloudflare 账号上同时配好的 R2 bucket + D1 database + R2:Edit/D1:Edit token。
 
-- [ ] A 启用同步 → 输 endpoint/bucket/access_key/secret → "测试连接" 显示 ✓
-- [ ] A 输入同步密码（≥12 字符） → backfill 进度条跑完
-- [ ] B 启用同步 → 输入同 endpoint + 同密码 → 显示 "正在拉取 N 条…" → 完成
-- [ ] A 复制一段文字 → ≤ 60 秒 B 唤起面板能看到该条目（行尾 ☁️）
+**首次启用 (A)**
+- [ ] Preferences > 云同步 → 输入 R2 endpoint / bucket / access key / secret + D1 account ID / database ID + API token
+- [ ] "并行测试" → 三个 ✓ 同时出现 (✓ R2 / ✓ D1 / ✓ Token)
+- [ ] 输入同步密码 (≥12 字符) → "初始化 / 加入云端" → 显示"已初始化新云端 profile"
+- [ ] backfill 进度可观察（sync_queue 行数下降）
+
+**加入设备 (B)**
+- [ ] 同样配置 + 同密码 → "并行测试" 通过 → 初始化 → 显示"已加入现有云端"
+- [ ] B 启动 30 秒内拉到 A 已有的所有条目（行尾 ☁️）
+
+**正常使用**
+- [ ] A 复制一段文字 → ≤ 60 秒 B 唤起面板能看到该条目
 - [ ] A 删一条 → B 上消失
 - [ ] A pin 一条 → B 上 pin 状态同步
-- [ ] A 复制一张 1MB 图 → B 看到行（lazy thumbnail）→ 点开预览 spinner → 解密后显示
-- [ ] A 复制一张 3MB 图 → A 行尾显示 📤；B 永远看不到
-- [ ] A 在面板按 ⌘N 标记不同步一条已有项 → 行尾 🚫；B 上消失
+- [ ] A 复制一张 1MB 图 → B 看到行（lazy 占位）→ 点开预览 spinner → 解密渲染
+- [ ] A 复制一张 3MB 图 → A 行尾 📤（v3 暂用 ☁️ 替代）；B 永远看不到这条
+- [ ] A 在面板按 ⌘N 标记不同步一条已有 → B 上消失（行尾 🚫 在 A 出现）
 - [ ] 重启两台 Mac → 历史保留 + 后续复制仍同步
-- [ ] 输错密码 → 不删本地数据；提示密码错
+- [ ] 输错密码 → 不删本地数据；statusMessage 显示密码错
+
+**边角**
+- [ ] A 排除一条 → B 删 → A 重新复制相同文字 → push 命中现有 cloud_id → D1 行 deleted 翻 0（fix B）
+- [ ] 网络断开 → 复制内容入 sync_queue → 网络恢复后自动 drain
+- [ ] 把同步密码改错重启 app → SyncEngine.start 期间所有 GET 都解密失败 → 本地数据无损（无静默删除）
 ```
 
 - [ ] **Step 2: Commit**
 
 ```bash
 git add docs/MANUAL_TEST.md
-git commit -m "sync: manual smoke checklist for cross-Mac cloud sync"
+git commit -m "sync: manual smoke checklist — D1+R2 cross-Mac sync"
 ```
 
 ---
 
-## Phase P5 — R2 integration test (opt-in)
+## Phase P5 — Real-cloud integration test
 
-### Task 24: Real-R2 round-trip test
+### Task 27: D1+R2 round-trip integration test (opt-in)
 
 **Files:**
-- Create: `Tests/ClipTests/R2Integration/R2RoundTripTests.swift`
+- Create: `Tests/ClipTests/CloudIntegration/CloudRoundTripTests.swift`
 
-This test self-skips if `R2_ACCESS_KEY_ID` env is not set; CI will skip silently. Local dev runs it after `set -a; source ~/.wrangler/clip.env; set +a`.
+Self-skips when env unset; CI stays green without secrets. Local: source `~/.wrangler/clip.env` then run.
 
-- [ ] **Step 1: Create the integration test**
+- [ ] **Step 1: Create the test**
 
 ```swift
-// Tests/ClipTests/R2Integration/R2RoundTripTests.swift
+// Tests/ClipTests/CloudIntegration/CloudRoundTripTests.swift
 import XCTest
 @testable import Clip
 
-/// Real-R2 end-to-end. Self-skips when env not set so CI doesn't fail.
-/// Local: source ~/.wrangler/clip.env first.
-final class R2RoundTripTests: XCTestCase {
-    func env(_ key: String) -> String? {
-        ProcessInfo.processInfo.environment[key].flatMap { $0.isEmpty ? nil : $0 }
+final class CloudRoundTripTests: XCTestCase {
+    func env(_ k: String) -> String? {
+        ProcessInfo.processInfo.environment[k].flatMap { $0.isEmpty ? nil : $0 }
     }
 
-    func testPutGetDeleteAgainstRealBucket() async throws {
+    func testFullPushPullAgainstRealCloud() async throws {
         guard let endpoint = env("R2_ENDPOINT").flatMap(URL.init),
-              let bucket   = env("R2_BUCKET"),
-              let ak       = env("R2_ACCESS_KEY_ID"),
-              let sk       = env("R2_SECRET_ACCESS_KEY")
-        else {
-            throw XCTSkip("R2 env not set; skipping integration test")
-        }
-        let backend = R2Backend(endpoint: endpoint, bucket: bucket,
-                                accessKeyID: ak, secretAccessKey: sk)
-        let key = "_probe/swift-roundtrip-\(UUID().uuidString).bin"
-        let body = Data("clip swift integration probe \(Date())".utf8)
-        let (etag, lm) = try await backend.put(key: key, body: body, contentType: "application/octet-stream")
-        XCTAssertFalse(etag.isEmpty)
-        XCTAssertGreaterThan(lm, 0)
-        let got = try await backend.get(key: key)
-        XCTAssertEqual(got, body)
-        try await backend.delete(key: key)
-        XCTAssertNil(try await backend.get(key: key))
+              let bucket = env("R2_BUCKET"),
+              let r2AK = env("R2_ACCESS_KEY_ID"),
+              let r2Sec = env("R2_SECRET_ACCESS_KEY"),
+              let acct = env("R2_ACCOUNT_ID"),
+              let dbID = env("D1_DATABASE_ID"),
+              let token = env("CLOUDFLARE_API_TOKEN")
+        else { throw XCTSkip("cloud env not set; skipping integration") }
+
+        let crypto = CryptoBox(masterKey: Data(repeating: UInt8.random(in: 0...255), count: 32))
+        let ds = D1Backend(accountID: acct, databaseID: dbID, apiToken: token)
+        let blobs = R2BlobBackend(endpoint: endpoint, bucket: bucket,
+                                  accessKeyID: r2AK, secretAccessKey: r2Sec)
+
+        try await ds.ensureSchema()
+
+        // Push a probe row from "device A"
+        let storeA = try HistoryStore.inMemory()
+        let engineA = SyncEngine(store: storeA, dataSource: ds, blobStore: blobs,
+                                 crypto: crypto, deviceID: "test-A",
+                                 state: SyncStateStore(store: storeA))
+        let probe = "clip integration probe \(UUID().uuidString)"
+        let id = try storeA.insert(ClipItem(
+            id: nil, content: probe, contentHash: ClipItem.contentHash(of: probe),
+            sourceBundleID: nil, sourceAppName: nil, createdAt: 100,
+            pinned: false, byteSize: probe.utf8.count, truncated: false))
+        try await engineA.enqueueClipPush(itemID: id, at: 100)
+        _ = try await engineA.pushOnce(now: 200)
+
+        // Pull from a fresh "device B"
+        let storeB = try HistoryStore.inMemory()
+        let engineB = SyncEngine(store: storeB, dataSource: ds, blobStore: blobs,
+                                 crypto: crypto, deviceID: "test-B",
+                                 state: SyncStateStore(store: storeB))
+        try await engineB.pullOnce(now: 300)
+        XCTAssertTrue(try storeB.listRecent().contains(where: { $0.content == probe }))
+
+        // Cleanup: tombstone our probe row so the test bucket stays small
+        let cloudID = try storeA.itemByID(id)!.cloudID!
+        _ = try await ds.setClipDeleted(id: cloudID)
     }
 }
 ```
@@ -4198,39 +4643,35 @@ final class R2RoundTripTests: XCTestCase {
 
 ```bash
 set -a; source ~/.wrangler/clip.env; set +a
-swift test --filter ClipTests.R2RoundTripTests
+swift test --filter ClipTests.CloudRoundTripTests
 ```
 
-Expected: 1 test passes.
-
-If the env isn't sourced, expect: 1 test SKIPPED (not failed) — that's the design.
+Expected: 1 test passes (or SKIPPED if env not sourced).
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add Tests/ClipTests/R2Integration/R2RoundTripTests.swift
-git commit -m "sync: R2 integration test (self-skips without env)"
+git add Tests/ClipTests/CloudIntegration/CloudRoundTripTests.swift
+git commit -m "sync: cloud integration test — D1+R2 push/pull round-trip (opt-in)"
 ```
 
 ---
 
 ## Final sweep
 
-- [ ] **Step 1: Run the entire test suite**
+- [ ] **Step 1: Run full test suite**
 
 ```bash
 swift test
 ```
 
-Expected: all green (R2 integration test passes if env sourced, otherwise skipped).
+Expected: all green; CloudRoundTripTests passes if env sourced, otherwise SKIPPED.
 
 - [ ] **Step 2: Release build**
 
 ```bash
 swift build -c release --product Clip
 ```
-
-Expected: success.
 
 - [ ] **Step 3: Manual smoke (optional but recommended)**
 
@@ -4240,43 +4681,53 @@ open dist/Clip.app
 # walk through docs/MANUAL_TEST.md "云同步" section
 ```
 
-- [ ] **Step 4: Verify file map matches plan**
+- [ ] **Step 4: File map sanity check**
 
 ```bash
 ls Sources/Clip/Sync/
 ls Tests/ClipTests/Sync/
+ls Tests/ClipTests/CloudIntegration/
 ```
 
-Should match the "Files created" table at the top of this plan.
+Should match the "Files created" map at the top of this plan.
 
 ---
 
 ## Self-review (post-write checklist)
 
-This is the planner's self-check, not a separate review pass:
-
 **Spec coverage:**
-- §3 decisions 1-18: each maps to a task above (R2 backend = T11; pluggable protocol = T8; ChaCha20 = T3; PBKDF2 = T2; HMAC naming = T3; image lazy = T15 + future preview wiring; LWW = T15; tombstones = T16; backfill = T17; selective sync = T18 + T20)
-- §5 Migration v3: T1
-- §6 Crypto + naming + signing: T2 / T3 / T6 / T10 / T11
-- §7 Data flows: T14-T18
-- §8 UI: T20-T21
-- §10 Error handling: covered through SyncEngine error returns + SyncQueue backoff + R2Backend.Error.http
-- §11 Tests: each crypto/queue/engine task has its own test file; integration test = T24
-- §12 Acceptance: covered by `swift test` + manual checklist (T23)
-- §13 Deferred: explicitly out of scope
+- §3 decisions 1-20 → mapped to T1, T8, T9, T11-T13, T17, T15-T20 (push/pull/enable etc.)
+- §4 modules → P1+P2 tasks
+- §5 schema → T1 (local v3) + T8/T9/T13 (D1 schema in ensureSchema)
+- §6 crypto + naming → T2/T3/T11
+- §6.3 hmac dedup with deleted=1 (fix B) → T13 + T16
+- §6.5 S3v4 → T11
+- §7.1 enable → T18 (idempotent + fix C + fix E)
+- §7.2 push → T16 (R2-then-D1; orphan blob acceptance is documented behavior — fix D)
+- §7.3 pull → T17 (composite cursor — fix A)
+- §7.4 lazy blob → T19 + T25 (caller wire-up)
+- §7.5 selective sync → T21
+- §7.6 backfill → T20
+- §8 UI → T23 (panel) + T24 (Preferences with parallel ping — fix F)
+- §10 errors → covered through SyncEngine error returns + SyncQueue backoff
+- §11 tests → each module has unit / integration tests; T27 = real cloud round-trip
+- §12 acceptance → unit + manual (T26) cover items 1, 2, 3, 5; items 4 (24h CPU) and 6 (backfill < 100ms UI) are manual measurements
+- §13 deferred → device push, panel ⏳/⚠️ icons, "立刻同步"/"查看错误" buttons, modal onboarding
 
-**Placeholder scan:** No "TBD"/"implement later"; the only `// no-op stub` is the placeholder `pushTomb` in T14, which is replaced in T16 (this is bounded refactoring, not a placeholder TODO left in shipped code).
+**Placeholder scan:**
+- T16 `pushTomb` and `pushDevice` are stubs → `pushTomb` implemented in T21; `pushDevice` is permanently empty per Out of Scope
+- No "TBD" / "implement later" in shipped code
 
-**Type consistency:** Method names checked across tasks:
-- `enqueueItemPush(itemID:at:)` defined T14, used T22
-- `pushOnce(now:)` defined T14, used T22
-- `pullOnce(now:)` defined T15, used T22
-- `enqueueTombstone(contentHash:at:)` defined T16, used T18 + T22
-- `excludeItem(id:at:)` defined T18, used T22
-- `backfill(now:)` defined T17, used by user-trigger UI (not in this plan; future task or manual call)
-- `name(forContentHash:)` on CryptoBox defined T3, used T14, T16, T20
-- `setSyncExcluded(id:excluded:)` defined T7, used T18
+**Type/signature consistency:**
+- `enqueueClipPush(itemID:at:)`: T16 defines, T25 calls
+- `pushOnce(now:)`: T16, T25
+- `pullOnce(now:)`: T17, T25
+- `enableSync(password:dataSource:state:keychain:account:)`: T18, T24
+- `excludeItem(id:at:)`: T21, T25
+- `excludeItemByHash(contentHash:at:)`: T25 references; impl provided in T25 step 1 note
+- `fetchBlob(blobID:)`: T19, T25
+- `backfill(now:)`: T20, T25
+- `name(forContentHash:)` on CryptoBox: T3, T16, T19, T17
 
 All consistent.
 
@@ -4284,25 +4735,21 @@ All consistent.
 
 ## Out of Scope (explicit) — for STATUS.md handoff
 
-These items appear in the spec (some only as UI affordances) but are **deliberately not implemented in this plan**. STATUS.md must surface them so the user knows what's stubbed vs shipped:
+These items appear in the spec or were natural follow-ups but are **deliberately not implemented in this plan**. STATUS.md must surface them so the user knows what's stubbed vs shipped:
 
 | Spec ref | Item | Why deferred | Workaround for v3 ship |
 |---|---|---|---|
-| §3.14, §7.3 | Wake / hotkey-trigger immediate pull + 5s rate-limit | 30s tick is functional for daily use; immediate-pull is a latency win, not correctness | User waits ≤ 30s for cross-device updates |
-| §6.4 + §7.x | Device push (`pushDevice` actor stub) + `devices/<id>` aggregation in Preferences "已知设备" UI | Cosmetic / observability feature; payload type defined (`DevicePayload`) but PUT/decode pipeline not wired | Sync still works; users can't see device list (use Console.app to identify which Mac wrote what) |
-| §8.1 | "立刻同步" button | Background tick covers it | Quit + relaunch app = same effect |
-| §8.1 | "查看错误" sheet (per-row sync_queue inspection) | Read-only diagnostic — not load-bearing | Inspect `~/Library/Application Support/clip/history.sqlite` directly: `sqlite3 history.sqlite 'SELECT * FROM sync_queue'` |
-| §8.1 | "清空云端数据" button | Use `wrangler r2 object delete` from CLI for now | `wrangler r2 bucket clear clip-sync` (or per-prefix delete) |
-| §8.1 | "重置同步密码" button | Spec'd but full re-encryption flow is non-trivial | "Clear cloud + re-enable with new password" via dashboard |
-| §8.2 | Panel icons ⏳ / 📤 / ⚠️ (only ☁️ / 🚫 in T20) | UX polish; the underlying state (sync_queue / blob skip / failed attempts) is computed correctly, just not surfaced visually | Icons can be added in a follow-up commit |
-| §8.4 | First-launch modal sheet ("first Mac vs join existing" branching with progress bar) | The bootstrap logic IS in T17A; UI shows it as a Preferences form rather than a separate onboarding sheet | Functional — user bootstraps via Preferences instead of modal |
-| §10.2 | Password change flow (5-step blocking re-encrypt) | Heavy feature; reset-cloud-and-re-enable accomplishes the same with minor data loss | Per workaround in §8.1 |
-| §10.4 | In-app quota-exceeded remediation flow | Spec already says "user handles via dashboard" | Dashboard link in CloudSyncView status text (manual step) |
-| §10.1 | Special-case R2 401/403: pause push loop + surface auth-error banner | Generic backoff loop will retry forever and the queue will pile up; observable via `查看错误` (also deferred). For v3 the sync_queue.last_error column captures the message | Manual: rotate token in dashboard + paste new secret in CloudSyncView; engine restarts the queue on next push tick |
-| §12 acceptance #4 | Activity-Monitor 24h CPU < 0.5% | Manual measurement; no automated long-running benchmark in v3 | Run app + observe Activity Monitor manually after v3 lands |
-| §12 acceptance #6 | Backfill 1000 entries < 100ms UI block | UI block is bounded by single-actor pushTask + main-thread isolation; not measured | Manual smoke during backfill of a populated DB |
+| §3.16 / §7.3 | Wake / hotkey-trigger immediate pull + 5s rate-limit | 30s tick is functional for daily use; immediate-pull is a latency win, not correctness | User waits ≤ 30s for cross-device updates |
+| §6.4 / §7.x | Device push (`pushDevice` actor stub) + "已知设备" Preferences UI | Cosmetic / observability feature; DevicePayload + DeviceRow are defined and `upsertDevice` / `listDevices` exist on the protocol so v3.1 just wires push + UI | Sync still works; users can't see device list (use Console.app to identify) |
+| §8.1 | "立刻同步" / "查看错误" / "清空云端" / "重置同步密码" buttons | Read-only diagnostics + dangerous ops; not load-bearing for daily sync | "立刻同步" → quit + relaunch app. "查看错误" → `sqlite3 ~/Library/Application Support/clip/history.sqlite 'SELECT * FROM sync_queue'`. "清空云端" → `wrangler d1 execute clip-sync --command 'DELETE FROM clips; DELETE FROM devices; DELETE FROM config'` + clear R2 bucket. "重置密码" → clear cloud + re-enable |
+| §8.2 | Panel icons ⏳ / 📤 / ⚠️ (only ☁️ / 🚫 in T23) | UX polish; underlying state computed correctly, not surfaced visually | Add in a follow-up commit; trivial UI change |
+| §8.4 | First-launch modal sheet ("first Mac vs join existing" branching with progress bar) | Bootstrap logic IS in T18; UI shows it as Preferences form rather than separate onboarding sheet | Functional via Preferences |
+| §10.1 | R2/D1 401/403 special pause-and-notify | Generic backoff covers it (sync_queue.last_error captures the auth-error message) | Manual: rotate token in dashboard + paste new token in CloudSyncView |
+| §10.2 | Password change flow (5-step blocking re-encrypt) | Heavy feature; reset-cloud-and-re-enable accomplishes the same with minor data loss | "Clear cloud + re-enable with new password" via dashboard |
+| §10.4 | In-app quota-exceeded remediation flow | Spec says "user handles via dashboard" | Dashboard link in CloudSyncView status text (manual step) |
+| §12 #4 / #6 | 24h CPU < 0.5% / Backfill 1000 < 100ms UI block | Manual measurements; no automated long-running benchmark in v3 | Activity Monitor + manual smoke during backfill |
 
-For each item above, the engine architecture is forward-compatible: a follow-up plan can add tasks without touching the core push/pull/crypto/queue modules.
+For each item: the engine architecture is forward-compatible — a v3.1 plan can add tasks without touching the core push/pull/crypto/queue modules.
 
 ---
 

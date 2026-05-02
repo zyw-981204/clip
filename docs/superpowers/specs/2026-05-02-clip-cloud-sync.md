@@ -108,16 +108,54 @@ AppDelegate
 
 `SyncEngine` 是 Swift `actor`，所有可变状态串行化。后台用 `Task` 跑两条不阻塞主线程的循环。
 
+### 4.3 `CloudSyncBackend` 协议契约
+
+```swift
+struct CloudObjectMeta {
+    var key: String          // e.g. "items/abc...bin"
+    var etag: String         // PUT/list 返回的 ETag (去引号)
+    var lastModified: Int64  // unix 秒
+    var size: Int            // 字节数
+}
+
+struct ListPage {
+    var objects: [CloudObjectMeta]
+    var nextCursor: String?  // nil = 最后一页
+}
+
+protocol CloudSyncBackend: Sendable {
+    /// PUT；返回的 etag/lastModified 必须从响应 header 读取
+    func put(key: String, body: Data, contentType: String?) async throws -> (etag: String, lastModified: Int64)
+
+    /// GET；返回 nil = 404；其它错误抛
+    func get(key: String) async throws -> Data?
+
+    /// HEAD（用于"测试连接"和按需校验）
+    func head(key: String) async throws -> CloudObjectMeta?
+
+    /// DELETE；404 不抛（idempotent）
+    func delete(key: String) async throws
+
+    /// LIST；prefix 必须以 "/" 结尾；cursor=nil 即从头；max 1000 / page
+    func list(prefix: String, after cursor: String?) async throws -> ListPage
+}
+```
+
+**list 分页约定**：返回每页最多 1000 个对象（R2 默认上限）；当 `nextCursor != nil` 时调用方继续传回；分页过程中如果有对象被 PUT/DELETE，**只保证最终一致**——可能错过本轮但下轮 30s 必能见。
+
+**Pull 阶段并发**：v3 内 GET 串行（一次一个）。性能预算 §9 已按串行算账。如果 backfill 拉量巨大要并行优化，留 v3.x。
+
 ## 5. 数据模型 — Migration v3
 
 ### 5.1 字段增量
 
 ```sql
--- items 加 4 列
+-- items 加 5 列
 ALTER TABLE items ADD COLUMN sync_excluded INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE items ADD COLUMN cloud_synced_at INTEGER;          -- NULL = 未上传
 ALTER TABLE items ADD COLUMN cloud_etag TEXT;                  -- last seen / set ETag
-ALTER TABLE items ADD COLUMN device_id TEXT;                   -- 来源设备 UUID
+ALTER TABLE items ADD COLUMN cloud_lastmodified INTEGER;       -- R2 LastModified (unix 秒); LWW 比较用
+ALTER TABLE items ADD COLUMN device_id TEXT;                   -- 最近写者 (UPDATE 时覆盖)
 
 -- clip_blobs 加 2 列
 ALTER TABLE clip_blobs ADD COLUMN cloud_synced_at INTEGER;
@@ -129,11 +167,12 @@ ALTER TABLE clip_blobs ADD COLUMN cloud_etag TEXT;
 ```sql
 -- 云端 tombstones：被删除的条目，防 "pull 又把它捡回来"
 CREATE TABLE tombstones (
-  hmac            TEXT PRIMARY KEY,         -- HMAC 后的云端文件名
-  content_hash    TEXT NOT NULL,            -- 本地用，确认对应哪条
-  tombstoned_at   INTEGER NOT NULL,
-  cloud_synced_at INTEGER,                  -- NULL = 本地 only；NN = 已上传 tomb/<h>
-  cloud_etag      TEXT                      -- last seen ETag of tomb/<h>; 用于 pull 增量判定
+  hmac               TEXT PRIMARY KEY,      -- HMAC 后的云端文件名
+  content_hash       TEXT NOT NULL,         -- 本地用，确认对应哪条
+  tombstoned_at      INTEGER NOT NULL,
+  cloud_synced_at    INTEGER,               -- NULL = 本地 only；NN = 已上传 tomb/<h>
+  cloud_etag         TEXT,                  -- last seen ETag of tomb/<h>; 用于 pull 增量判定
+  cloud_lastmodified INTEGER                -- R2 LastModified (unix 秒); LWW 比较用
 );
 CREATE INDEX idx_tombstones_synced ON tombstones(cloud_synced_at);
 
@@ -222,7 +261,12 @@ tomb/<hex(hmac)>.bin                           # 加密 TombstonePayload
 devices/<device_id>.bin                        # 加密 DevicePayload (首启 + display name 改时上传)
 ```
 
-**`cloud_etag` 来源**：S3 PUT 响应的 `ETag` header（R2 实现：MD5-style hex string，带双引号的版本去引号即用）。`backend.put` 返回这个字符串；`SyncEngine` 把它写入 `items.cloud_etag` / `tombstones.cloud_etag`。pull 阶段 `backend.list` 返回的每个 object 也带 `etag` 字段，与本地存的对比即可判断是否 changed。
+**`cloud_etag` / `cloud_lastmodified` 来源**：
+- S3 PUT 响应的 `ETag` header → `cloud_etag`（R2 实现：MD5-hex 字符串，带双引号包裹，去引号即用）。**v3 不使用 multipart upload**（最大对象 = 2MB image，远低于 R2 单 PUT 5GB 上限），所以 ETag 永远是简单 MD5-hex，不需要处理 `<md5>-<part_count>` 形式
+- S3 PUT 响应的 `Last-Modified` header → 解析为 unix 秒 → `cloud_lastmodified`
+- list 返回的每个 object item 同样带 `etag` 和 `lastModified`，pull 阶段拿来做 LWW 比较
+
+`backend.put` 返回 `(etag, lastModified)` tuple；`SyncEngine` 把两个值都写入对应表行。
 
 **ItemPayload (encrypted JSON)**:
 ```json
@@ -261,6 +305,26 @@ devices/<device_id>.bin                        # 加密 DevicePayload (首启 + 
 { "v": 1, "kdf": "pbkdf2-hmac-sha256", "kdf_iters": 200000,
   "kdf_salt_b64": "<base64>", "format": "chacha20-poly1305-ietf-12-16" }
 ```
+
+### 6.5 S3v4 签名（R2Backend 实现细节）
+
+R2 接受标准 AWS Signature Version 4。**v3 用法约束**：
+
+- **Path-style**：URL 形如 `https://{account}.r2.cloudflarestorage.com/{bucket}/{key}`（virtual-hosted-style 在 R2 自定义 endpoint 不支持）
+- **Region**：固定字符串 `"auto"`（R2 不分 region；boto3 / 标准 SDK 也都用这个）
+- **Service**：`"s3"`
+- **Payload signing**：用 `UNSIGNED-PAYLOAD` 模式（在签名时 body hash 用字面字符串 `"UNSIGNED-PAYLOAD"`）。理由：item payload 已经是密文 + AEAD tag，再做 SHA256 浪费；R2 接受 unsigned payload；URLSession 上传时不需要先把 body 全读进内存做哈希
+- **签名头**：`Authorization: AWS4-HMAC-SHA256 Credential=..., SignedHeaders=..., Signature=...` + `x-amz-date` + `x-amz-content-sha256: UNSIGNED-PAYLOAD`
+- **字符转义**：key 走标准 RFC 3986 encode，但 `/` 不 encode（path 分隔符）
+
+`R2Backend` 实现是一个纯 Swift class，依赖只有 `Foundation` + `CryptoKit` (HMAC-SHA256)。无第三方 S3 SDK——避免引入除了 GRDB / KeyboardShortcuts 之外的依赖。
+
+### 6.6 杂项约定
+
+- **content_hash 定义**：沿用现有 `ClipItem.contentHash(of:)`，即 `SHA256(content.trimmingCharacters(in:.whitespacesAndNewlines).utf8)`，对图片 blob 是 `SHA256(rawBytes)`。云端跨设备依赖这个定义一致——Mac A / B 上同一段文字必须哈希出相同结果。这是已有契约，不变
+- **DevicePayload.display_name**：默认值 `Host.current().localizedName ?? "Mac"`；用户可在 Preferences > 云同步 > 设备 编辑。每次启动 / 改名 → PUT `devices/<device_id>.bin`
+- **Reachability**：用 `Network.framework` 的 `NWPathMonitor`（macOS 13+ 原生 API）。`SyncEngine` 持有 monitor，path 从 unsatisfied → satisfied 时发 wakeup signal 唤醒 pushTask
+- **Keychain 同步**：master_key 在 Keychain 里 **`kSecAttrSynchronizable = false`**（不走 iCloud Keychain）。理由：iCloud Keychain 同步密码 = 把 E2E 密钥放进 Apple 控制范围，违背"云端永远拿不到明文"的承诺。每台 Mac 单独输一次密码
 
 ## 7. 数据流
 
@@ -346,12 +410,14 @@ pushTask 循环 (Task in actor):
   sync_state.last_pull_cursor = JSON.stringify(cursors)
 ```
 
-`handleItemPayload(payload, etag)`：
+`handleItemPayload(payload, etag, lastModified)`：
 - 查 `tombstones` 表，hmac 命中且 `tombstoned_at >= payload.created_at` → **skip**（等号情况：tomb wins，与 §10.3 一致；保护"删后又出现陈旧复活"场景）
 - 查本地 `items` 表 by `content_hash`：
-  - 命中：UPDATE 可变字段 `pinned`, `device_id`, `cloud_etag = etag`（payload 内的 created_at 不动；本机 created_at 是本地真值）
+  - 命中：把 list 返回的 `lastModified` 与本地 `cloud_etag_lastmodified`（伴随 cloud_etag 一起存的 server-side mtime）比较；**only if `lastModified > local_lastmodified`** 才 UPDATE 可变字段 `pinned`、`device_id`、`cloud_etag = etag`、`cloud_etag_lastmodified = lastModified`。这才真正实现了 §3 row 8 的 R2 LastModified LWW。`device_id` 字段语义：覆盖为最新写者的 device（而非 first-writer-wins），便于 UI 展示"这条最近一次被 pin 的设备"
   - 未命中：INSERT，cloud_etag = etag。image kind 时 `clip_blobs` 插占位行（bytes NULL，blob_hmac/byte_size 来自 payload），thumbnail 落 ThumbnailCache
 - 解密失败：log warning + 跳过；不删本地
+
+> **Schema 增量补充**：上面引入的 `cloud_etag_lastmodified` 字段需要在 §5.1 Migration v3 里给 `items` / `tombstones` 各加一列 `cloud_lastmodified INTEGER`（unix 秒；R2 LastModified header 解析后的值）。
 
 `handleTombstone(payload, etag)`：
 - UPSERT into `tombstones` (hmac, content_hash, tombstoned_at, cloud_etag = etag, cloud_synced_at = now)
@@ -382,24 +448,34 @@ UI 在 panel 行有快捷键 `⌘N` toggle "不上云"（确认 ⌘N 在现有 p
 - 已 synced 的项 → INSERT tombstone + enqueue tomb push + UPDATE items SET sync_excluded = 1 + **DELETE FROM sync_queue WHERE op IN ('put_item','put_blob') AND target_key 对应到本 item**
 - 未 synced 的项 → UPDATE sync_excluded = 1 + DELETE 相同 sync_queue 行（无 tomb 必要，反正未上传过）
 
-再次 `⌘N` 取消排除：UPDATE sync_excluded = 0 + 重新 enqueue put_item（如果 cloud_synced_at 仍然 NULL）。已上传过的 tomb 不会自动收回——重新出现的 hash 走正常 INSERT，云端会有一份新的 items/<h>，但旧 tomb 文件还在直到 lifecycle 清理。这是已知行为，不在 v3 自动 GC tomb。
+再次 `⌘N` 取消排除：UPDATE sync_excluded = 0 + 重新 enqueue put_item（如果 cloud_synced_at 仍然 NULL）。已上传过的 tomb 不会自动收回——重新出现的 hash 走正常 INSERT，云端会有一份新的 items/<h>，但旧 tomb 文件还在直到 lifecycle 清理。**B 端解释**：B pull 时同时看到 tomb（老）和 items/（新），按 §10.3 比较 `tombstoned_at` vs `payload.created_at`：新 PUT 的 item.created_at 一定 > 老 tomb 的 tombstoned_at（因为 toggle 是更晚的动作）→ item wins，B 删 tombstones 行 + INSERT。这是设计期望行为。v3 不自动 GC tomb（lifecycle 清理留 v3.x）。
 
 Panel 行尾若 `sync_excluded = 1` 显示 🚫；否则若 `cloud_synced_at IS NULL AND sync queue has it` 显示 ⏳；否则若 `cloud_synced_at NOT NULL` 显示 ☁️；否则不显示。
 
 ### 7.6 Backfill
 
-启用时事务里：
-```sql
-INSERT INTO sync_queue (op, target_key, next_try_at, enqueued_at)
-SELECT 'put_item', CAST(id AS TEXT), strftime('%s','now'), strftime('%s','now')
-FROM items WHERE sync_excluded = 0;
+启用时**独立事务**（不在 migrator 内）：
 
+```sql
+-- 文字 + ≤ 2MB 图片的 items
 INSERT INTO sync_queue (op, target_key, next_try_at, enqueued_at)
-SELECT 'put_blob', CAST(id AS TEXT), strftime('%s','now'), strftime('%s','now')
+SELECT 'put_item', CAST(items.id AS TEXT), strftime('%s','now'), strftime('%s','now')
+FROM items
+LEFT JOIN clip_blobs ON items.blob_id = clip_blobs.id
+WHERE items.sync_excluded = 0
+  AND (items.kind = 'text' OR clip_blobs.byte_size <= 2*1024*1024)
+ORDER BY items.created_at DESC;          -- 新的先推
+
+-- 对应 ≤ 2MB 的 blobs
+INSERT INTO sync_queue (op, target_key, next_try_at, enqueued_at)
+SELECT 'put_blob', CAST(clip_blobs.id AS TEXT), strftime('%s','now'), strftime('%s','now')
 FROM clip_blobs
-WHERE id IN (SELECT blob_id FROM items WHERE sync_excluded = 0 AND blob_id IS NOT NULL)
-  AND byte_size <= 2*1024*1024;
+JOIN items ON items.blob_id = clip_blobs.id
+WHERE items.sync_excluded = 0 AND clip_blobs.byte_size <= 2*1024*1024
+ORDER BY items.created_at DESC;
 ```
+
+`ORDER BY created_at DESC` 是有意：用户启用同步后第一时间想在 B 端看到的是**最近**复制的内容，所以**新的先推**。
 
 UI 显示 "Backfill: M / N" 进度条，由 sync_queue 长度差驱动。
 
@@ -430,6 +506,11 @@ Secret:         ●●●●●●●●               (写入触发；存 Keych
 状态:
   云端: 1284 条 / 392 MB
   本地未同步: 3 条 (重试中)         [立刻同步] [查看错误]
+                                  ↑ 立刻同步 = (1) 把所有 sync_queue 行
+                                    next_try_at 重置为 now，(2) 唤醒 pushTask，
+                                    (3) 触发一次 immediate pull
+                                  ↑ 查看错误 = sheet，列出 attempts > 0 的行
+                                    及其 last_error，可单条 retry / discard
   上次拉取: 12 秒前 (自动 30 秒)
   Backfill: 1284 / 1284 (完成)
 
@@ -521,7 +602,7 @@ R2 一次 PUT/GET 假定 50-200ms（中国大陆 → APAC 区）。
 | 场景 | 处理 |
 |---|---|
 | 单 image > 2MB | A 端：检查 byte_size > 2MB → 不入 sync_queue（既不 put_item 也不 put_blob）→ 行尾显示 📤；item 在云上完全不存在，因此 B 端**永远看不到这条**（无对象可 list / get）。这是设计取舍：避免大图同步；用户感知到"大图只在本地"。`sync_excluded` 不设（区分用户意志 vs 技术限制） |
-| R2 配额超 | put 失败；状态显示"配额超限"；用户处理（升级 plan / 删旧条目） |
+| R2 配额超 | put 失败 → attempts++ + backoff；CloudSyncView 状态文本显示"配额超限"红字 + 按钮"打开 R2 dashboard"（外链 https://dash.cloudflare.com/...）；用户处理（升级 plan / 在 R2 端删旧对象 / 在本地清旧 items 让 tombstones 推上去）。v3 不自动收缩本地 retention 来腾配额 |
 
 ### 10.5 启动 / 多实例
 
@@ -592,3 +673,4 @@ R2 一次 PUT/GET 假定 50-200ms（中国大陆 → APAC 区）。
 - **冲突 UI**：当前 LWW 静默处理；如果用户报"我的 pin 状态怎么没了"，再加冲突日志
 - **R2 token 撤销 / 轮换**：需要用户手动在 dashboard 撤销 + 在 Preferences 重新粘贴；UI 给链接
 - **Backend abuse**：如果用户的 token 泄漏，攻击者只能往桶里写垃圾或删除（不能解密）；v3.1 加 R2 lifecycle 自动删除 N 天前对象作为兜底
+- **`clip_blobs` 孤儿清理**：原 v2 spec 的 `HistoryStore.prune` 已经在每次跑时清理无 items 引用的 blob 行（删 `clip_blobs WHERE id NOT IN (SELECT blob_id ...)`）。这条逻辑不需要改；同步带来的 lazy blob 占位行（bytes NULL）也会被这个查询保留（因为 `items.blob_id` 仍指向它）。无新增清理需求

@@ -207,6 +207,15 @@ final class PanelModel: ObservableObject {
         reload()
     }
 
+    /// User pressed ⌘N to mark the selected item as not-syncing.
+    /// AppDelegate wires this to engine.excludeItem(id:at:).
+    var onExclude: ((Int64) -> Void)?
+
+    func toggleExcludeSelected() {
+        guard let id = selectedItem()?.id else { return }
+        onExclude?(id)
+    }
+
     /// Toggle pin on a specific row (used by the right-click context menu so
     /// it acts on the row that was right-clicked, not the previously selected
     /// row).

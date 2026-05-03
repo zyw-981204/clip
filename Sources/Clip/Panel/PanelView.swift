@@ -273,6 +273,11 @@ struct PanelRow: View {
             if item.truncated {
                 Text("(截断)").font(.caption2).foregroundStyle(.orange)
             }
+            if let icon = syncIcon(for: item) {
+                Text(icon)
+                    .frame(width: 14, alignment: .center)
+                    .help(syncTooltip(for: item))
+            }
         }
         .padding(.horizontal, 8)
         .frame(maxWidth: .infinity, minHeight: Self.height,
@@ -312,4 +317,17 @@ struct PanelRow: View {
         if one.count <= 120 { return one }
         return String(one.prefix(120)) + "…"
     }
+}
+
+private func syncIcon(for item: ClipItem) -> String? {
+    if item.syncExcluded { return "🚫" }
+    if item.cloudSyncedAt != nil { return "☁️" }
+    // ⏳ / ⚠️ / 📤 deferred to v3.x (spec §13)
+    return nil
+}
+
+private func syncTooltip(for item: ClipItem) -> String {
+    if item.syncExcluded { return "已标记为不同步 (⌘N 取消)" }
+    if item.cloudSyncedAt != nil { return "已同步到云端" }
+    return ""
 }

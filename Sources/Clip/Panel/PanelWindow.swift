@@ -34,6 +34,8 @@ final class PanelWindow: NSPanel {
         let onPreview: () -> Void
         /// ⌥1 / ⌥2 / ⌥3 → 全部 / 文字 / 图片. 1-based.
         let onSwitchTab: (Int) -> Void
+        /// ⌘N → mark the selected item as not-syncing (sync exclude toggle).
+        var onExclude: () -> Void = {}
     }
 
     var keyHandlers: KeyHandlers?
@@ -152,6 +154,7 @@ final class PanelWindow: NSPanel {
             switch chars.lowercased() {
             case "p": h.onPin(); return nil
             case "d": h.onDelete(); return nil
+            case "n": h.onExclude(); return nil
             // ⌘F is handled by a SwiftUI keyboardShortcut button in PanelView
             // (it needs @FocusState access to flip the search field's focus).
             // Letting the event through allows SwiftUI's shortcut to catch it.

@@ -255,6 +255,27 @@ actor SyncEngine {
         }
         _ = try store.insert(item)
     }
+
+    // MARK: - lazy blob fetch
+
+    /// Spec §7.4 lazy image download. Caller holds a clip_blobs.id whose
+    /// `bytes` is empty (sha256 prefixed `lazy:`). Resolves the blob_hmac,
+    /// GETs blobs/<hmac>.bin, decrypts, fills local row, returns bytes.
+    func fetchBlob(blobID: Int64) async throws -> Data {
+        guard let info = try store.lazyBlobHmac(id: blobID) else {
+            // Already filled — caller should re-read.
+            return (try store.blob(id: blobID)) ?? Data()
+        }
+        let key = CloudKey.blobKey(name: info.hmac)
+        guard let sealed = try await blobStore.getBlob(key: key) else {
+            throw SyncError.r2("blob \(info.hmac) not found in cloud")
+        }
+        let bytes = try crypto.open(sealed)
+        let realSha = ClipItem.contentHash(of: bytes)
+        try store.fillBlob(id: blobID, bytes: bytes, sha256: realSha,
+                           at: Int64(Date().timeIntervalSince1970))
+        return bytes
+    }
 }
 
 extension SyncEngine {

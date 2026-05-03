@@ -1,4 +1,12 @@
 import Foundation
+import Security
+
+enum SyncError: Error, Equatable {
+    case remoteSchemaNewer(remote: String, local: String)
+    case decryptionFailed
+    case d1(String)
+    case r2(String)
+}
 
 /// Cloud sync orchestrator. Spec §4.1: actor; two background loops
 /// (push drainer + 30s pull tick) plus signal-based wakeups.
@@ -246,5 +254,83 @@ actor SyncEngine {
             item.blobID = blobID
         }
         _ = try store.insert(item)
+    }
+}
+
+extension SyncEngine {
+    enum BootstrapResult: Equatable {
+        case firstDevice
+        case joinedExisting
+    }
+
+    /// Spec §7.1 first-time enable. Static because it runs before SyncEngine
+    /// is instantiated. Bakes in fix C (INSERT OR IGNORE) + fix E (schema_version).
+    ///
+    /// Side effects:
+    ///   - D1 schema present (CREATE IF NOT EXISTS)
+    ///   - config { schema_version='3', kdf_iters='200000', kdf_salt_b64=<...> }
+    ///   - master_key written to (keychain.service, account)
+    ///   - device_id allocated locally if missing
+    static func enableSync(
+        password: String,
+        dataSource: CloudSyncDataSource,
+        state: SyncStateStore,
+        keychain: KeychainStore,
+        account: String
+    ) async throws -> BootstrapResult {
+        let localSchemaVersion = "3"
+        let iters = 200_000
+
+        try await dataSource.ensureSchema()
+
+        // Fix E — schema_version gatekeeping
+        let remote = try await dataSource.getConfig(key: "schema_version") ?? localSchemaVersion
+        if (Int(remote) ?? 0) > (Int(localSchemaVersion) ?? 0) {
+            throw SyncError.remoteSchemaNewer(remote: remote, local: localSchemaVersion)
+        }
+        // Stamp our version (idempotent)
+        _ = try await dataSource.putConfigIfAbsent(key: "schema_version", value: localSchemaVersion)
+
+        // Fix C — idempotent salt + iters bootstrap
+        var saltBytes = Data(count: 16)
+        _ = saltBytes.withUnsafeMutableBytes {
+            SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!)
+        }
+        let saltB64 = saltBytes.base64EncodedString()
+        let iWonSalt = try await dataSource.putConfigIfAbsent(
+            key: "kdf_salt_b64", value: saltB64)
+        _ = try await dataSource.putConfigIfAbsent(
+            key: "kdf_iters", value: String(iters))
+
+        // Read authoritative salt (mine if iWon, theirs otherwise)
+        guard let authSaltB64 = try await dataSource.getConfig(key: "kdf_salt_b64"),
+              let authSalt = Data(base64Encoded: authSaltB64) else {
+            throw SyncError.d1("kdf_salt_b64 missing after bootstrap")
+        }
+
+        let masterKey = KeyDerivation.pbkdf2_sha256(
+            password: password, salt: authSalt,
+            iterations: iters, keyLength: 32)
+        try keychain.write(account: account, data: masterKey)
+
+        // Allocate local device_id if missing
+        if try state.get("device_id") == nil {
+            try state.set("device_id", UUID().uuidString.lowercased())
+        }
+
+        return iWonSalt ? .firstDevice : .joinedExisting
+    }
+
+    /// Spec §5.2 — runs on **every SyncEngine cold start** (not only enable),
+    /// so a remote schema bump while this client was offline is caught next
+    /// launch. Throws SyncError.remoteSchemaNewer when remote > local.
+    /// Idempotent: `ensureSchema` is `CREATE TABLE IF NOT EXISTS`-only.
+    static func verifyRemoteSchema(dataSource: CloudSyncDataSource) async throws {
+        let localSchemaVersion = "3"
+        try await dataSource.ensureSchema()
+        let remote = try await dataSource.getConfig(key: "schema_version") ?? localSchemaVersion
+        if (Int(remote) ?? 0) > (Int(localSchemaVersion) ?? 0) {
+            throw SyncError.remoteSchemaNewer(remote: remote, local: localSchemaVersion)
+        }
     }
 }

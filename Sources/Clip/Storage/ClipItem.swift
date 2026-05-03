@@ -25,6 +25,14 @@ struct ClipItem: Identifiable, Equatable {
     var kind: ClipKind = .text
     var blobID: Int64? = nil
     var mimeType: String? = nil
+    // v3 cloud sync columns (Migration v3) — all default-nil so callsites
+    // that never touch sync don't break.
+    var cloudID: String? = nil
+    var cloudUpdatedAt: Int64? = nil
+    var cloudSyncedAt: Int64? = nil
+    var cloudBlobKey: String? = nil
+    var syncExcluded: Bool = false
+    var deviceID: String? = nil
 
     static func byteSize(of s: String) -> Int {
         s.utf8.count

@@ -1,11 +1,22 @@
 import Foundation
 import GRDB
 
+enum HistoryStoreChange: Sendable {
+    case inserted(itemID: Int64)
+    case deleted(itemID: Int64, contentHash: String)
+    case pinToggled(itemID: Int64)
+    case excludedToggled(itemID: Int64)
+}
+
 /// Thread-safety: the only stored state is `pool`, a GRDB `DatabasePool`
 /// which is documented as safe to share across threads. WAL journal mode
 /// (set in init) lets readers and writers proceed concurrently.
 final class HistoryStore: @unchecked Sendable {
     let pool: DatabasePool
+
+    /// Fires after every successful mutation (insert/delete/pin/exclude).
+    /// SyncEngine subscribes here in T25 to enqueue push work.
+    var onChange: (@Sendable (HistoryStoreChange) -> Void)?
 
     init(path: String) throws {
         if FileManager.default.fileExists(atPath: path) {
@@ -56,9 +67,11 @@ final class HistoryStore: @unchecked Sendable {
 
     @discardableResult
     func insert(_ item: ClipItem) throws -> Int64 {
-        try pool.write { db in
+        let id = try pool.write { db in
             try Self._insert(db, item: item)
         }
+        onChange?(.inserted(itemID: id))
+        return id
     }
 
     fileprivate static func _insert(_ db: Database, item: ClipItem) throws -> Int64 {
@@ -66,13 +79,17 @@ final class HistoryStore: @unchecked Sendable {
             INSERT INTO items
                 (content, content_hash, source_bundle_id, source_app_name,
                  created_at, pinned, byte_size, truncated,
-                 kind, blob_id, mime_type)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 kind, blob_id, mime_type,
+                 cloud_id, cloud_updated_at, cloud_synced_at, cloud_blob_key,
+                 sync_excluded, device_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, arguments: [
             item.content, item.contentHash, item.sourceBundleID,
             item.sourceAppName, item.createdAt, item.pinned ? 1 : 0,
             item.byteSize, item.truncated ? 1 : 0,
             item.kind.rawValue, item.blobID, item.mimeType,
+            item.cloudID, item.cloudUpdatedAt, item.cloudSyncedAt, item.cloudBlobKey,
+            item.syncExcluded ? 1 : 0, item.deviceID,
         ])
         return db.lastInsertedRowID
     }
@@ -92,7 +109,7 @@ final class HistoryStore: @unchecked Sendable {
         now: Int64
     ) throws -> Int64 {
         let sha = ClipItem.contentHash(of: bytes)
-        return try pool.write { db in
+        let result: (id: Int64, isNew: Bool) = try pool.write { db in
             // 1. Find or create the blob.
             let blobID: Int64
             if let existing = try Int64.fetchOne(
@@ -119,7 +136,7 @@ final class HistoryStore: @unchecked Sendable {
                     sql: "UPDATE items SET created_at = ? WHERE id = ?",
                     arguments: [now, id]
                 )
-                return id
+                return (id, false)
             }
 
             // 3. Fresh insert.
@@ -136,8 +153,13 @@ final class HistoryStore: @unchecked Sendable {
                 blobID: blobID,
                 mimeType: mimeType
             )
-            return try Self._insert(db, item: item)
+            let newID = try Self._insert(db, item: item)
+            return (newID, true)
         }
+        if result.isNew {
+            onChange?(.inserted(itemID: result.id))
+        }
+        return result.id
     }
 
     /// Fetch raw bytes for a blob (used by ThumbnailCache + PasteInjector).
@@ -223,11 +245,23 @@ final class HistoryStore: @unchecked Sendable {
     }
 
     func delete(id: Int64) throws {
+        // Capture content_hash BEFORE the delete so SyncEngine can write a
+        // tombstone with the correct hash.
+        let hash = try pool.read { db in
+            try String.fetchOne(
+                db,
+                sql: "SELECT content_hash FROM items WHERE id = ?",
+                arguments: [id]
+            )
+        }
         try pool.write { db in
             try db.execute(
                 sql: "DELETE FROM items WHERE id = ?",
                 arguments: [id]
             )
+        }
+        if let hash {
+            onChange?(.deleted(itemID: id, contentHash: hash))
         }
     }
 
@@ -238,6 +272,7 @@ final class HistoryStore: @unchecked Sendable {
                 arguments: [id]
             )
         }
+        onChange?(.pinToggled(itemID: id))
     }
 
     func search(query: String, limit: Int = 50) throws -> [ClipItem] {
@@ -261,7 +296,7 @@ final class HistoryStore: @unchecked Sendable {
 
     @discardableResult
     func insertOrPromote(_ item: ClipItem, now: Int64) throws -> Int64 {
-        try pool.write { db in
+        let result: (id: Int64, isNew: Bool) = try pool.write { db in
             if let id = try Int64.fetchOne(
                 db,
                 sql: "SELECT id FROM items WHERE content_hash = ? LIMIT 1",
@@ -271,10 +306,15 @@ final class HistoryStore: @unchecked Sendable {
                     sql: "UPDATE items SET created_at = ? WHERE id = ?",
                     arguments: [now, id]
                 )
-                return id
+                return (id, false)
             }
-            return try Self._insert(db, item: item)
+            let newID = try Self._insert(db, item: item)
+            return (newID, true)
         }
+        if result.isNew {
+            onChange?(.inserted(itemID: result.id))
+        }
+        return result.id
     }
 
     static func itemFromRow(_ row: Row) -> ClipItem {
@@ -296,7 +336,136 @@ final class HistoryStore: @unchecked Sendable {
             truncated: (row["truncated"] as Int64) != 0,
             kind: kind,
             blobID: row["blob_id"],
-            mimeType: row["mime_type"]
+            mimeType: row["mime_type"],
+            cloudID: row["cloud_id"],
+            cloudUpdatedAt: row["cloud_updated_at"],
+            cloudSyncedAt: row["cloud_synced_at"],
+            cloudBlobKey: row["cloud_blob_key"],
+            syncExcluded: ((row["sync_excluded"] as Int64?) ?? 0) != 0,
+            deviceID: row["device_id"]
         )
+    }
+
+    // MARK: - Sync helpers (Migration v3)
+
+    func itemByID(_ id: Int64) throws -> ClipItem? {
+        try pool.read { db in
+            try Row.fetchOne(db, sql: "SELECT * FROM items WHERE id = ?", arguments: [id])
+                .map(Self.itemFromRow)
+        }
+    }
+
+    func itemByCloudID(_ cloudID: String) throws -> ClipItem? {
+        try pool.read { db in
+            try Row.fetchOne(db, sql: "SELECT * FROM items WHERE cloud_id = ? LIMIT 1",
+                             arguments: [cloudID]).map(Self.itemFromRow)
+        }
+    }
+
+    func itemByContentHash(_ hash: String) throws -> ClipItem? {
+        try pool.read { db in
+            try Row.fetchOne(db, sql: "SELECT * FROM items WHERE content_hash = ? LIMIT 1",
+                             arguments: [hash]).map(Self.itemFromRow)
+        }
+    }
+
+    func markClipSynced(id: Int64, cloudID: String, updatedAt: Int64, at: Int64) throws {
+        try pool.write { db in
+            try db.execute(sql: """
+                UPDATE items SET cloud_id = ?, cloud_updated_at = ?, cloud_synced_at = ?
+                WHERE id = ?
+            """, arguments: [cloudID, updatedAt, at, id])
+        }
+    }
+
+    /// Per spec §5.1, clip_blobs has no new columns — "synced" for a blob is
+    /// implicit (sha256 no longer carries the `"lazy:"` prefix). This helper
+    /// is a no-op kept for SyncEngine API symmetry; callers may use it as a
+    /// hook point if a future migration adds explicit per-blob sync state.
+    func markBlobSynced(id: Int64, at: Int64) throws {
+        _ = id; _ = at
+    }
+
+    func setItemCloudBlobKey(id: Int64, blobKey: String) throws {
+        try pool.write { db in
+            try db.execute(sql: "UPDATE items SET cloud_blob_key = ? WHERE id = ?",
+                           arguments: [blobKey, id])
+        }
+    }
+
+    func setSyncExcluded(id: Int64, excluded: Bool) throws {
+        try pool.write { db in
+            try db.execute(sql: "UPDATE items SET sync_excluded = ? WHERE id = ?",
+                           arguments: [excluded ? 1 : 0, id])
+        }
+        onChange?(.excludedToggled(itemID: id))
+    }
+
+    // MARK: - Tombstones (local; prevents capture-side resurrection)
+
+    func upsertTombstone(contentHash: String, cloudID: String,
+                         tombstonedAt: Int64, cloudUpdatedAt: Int64) throws {
+        try pool.write { db in
+            try db.execute(sql: """
+                INSERT INTO tombstones (content_hash, cloud_id, tombstoned_at, cloud_updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(content_hash) DO UPDATE SET
+                  tombstoned_at = excluded.tombstoned_at,
+                  cloud_updated_at = excluded.cloud_updated_at
+            """, arguments: [contentHash, cloudID, tombstonedAt, cloudUpdatedAt])
+        }
+    }
+
+    func tombstoneAt(contentHash: String) throws -> Int64? {
+        try pool.read { db in
+            try Int64.fetchOne(db,
+                sql: "SELECT tombstoned_at FROM tombstones WHERE content_hash = ?",
+                arguments: [contentHash])
+        }
+    }
+
+    func deleteItemsByContentHashOlderThan(_ contentHash: String, _ tombstonedAt: Int64) throws {
+        try pool.write { db in
+            try db.execute(sql: """
+                DELETE FROM items WHERE content_hash = ? AND created_at <= ?
+            """, arguments: [contentHash, tombstonedAt])
+        }
+    }
+
+    // MARK: - Lazy blob (image rows pulled before bytes downloaded)
+
+    func insertLazyBlob(blobHmac: String, byteSize: Int, now: Int64) throws -> Int64 {
+        try pool.write { db in
+            try db.execute(sql: """
+                INSERT INTO clip_blobs (sha256, bytes, byte_size, created_at)
+                VALUES (?, ?, ?, ?)
+            """, arguments: ["lazy:" + blobHmac, Data(), byteSize, now])
+            return db.lastInsertedRowID
+        }
+    }
+
+    func lazyBlobHmac(id: Int64) throws -> (hmac: String, byteSize: Int)? {
+        try pool.read { db in
+            guard let row = try Row.fetchOne(db,
+                sql: "SELECT sha256, byte_size FROM clip_blobs WHERE id = ?",
+                arguments: [id]) else { return nil }
+            let sha: String = row["sha256"]
+            guard sha.hasPrefix("lazy:") else { return nil }
+            return (String(sha.dropFirst("lazy:".count)), row["byte_size"])
+        }
+    }
+
+    /// `at` is the wall-clock time of the fill; not stored on clip_blobs (per
+    /// spec §5.1 the table has no sync timestamp), but kept in the signature
+    /// so SyncEngine code can pass it without conditional plumbing if a future
+    /// migration adds the column.
+    func fillBlob(id: Int64, bytes: Data, sha256: String, at: Int64) throws {
+        _ = at
+        try pool.write { db in
+            try db.execute(sql: """
+                UPDATE clip_blobs SET bytes = ?, sha256 = ?
+                WHERE id = ?
+            """, arguments: [bytes, sha256, id])
+        }
     }
 }

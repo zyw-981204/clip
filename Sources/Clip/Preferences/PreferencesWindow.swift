@@ -10,7 +10,7 @@ import SwiftUI
 /// collides with the traffic-light region.
 struct PreferencesWindow: View {
     enum Tab: Hashable, CaseIterable {
-        case general, hotkey, retention, privacy, advanced
+        case general, hotkey, retention, privacy, cloud, advanced
 
         var title: String {
             switch self {
@@ -18,6 +18,7 @@ struct PreferencesWindow: View {
             case .hotkey:    "热键"
             case .retention: "保留"
             case .privacy:   "隐私"
+            case .cloud:     "云同步"
             case .advanced:  "高级"
             }
         }
@@ -45,6 +46,7 @@ struct PreferencesWindow: View {
                 case .hotkey:    HotkeyView()
                 case .retention: RetentionView()
                 case .privacy:   PrivacyView()
+                case .cloud:     CloudSyncView()
                 case .advanced:  AdvancedView()
                 }
             }

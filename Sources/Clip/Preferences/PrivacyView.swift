@@ -132,5 +132,6 @@ final class PreferencesContainer: @unchecked Sendable {
     var blacklist: BlacklistService?
     var store: HistoryStore?
     var dbPath: String?
+    var syncSettings: SyncSettings = SyncSettings()
     private init() {}
 }

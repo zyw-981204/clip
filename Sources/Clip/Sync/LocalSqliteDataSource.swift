@@ -50,15 +50,23 @@ final class LocalSqliteDataSource: CloudSyncDataSource, @unchecked Sendable {
 
     func upsertClip(_ row: CloudRow) async throws -> Int64 {
         try await pool.write { db in
+            // Enforce strict monotonic updated_at: spec §5.2 requires a
+            // monotonic pull cursor, but unixepoch() returns seconds so two
+            // updates within one second would collide and be missed by the
+            // composite cursor. Bump table-wide max+1 when wall clock hasn't
+            // advanced past it.
             try db.execute(sql: """
                 INSERT INTO clips (id, hmac, ciphertext, kind, blob_key, byte_size,
                                    device_id, created_at, updated_at, deleted)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch(), 0)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?,
+                        MAX(unixepoch(), COALESCE((SELECT MAX(updated_at) FROM clips), 0) + 1),
+                        0)
                 ON CONFLICT(id) DO UPDATE SET
                   hmac=excluded.hmac, ciphertext=excluded.ciphertext,
                   kind=excluded.kind, blob_key=excluded.blob_key,
                   byte_size=excluded.byte_size, device_id=excluded.device_id,
-                  updated_at=unixepoch(), deleted=0
+                  updated_at=MAX(unixepoch(), (SELECT MAX(updated_at) FROM clips) + 1),
+                  deleted=0
             """, arguments: [row.id, row.hmac, row.ciphertext, row.kind,
                              row.blobKey, row.byteSize, row.deviceID,
                              row.createdAt])
@@ -90,8 +98,11 @@ final class LocalSqliteDataSource: CloudSyncDataSource, @unchecked Sendable {
 
     func setClipDeleted(id: String) async throws -> Int64 {
         try await pool.write { db in
+            // Same monotonic-bump as upsertClip — pull cursor depends on it.
             try db.execute(sql: """
-                UPDATE clips SET deleted = 1, updated_at = unixepoch() WHERE id = ?
+                UPDATE clips SET deleted = 1,
+                    updated_at = MAX(unixepoch(), (SELECT MAX(updated_at) FROM clips) + 1)
+                WHERE id = ?
             """, arguments: [id])
             return try Int64.fetchOne(db,
                 sql: "SELECT updated_at FROM clips WHERE id = ?",

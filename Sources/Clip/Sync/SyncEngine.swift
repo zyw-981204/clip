@@ -135,10 +135,58 @@ actor SyncEngine {
         try store.markBlobSynced(id: blobID, at: now)
     }
 
-    // Implementations in T18 / T20 / T21
+    /// User toggles "do not sync this" on a panel row. Spec §7.5.
+    func excludeItem(id: Int64, at: Int64) async throws {
+        guard let item = try store.itemByID(id) else { return }
+        try store.setSyncExcluded(id: id, excluded: true)
+        try queue.deleteAllForItem(itemID: id)
+        if let cloudID = item.cloudID {
+            // Already on cloud → write local tombstone + enqueue tomb push
+            try store.upsertTombstone(contentHash: item.contentHash,
+                                      cloudID: cloudID,
+                                      tombstonedAt: at,
+                                      cloudUpdatedAt: at)
+            try queue.enqueue(op: .putTomb, targetKey: item.contentHash, at: at)
+        }
+        // Else: never reached cloud, no remote action needed.
+    }
+
+    /// Wrapper used by AppDelegate's HistoryStore.onChange handler when a
+    /// `.deleted(itemID:contentHash:)` event arrives — by then the local row
+    /// is already gone, so we can't look it up by id. If a previously-synced
+    /// row tombstone is locally stored, enqueue the tomb push; otherwise no-op.
+    func excludeItemByHash(contentHash: String, at: Int64) async throws {
+        if let item = try store.itemByContentHash(contentHash), let id = item.id {
+            try await excludeItem(id: id, at: at)
+            return
+        }
+        let existingCloudID = try await store.pool.read { db in
+            try String.fetchOne(db,
+                sql: "SELECT cloud_id FROM tombstones WHERE content_hash = ?",
+                arguments: [contentHash])
+        }
+        if let existingCloudID, !existingCloudID.isEmpty {
+            try queue.enqueue(op: .putTomb, targetKey: contentHash, at: at)
+        }
+    }
+
+    /// Replaces the T16 stub. Drains a put_tomb queue row by calling
+    /// `dataSource.setClipDeleted` for the cloud_id stored in the local
+    /// tombstones table.
     private func pushTomb(contentHash: String) async throws {
-        // Implemented in Task 21 (excludeItem).
-        _ = contentHash
+        // Fetch local tomb to find cloud_id
+        let cloudID = try await store.pool.read { db in
+            try String.fetchOne(db,
+                sql: "SELECT cloud_id FROM tombstones WHERE content_hash = ?",
+                arguments: [contentHash])
+        }
+        guard let cloudID, !cloudID.isEmpty else { return }
+        let serverUpdatedAt = try await dataSource.setClipDeleted(id: cloudID)
+        // Re-stamp local tombstone with server-authoritative updated_at
+        try store.upsertTombstone(contentHash: contentHash,
+                                  cloudID: cloudID,
+                                  tombstonedAt: serverUpdatedAt,
+                                  cloudUpdatedAt: serverUpdatedAt)
     }
 
     private func pushDevice() async throws {

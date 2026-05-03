@@ -276,6 +276,36 @@ actor SyncEngine {
                            at: Int64(Date().timeIntervalSince1970))
         return bytes
     }
+
+    // MARK: - backfill
+
+    /// Spec §7.6 — enqueue every existing non-excluded, non-yet-synced item
+    /// (and its blob if image and ≤2MB). Run once after `enableSync` finishes
+    /// AND only on the first device (BootstrapResult.firstDevice).
+    func backfill(now: Int64) async throws {
+        try await store.pool.write { db in
+            try db.execute(sql: """
+                INSERT INTO sync_queue (op, target_key, attempts, next_try_at, enqueued_at)
+                SELECT 'put_clip', CAST(items.id AS TEXT), 0, ?, ?
+                FROM items
+                LEFT JOIN clip_blobs ON items.blob_id = clip_blobs.id
+                WHERE items.sync_excluded = 0
+                  AND items.cloud_id IS NULL
+                  AND (items.kind = 'text' OR clip_blobs.byte_size <= 2097152)
+                ORDER BY items.created_at DESC
+            """, arguments: [now, now])
+            try db.execute(sql: """
+                INSERT INTO sync_queue (op, target_key, attempts, next_try_at, enqueued_at)
+                SELECT 'put_blob', CAST(clip_blobs.id AS TEXT), 0, ?, ?
+                FROM clip_blobs
+                JOIN items ON items.blob_id = clip_blobs.id
+                WHERE items.sync_excluded = 0
+                  AND items.cloud_id IS NULL
+                  AND clip_blobs.byte_size <= 2097152
+                ORDER BY items.created_at DESC
+            """, arguments: [now, now])
+        }
+    }
 }
 
 extension SyncEngine {

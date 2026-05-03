@@ -25,6 +25,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let injector = PasteInjector()
     var pruner: DispatchSourceTimer!
 
+    // Cloud sync (T25). Engine + the two background drainer/poll tasks.
+    var syncEngine: SyncEngine?
+    private var pushLoopTask: Task<Void, Never>?
+    private var pullLoopTask: Task<Void, Never>?
+
     private var onboardingWindow: NSWindow?
     private var preferencesWindow: NSWindow?
     private var cancellables: Set<AnyCancellable> = []
@@ -86,6 +91,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         observer.start()
 
+        // 7.5 Cloud sync (v3, D1+R2). Spec §4.1.
+        startCloudSyncIfEnabled()
+        // Notification fires on the main queue (passed below), but Swift 6's
+        // strict concurrency can't see that statically — bounce through
+        // MainActor.assumeIsolated to assert isolation explicitly.
+        NotificationCenter.default.addObserver(
+            forName: .clipCloudSyncDidEnable, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.startCloudSyncIfEnabled()
+                // First-device backfill on cold-start of engine
+                if let engine = self.syncEngine {
+                    Task { try? await engine.backfill(now: Int64(Date().timeIntervalSince1970)) }
+                }
+            }
+        }
+
         // 7. Hotkey
         hotkey = HotkeyManager()
         hotkey.onToggle = { [weak self] in self?.togglePanel() }
@@ -101,17 +124,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self?.panel.close()
                 }
             case .image:
-                guard let blobID = item.blobID,
-                      let bytes = try? self.store.blob(id: blobID)
-                else {
-                    // Blob missing somehow — close without pasting.
-                    self.panel.close()
-                    return
+                guard let blobID = item.blobID else { self.panel.close(); return }
+                // Lazy blob fetch (T25): if local bytes are empty (placeholder
+                // row from a pull), await engine.fetchBlob before pasting.
+                Task {
+                    var bytes = (try? self.store.blob(id: blobID)) ?? Data()
+                    if bytes.isEmpty, let engine = self.syncEngine {
+                        bytes = (try? await engine.fetchBlob(blobID: blobID)) ?? Data()
+                    }
+                    await MainActor.run {
+                        if !bytes.isEmpty {
+                            self.injector.pasteImage(
+                                bytes: bytes,
+                                mimeType: item.mimeType ?? "image/png"
+                            ) { self.panel.close() }
+                        } else {
+                            self.panel.close()
+                        }
+                    }
                 }
-                self.injector.pasteImage(
-                    bytes: bytes,
-                    mimeType: item.mimeType ?? "image/png"
-                ) { [weak self] in self?.panel.close() }
             }
         }
         panel.setRoot(PanelView(model: panelModel))
@@ -320,5 +351,114 @@ extension AppDelegate {
 
         NSApp.activate(ignoringOtherApps: true)
         w.makeKeyAndOrderFront(nil)
+    }
+}
+
+// MARK: - Cloud sync wire-in (Task 25)
+extension AppDelegate {
+    func startCloudSyncIfEnabled() {
+        let settings = PreferencesContainer.shared.syncSettings
+        guard settings.enabled,
+              let endpoint = settings.r2Endpoint.flatMap(URL.init),
+              let bucket = settings.r2Bucket,
+              let r2AK = settings.r2AccessKeyID,
+              let r2Secret = (try? KeychainStore(service: "com.zyw.clip.cloud-r2-secret-v1")
+                              .read(account: "current")).flatMap({ String(data: $0, encoding: .utf8) }),
+              let d1AccountID = settings.d1AccountID,
+              let d1DatabaseID = settings.d1DatabaseID,
+              let d1Token = (try? KeychainStore(service: "com.zyw.clip.cloud-d1-token-v1")
+                             .read(account: "current")).flatMap({ String(data: $0, encoding: .utf8) }),
+              let masterKey = try? KeychainStore(service: "com.zyw.clip.cloud-master-v1")
+                                  .read(account: "current")
+        else { return }
+
+        let crypto = CryptoBox(masterKey: masterKey)
+        let blobs = R2BlobBackend(endpoint: endpoint, bucket: bucket,
+                                  accessKeyID: r2AK, secretAccessKey: r2Secret)
+        let ds = D1Backend(accountID: d1AccountID, databaseID: d1DatabaseID,
+                           apiToken: d1Token)
+
+        // Spec §5.2 / fix E — verify remote schema on every cold start. Don't
+        // start the engine if remote is newer (refuse to mutate data we don't
+        // understand). Failure is surfaced via NSAlert; sync stays disabled
+        // for this session.
+        Task {
+            do {
+                try await SyncEngine.verifyRemoteSchema(dataSource: ds)
+                await MainActor.run { self.startCloudSyncEngineCore(
+                    ds: ds, blobs: blobs, crypto: crypto, masterKey: masterKey) }
+            } catch let SyncError.remoteSchemaNewer(remote, local) {
+                await MainActor.run {
+                    let alert = NSAlert()
+                    alert.messageText = "需要升级 Clip"
+                    alert.informativeText = "另一台 Mac 装了更新版本的 Clip (云端 schema v\(remote);本机 v\(local))。请升级本机后重启同步。"
+                    alert.alertStyle = .warning
+                    alert.runModal()
+                }
+            } catch {
+                NSLog("[clip] verifyRemoteSchema failed: \(error)")
+            }
+        }
+    }
+
+    /// Caller has verified schema; actually wire the engine + start loops.
+    private func startCloudSyncEngineCore(ds: CloudSyncDataSource,
+                                          blobs: CloudSyncBlobStore,
+                                          crypto: CryptoBox,
+                                          masterKey: Data) {
+        let state = SyncStateStore(store: store)
+        let deviceID = (try? state.get("device_id")) ?? UUID().uuidString.lowercased()
+        try? state.set("device_id", deviceID)
+
+        let engine = SyncEngine(store: store, dataSource: ds, blobStore: blobs,
+                                crypto: crypto, deviceID: deviceID, state: state)
+        self.syncEngine = engine
+
+        // Wire HistoryStore.onChange → engine.enqueue. The closure captures the
+        // store directly (Sendable) rather than `self` so it can run on the
+        // mutation thread without crossing MainActor isolation.
+        let storeRef = self.store!
+        store.onChange = { [weak engine] change in
+            guard let engine else { return }
+            let now = Int64(Date().timeIntervalSince1970)
+            Task {
+                switch change {
+                case .inserted(let id):
+                    try? await engine.enqueueClipPush(itemID: id, at: now)
+                    if let item = try? storeRef.itemByID(id),
+                       let blobID = item.blobID {
+                        try? await engine.enqueueBlobPush(blobID: blobID, at: now)
+                    }
+                case .deleted(_, let hash):
+                    try? await engine.excludeItemByHash(contentHash: hash, at: now)
+                case .pinToggled(let id):
+                    try? await engine.enqueueClipPush(itemID: id, at: now)
+                case .excludedToggled:
+                    break  // handled by engine.excludeItem directly
+                }
+            }
+        }
+
+        // Wire panel ⌘N (PanelModel.onExclude — T23)
+        panelModel.onExclude = { [weak engine] id in
+            guard let engine else { return }
+            let now = Int64(Date().timeIntervalSince1970)
+            Task { try? await engine.excludeItem(id: id, at: now) }
+        }
+
+        // Background push drainer + 30s pull tick. Capture the engine weakly
+        // so if AppDelegate releases it the loops self-terminate.
+        pushLoopTask = Task { [weak engine] in
+            while !Task.isCancelled, let engine {
+                let did = (try? await engine.pushOnce(now: Int64(Date().timeIntervalSince1970))) ?? false
+                if !did { try? await Task.sleep(nanoseconds: 1_000_000_000) }
+            }
+        }
+        pullLoopTask = Task { [weak engine] in
+            while !Task.isCancelled, let engine {
+                _ = try? await engine.pullOnce(now: Int64(Date().timeIntervalSince1970))
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
+            }
+        }
     }
 }

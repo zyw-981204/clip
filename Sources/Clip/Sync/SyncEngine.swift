@@ -314,6 +314,10 @@ extension SyncEngine {
         case joinedExisting
     }
 
+    /// Single source of truth for the local D1 schema version this binary
+    /// understands. Bumped in lockstep with `dataSource.ensureSchema()`.
+    private static let localSchemaVersion = "3"
+
     /// Spec §7.1 first-time enable. Static because it runs before SyncEngine
     /// is instantiated. Bakes in fix C (INSERT OR IGNORE) + fix E (schema_version).
     ///
@@ -329,7 +333,6 @@ extension SyncEngine {
         keychain: KeychainStore,
         account: String
     ) async throws -> BootstrapResult {
-        let localSchemaVersion = "3"
         let iters = 200_000
 
         try await dataSource.ensureSchema()
@@ -344,8 +347,13 @@ extension SyncEngine {
 
         // Fix C — idempotent salt + iters bootstrap
         var saltBytes = Data(count: 16)
-        _ = saltBytes.withUnsafeMutableBytes {
+        let rngStatus = saltBytes.withUnsafeMutableBytes {
             SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!)
+        }
+        // SyncError.d1 is a stretch semantically (RNG isn't D1), but adding a
+        // dedicated `.crypto` case for one callsite is overkill — reuse it.
+        guard rngStatus == errSecSuccess else {
+            throw SyncError.d1("RNG failed (status=\(rngStatus))")
         }
         let saltB64 = saltBytes.base64EncodedString()
         let iWonSalt = try await dataSource.putConfigIfAbsent(
@@ -377,7 +385,6 @@ extension SyncEngine {
     /// launch. Throws SyncError.remoteSchemaNewer when remote > local.
     /// Idempotent: `ensureSchema` is `CREATE TABLE IF NOT EXISTS`-only.
     static func verifyRemoteSchema(dataSource: CloudSyncDataSource) async throws {
-        let localSchemaVersion = "3"
         try await dataSource.ensureSchema()
         let remote = try await dataSource.getConfig(key: "schema_version") ?? localSchemaVersion
         if (Int(remote) ?? 0) > (Int(localSchemaVersion) ?? 0) {
